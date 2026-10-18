@@ -1,0 +1,77 @@
+# ==========================================
+# Python & Virtual Environments
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.venv/
+.venv*/
+
+# ==========================================
+# FastAPI / Saleor / Database
+# ==========================================
+*.sqlite3
+*.db
+/media/
+/static/
+/staticfiles/
+.webassets-cache/
+
+# ==========================================
+# Environment Variables & Secrets (CRÍTICO)
+# ==========================================
+.env
+.env.*
+!.env.example
+!.env.template
+*.pem
+*.key
+*.cert
+
+# ==========================================
+# Testing & Coverage
+# ==========================================
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+
+# ==========================================
+# Docker & Containers (Podman / Local)
+# ==========================================
+.docker/
+docker-compose.override.yml
+podman-compose.override.yml
+
+# ==========================================
+# IDEs & System Files (WSL2 / Windows / macOS)
+# ==========================================
+.vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+ehthumbs.db
+
+# ==========================================
+# Logs
+# ==========================================
+*.log
+logs/
