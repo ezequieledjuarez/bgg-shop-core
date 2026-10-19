@@ -1,0 +1,36 @@
+type Product {
+  bggId: Int!
+  name: String!
+  releaseYear: Int!
+  minPlayers: Int!
+  maxPlayers: Int!
+  playingTimeMinutes: Int!
+  minAge: Int!
+  weight: Float!
+  category: [String!]!
+  price: Float!
+  publisher: String!
+  imageUrl: String!
+}
+
+type ProductPage {
+  items: [Product!]!
+  page: Int!
+  pageSize: Int!
+  total: Int!
+  totalPages: Int!
+}
+
+type Query {
+  products(
+    page: Int = 1
+    pageSize: Int = 20
+    search: String
+    yearPublished: Int
+    minPlayers: Int
+    maxPlayers: Int
+    categoryId: Int
+    priceMin: Float
+    priceMax: Float
+  ): ProductPage!
+}
