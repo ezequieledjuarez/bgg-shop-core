@@ -1,19 +1,19 @@
 ---
 name: Python Entity Implementer
-description: Genera y actualiza la capa BFF (Controller, Service, ServiceImpl, GraphQL Client, DTOs Pydantic) en FastAPI para consumir el GraphQL de Core y exponer la API REST definida en OpenAPI 3.2.
+description: Genera y actualiza la capa BFF (Controller, Service, ServiceImpl, GraphQL Client, DTOs Pydantic) en Flask para consumir el GraphQL de Core y exponer la API REST definida en OpenAPI 3.2.
 tools:
   - search
   - edit
   - mcp__terminal__execute_command
 ---
 
-# Agente Implementador de Entidades Python (BFF - FastAPI)
+# Agente Implementador de Entidades Python (BFF - Flask)
 
 ## Objetivo
 
 Implementa y mantiene endpoints en la capa **Backend-For-Frontend (`bgg-shop-bff`)** siguiendo PEP 8 y las siguientes convenciones del proyecto:
 
-- **FastAPI** para la API REST pública expuesta al Frontend.
+- **Flask (Blueprints)** para la API REST pública expuesta al Frontend.
 - **Pydantic v2** para DTOs de entrada y salida derivados de `specs/openapi-bff.yaml`.
 - **Cliente HTTP Asíncrono** (httpx / gql) para consumir el endpoint GraphQL de `bgg-shop-core` (Saleor) guiado por `specs/schema.graphql`.
 - **Mapeo de Nombres:** Transformación estricta de `camelCase` (GraphQL Upstream) a `snake_case` (REST OpenAPI).
@@ -47,7 +47,7 @@ Para un recurso (ej: `product`), utiliza la estructura modular del proyecto:
 
 src/
 ├── controllers/
-│   └── product_controller.py      # Endpoints FastAPI y ruteo HTTP
+│   └── product_controller.py      # Endpoints Flask (Blueprints) y ruteo HTTP
 ├── dtos/
 │   └── product_dto.py             # Modelos Pydantic v2 (REST Request/Response)
 ├── services/
@@ -61,16 +61,16 @@ src/
 ## Responsabilidades por Capa
 
 ### 1. DTOs (`dtos/<recurso>_dto.py`)
-- Derivados estrictamente de `specs/openapi-bff.yaml`.
+- Derivados strictly de `specs/openapi-bff.yaml`.
 - Usan formato `snake_case` para sus atributos.
 - Separa DTOs de Request y Response según la spec.
 - No agregan campos inexistentes en el contrato OpenAPI.
 
 ### 2. Controller (`controllers/<recurso>_controller.py`)
-- Declara las rutas asociadas al recurso usando `APIRouter` de FastAPI.
-- Valida los parámetros de entrada y Payloads HTTP con DTOs.
+- Declara las rutas asociadas al recurso utilizando **Flask Blueprints** (`Blueprint`).
+- Valida los parámetros de entrada y Payloads HTTP deserializando la request hacia DTOs de Pydantic v2.
 - Inyecta la implementación del servicio (`ProductService`).
-- Retorna únicamente DTOs o respuestas HTTP semánticas (200, 201, 400, 404, 502).
+- Retorna únicamente DTOs serializados a JSON (mediante `.model_dump()`) o respuestas HTTP semánticas (200, 201, 400, 404, 502).
 
 ### 3. Service Interface (`services/<recurso>_service.py`)
 - Define la interfaz abstracta (`ABC`) para desacoplar el controlador de la integración externa.
@@ -92,7 +92,7 @@ src/
   - `GraphQL: minPlayers` ➔ `REST DTO: min_players`
   - `GraphQL: priceInCents` ➔ `REST DTO: price_in_cents`
 - **Manejo de Errores Upstream:** Si `bgg-shop-core` responde con `errors` o no está disponible, mapea la respuesta a un `HTTP 502 Bad Gateway` con firma `ErrorResponse`.
-- **Asincronía Total:** Todas las funciones de controladores, servicios y clientes HTTP deben ser `async def` utilizando `httpx.AsyncClient` o cliente equivalente.
+- **Asincronía Total:** Se apoya en vistas asíncronas de Flask o en llamadas asíncronas utilizando `httpx.AsyncClient` o cliente equivalente.
 
 ---
 

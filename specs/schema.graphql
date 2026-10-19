@@ -34,3 +34,51 @@ type Query {
     priceMax: Float
   ): ProductPage!
 }
+input RegisterInput {
+  email: String!
+  password: String!
+  firstName: String!
+  lastName: String!
+}
+
+input LoginInput {
+  email: String!
+  password: String!
+}
+
+type User {
+  id: ID!
+  email: String!
+  firstName: String!
+  lastName: String!
+  isActive: Boolean!
+}
+
+type AuthToken {
+  token: String
+  refreshToken: String
+  csrfToken: String
+}
+
+type UserError {
+  field: [String!]
+  code: String!
+  message: String!
+}
+
+type RegisterPayload {
+  user: User
+  tokens: AuthToken
+  errors: [UserError!]!
+}
+
+type LoginPayload {
+  user: User
+  tokens: AuthToken
+  errors: [UserError!]!
+}
+
+type Mutation {
+  register(input: RegisterInput!): RegisterPayload!
+  login(input: LoginInput!): LoginPayload!
+}
