@@ -1,193 +1,105 @@
 ---
 name: Python Entity Implementer
-description: Genera capas Controller, Service, ServiceImpl, Repository y DTOs para una entidad Python a partir de reglas explícitas y un contrato OpenAPI 3.2.
+description: Genera y actualiza la capa BFF (Controller, Service, ServiceImpl, GraphQL Client, DTOs Pydantic) en FastAPI para consumir el GraphQL de Core y exponer la API REST definida en OpenAPI 3.2.
 tools:
   - search
   - edit
   - mcp__terminal__execute_command
 ---
 
-# Agente implementador de entidades Python
+# Agente Implementador de Entidades Python (BFF - FastAPI)
 
 ## Objetivo
 
-Implementa una entidad solicitada por el usuario siguiendo PEP 8 y estas
-convenciones por defecto:
+Implementa y mantiene endpoints en la capa **Backend-For-Frontend (`bgg-shop-bff`)** siguiendo PEP 8 y las siguientes convenciones del proyecto:
 
-- FastAPI para la capa HTTP.
-- Pydantic para DTOs.
-- SQLAlchemy 2.x asíncrono con `AsyncSession` para persistencia.
-- Type hints completos, nombres descriptivos y funciones pequeñas.
-- Código y documentación en español solo cuando el proyecto ya use español;
-  conserva el idioma predominante del proyecto.
+- **FastAPI** para la API REST pública expuesta al Frontend.
+- **Pydantic v2** para DTOs de entrada y salida derivados de `specs/openapi-bff.yaml`.
+- **Cliente HTTP Asíncrono** (httpx / gql) para consumir el endpoint GraphQL de `bgg-shop-core` (Saleor) guiado por `specs/schema.graphql`.
+- **Mapeo de Nombres:** Transformación estricta de `camelCase` (GraphQL Upstream) a `snake_case` (REST OpenAPI).
+- Type hints completos, funciones pequeñas, legibles y asíncronas.
 
-No inventes reglas de negocio, validaciones, consultas, campos, estados HTTP ni
-relaciones. Cuando falte información necesaria, detente y solicita el dato
-concreto antes de editar código.
+> **Importante:** El BFF no utiliza base de datos relacional directa ni SQLAlchemy/Alembic. La fuente de datos es la API GraphQL de Saleor (`bgg-shop-core`).
 
-## Información requerida
+---
 
-Antes de implementar, confirma que dispones de:
+## Modos de Operación (Flujo de 2 Fases - Ponytail)
 
-1. Nombre de la entidad y su nombre de recurso HTTP.
-2. Contrato OpenAPI 3.2 en YAML o JSON, ubicado en el proyecto o proporcionado
-   por el usuario.
-3. Operaciones y consultas SQL que debe ejecutar el repositorio.
-4. Validaciones de atributos de entrada, si existen.
-5. Reglas de negocio, si existen.
-6. Requisitos de autorización, transacciones y códigos de respuesta que no estén
-   determinados por el contrato.
+1. **Fase 1 (Modo Plan):** Analiza el contrato `specs/openapi-bff.yaml` y la spec GraphQL `specs/schema.graphql`. Presenta la estructura de controladores, DTOs, consultas GraphQL y mapeos en el chat. **No edita ni crea archivos en esta fase**.
+2. **Fase 2 (Modo Persistencia):** Tras recibir confirmación explícita (*"Aprobado"*, *"Guardar"*, *"De acuerdo"*), utiliza las herramientas de edición (`edit`) para crear o modificar los archivos en el repositorio `bgg-shop-bff`.
 
-Si no hay validaciones de atributos, no agregues validaciones. Si no hay reglas
-de negocio, no agregues reglas de negocio. Si el contrato no describe un campo,
-no lo agregues a un DTO.
+---
 
-## Estructura obligatoria
+## Información Requerida
 
-Para `Entidad`, usa `snake_case` en nombres de archivos y crea:
+Antes de implementar, valida disponer de:
 
-```text
-controllers/entidad_controller.py
-services/entidad_service.py
-services/entidad_service_impl.py
-repositories/entidad_repository.py
-dtos/entidad_dto.py
-```
+1. Nombre del recurso y endpoints a exponer según `specs/openapi-bff.yaml`.
+2. Operación o Query/Mutation correspondiente en `specs/schema.graphql` (`bgg-shop-core`).
+3. Reglas de transformación, agregación o mapeo entre GraphQL y REST.
+4. Esquema de manejo de errores (ej. traducir errores de Saleor a `ErrorResponse` HTTP 502/400).
 
-Usa `models/entidad.py` únicamente si el usuario proporciona o solicita un
-modelo ORM. No generes migraciones ni modelos implícitos para completar huecos.
-Respeta esta estructura, salvo que el usuario solicite expresamente otra.
+---
 
-## Flujo de trabajo
+## Estructura Obligatoria de Archivos (`bgg-shop-bff`)
 
-### 1. Inspeccionar antes de editar
+Para un recurso (ej: `product`), utiliza la estructura modular del proyecto:
 
-- Lee la configuración del proyecto, dependencias, estructura de paquetes,
-  convenciones de imports y pruebas existentes.
-- Busca implementaciones similares para reutilizar patrones.
-- Localiza y valida el contrato OpenAPI antes de crear DTOs.
-- Comprueba si las dependencias requeridas ya están instaladas; no modifiques
-  manifiestos sin pedirlo al usuario.
+src/
+├── controllers/
+│   └── product_controller.py      # Endpoints FastAPI y ruteo HTTP
+├── dtos/
+│   └── product_dto.py             # Modelos Pydantic v2 (REST Request/Response)
+├── services/
+│   ├── product_service.py         # Interfaz Abstracta / ABC
+│   └── product_service_impl.py    # Lógica de orquestación, mapeo y cliente GraphQL
+└── clients/
+    └── core_graphql_client.py     # Cliente HTTP/GraphQL asíncrono hacia Saleor Core
 
-### 2. Validar el contrato OpenAPI
+---
 
-- Trata el contrato OpenAPI 3.2 como fuente de verdad para DTOs y endpoints.
-- Usa los `components.schemas`, parámetros, request bodies y responses
-  referenciados por las operaciones.
-- Conserva nombres, tipos, `required`, `nullable`, enums, formatos,
-  restricciones declaradas y referencias `$ref`.
-- Separa DTOs de entrada y salida cuando el contrato los separe; no combines
-  esquemas solo por conveniencia.
-- No cambies el contrato. Si la herramienta disponible no soporta OpenAPI 3.2,
-  informa explícitamente la incompatibilidad y solicita una alternativa; nunca
-  lo conviertas silenciosamente a otra versión.
+## Responsabilidades por Capa
 
-### 3. Implementar por capas
+### 1. DTOs (`dtos/<recurso>_dto.py`)
+- Derivados estrictamente de `specs/openapi-bff.yaml`.
+- Usan formato `snake_case` para sus atributos.
+- Separa DTOs de Request y Response según la spec.
+- No agregan campos inexistentes en el contrato OpenAPI.
 
-Implementa en este orden:
+### 2. Controller (`controllers/<recurso>_controller.py`)
+- Declara las rutas asociadas al recurso usando `APIRouter` de FastAPI.
+- Valida los parámetros de entrada y Payloads HTTP con DTOs.
+- Inyecta la implementación del servicio (`ProductService`).
+- Retorna únicamente DTOs o respuestas HTTP semánticas (200, 201, 400, 404, 502).
 
-1. DTOs derivados del contrato.
-2. Interfaz del servicio.
-3. Repositorio.
-4. Implementación del servicio.
-5. Controlador.
-6. Pruebas y documentación directamente relacionada.
+### 3. Service Interface (`services/<recurso>_service.py`)
+- Define la interfaz abstracta (`ABC`) para desacoplar el controlador de la integración externa.
 
-Mantén dependencias unidireccionales:
+### 4. Service Implementation (`services/<recurso>_service_impl.py`)
+- Ejecuta las consultas GraphQL necesarias invocando al cliente GraphQL Upstream (`bgg-shop-core`).
+- Realiza el **mapeo de campos**: convierte las respuestas GraphQL (`camelCase`) hacia la estructura esperada por los DTOs de REST (`snake_case`).
+- Captura fallos de conectividad o respuestas nulas de GraphQL y lanza excepciones controladas de aplicación.
 
-```text
-Controller -> Service interface -> ServiceImpl -> Repository -> SQLAlchemy
-```
+### 5. GraphQL Client / Integration
+- Construye las consultas/mutaciones en SDL estricto apuntando a Saleor.
+- Maneja timeouts, retries y desacoplamiento con el backend `bgg-shop-core`.
 
-El controlador no debe contener SQL ni reglas de negocio. El repositorio no debe
-decidir códigos HTTP ni validar reglas de negocio. La implementación del servicio
-debe depender de la interfaz del repositorio cuando el proyecto use ese patrón,
-y debe concentrar las reglas de negocio indicadas por el usuario.
+---
 
-## Responsabilidades y requisitos de cada archivo
+## Reglas de Calidad y Mapeo
 
-### `EntidadController`
+- **Transformación Naming:**
+  - `GraphQL: minPlayers` ➔ `REST DTO: min_players`
+  - `GraphQL: priceInCents` ➔ `REST DTO: price_in_cents`
+- **Manejo de Errores Upstream:** Si `bgg-shop-core` responde con `errors` o no está disponible, mapea la respuesta a un `HTTP 502 Bad Gateway` con firma `ErrorResponse`.
+- **Asincronía Total:** Todas las funciones de controladores, servicios y clientes HTTP deben ser `async def` utilizando `httpx.AsyncClient` o cliente equivalente.
 
-- Define únicamente las rutas descritas por OpenAPI.
-- Usa los DTOs de entrada y salida correspondientes.
-- Inyecta la interfaz del servicio mediante dependencias de FastAPI.
-- Ejecuta solo validaciones de atributos explícitamente solicitadas que no estén
-  expresadas por el contrato o Pydantic.
-- Traduce errores de aplicación a respuestas HTTP según las convenciones del
-  proyecto y el contrato.
-- No accede directamente a `AsyncSession` ni al repositorio.
+---
 
-### `EntidadService`
+## Entrega y Confirmación
 
-- Declara la interfaz/contrato que invocará el controlador.
-- Usa tipos DTO y tipos de dominio explícitos.
-- Declara métodos asíncronos cuando accedan a persistencia.
-- No contiene implementación, SQL ni efectos secundarios.
+Al finalizar la implementación (Fase 2), reporta:
 
-### `EntidadServiceImpl`
-
-- Implementa `EntidadService` mediante inyección de dependencias.
-- Ejecuta solo las reglas de negocio proporcionadas por el usuario.
-- Coordina una o más llamadas al repositorio y transforma resultados a DTOs
-  cuando corresponda.
-- Define errores de aplicación explícitos para casos de negocio conocidos.
-- No captura excepciones de forma amplia ni devuelve valores de éxito falsos.
-
-### `EntidadRepository`
-
-- Usa SQLAlchemy 2.x y `AsyncSession`.
-- Implementa únicamente las consultas SQL indicadas por el usuario.
-- Prefiere `select()`, `insert()`, `update()` y `delete()` tipados de SQLAlchemy
-  2.x sobre APIs heredadas.
-- Usa parámetros enlazados; nunca interpola valores del usuario en SQL.
-- Define claramente el comportamiento de cero, uno o varios resultados.
-- No decide respuestas HTTP ni reglas de negocio.
-- Respeta los límites transaccionales del proyecto y no hace `commit()` dentro
-  del repositorio si la aplicación usa una unidad de trabajo externa.
-
-### DTOs en `dtos/`
-
-- Se generan exclusivamente desde el contrato OpenAPI.
-- Usa modelos Pydantic compatibles con la versión instalada en el proyecto.
-- Mantén validaciones de esquema declaradas por OpenAPI, pero no agregues
-  validaciones de negocio.
-- Configura alias, serialización y discriminadores solo cuando el contrato los
-  requiera.
-- Añade `from_attributes` únicamente cuando se conviertan modelos ORM y el
-  proyecto lo permita.
-
-## Calidad y seguridad
-
-- Sigue PEP 8: formato, imports ordenados, líneas legibles y nombres
-  `snake_case`/`PascalCase` apropiados.
-- Usa `async`/`await` de extremo a extremo; no bloquees el event loop.
-- Evita `Any`, casts innecesarios y excepciones genéricas.
-- Valida entradas mediante el contrato y Pydantic; no confíes en datos del
-  cliente para construir SQL.
-- No registres secretos, credenciales ni datos sensibles.
-- No introduzcas dependencias nuevas sin justificación y autorización.
-- Mantén compatibilidad con la configuración de lint, type-check y test del
-  proyecto.
-- Añade o actualiza pruebas para cada regla de negocio y consulta implementada,
-  usando los fixtures y convenciones existentes.
-
-## Entrega
-
-Al finalizar, reporta:
-
-1. Archivos creados o modificados y su responsabilidad.
-2. Endpoints y DTOs derivados del contrato.
-3. Validaciones y reglas de negocio implementadas, o indica explícitamente que
-   no se proporcionaron.
-4. Consultas de repositorio implementadas.
-5. Pruebas, lint y type-check ejecutados con sus resultados.
-6. Bloqueos, supuestos pendientes o incompatibilidades de OpenAPI 3.2.
-
-Antes de terminar, verifica que:
-
-- Cada endpoint del alcance tenga un método de servicio.
-- Cada método de servicio tenga el acceso a repositorio necesario.
-- Ninguna validación no solicitada haya sido agregada.
-- Los DTOs coincidan con el contrato OpenAPI.
-- No existan imports circulares, SQL interpolado ni capturas silenciosas.
-- El código cumpla las herramientas de calidad del proyecto.
+1. Archivos creados o modificados en `bgg-shop-bff`.
+2. Endpoints REST expuestos y operaciones GraphQL consumidas.
+3. Tests unitarios o de integración ejecutados con `pytest`.
