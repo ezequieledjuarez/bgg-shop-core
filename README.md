@@ -15,7 +15,8 @@ Construido sobre **Django** y la arquitectura base de **Saleor Core**, este serv
 
 ## 🏗️ Arquitectura y Rol en el Sistema
 
-Este repositorio opera de forma desacoplada dentro de la infraestructura general:
+Este repositorio opera de forma desacoplada dentro de la infraestructura
+general. El flujo implementado es:
 [ bgg-shop-front ]  ──(REST)──>  [ bgg-shop-bff ]  ──(GraphQL)──>  [ bgg-shop-core ]
 (React / Vite)                  (Flask / Gateway)                 (Django / Saleor)
 │
@@ -26,6 +27,69 @@ Este repositorio opera de forma desacoplada dentro de la infraestructura general
 * **OLTP Transaccional:** Administra usuarios, catálogo de productos, variantes y stock con integridad ACID.
 * **Capa de Transporte Stricta:** Proporciona un esquema de GraphQL fuertemente tipado, previniendo problemas de *over-fetching* y *under-fetching*.
 * **Asincronismo:** Procesa eventos en diferido (notificaciones, reportes masivos) mediante Celery Workers.
+
+## Servicio GraphQL expuesto
+
+La ruta actual es `POST /graphql/`; GraphiQL está habilitado sobre la misma
+ruta para exploración manual. En Compose está disponible en
+`http://localhost:8000/graphql/`.
+
+| Operación | Argumentos | Resultado o error |
+| --- | --- | --- |
+| `hello` | Ninguno | Texto `Saleor API activa y respondiendo OK`. |
+| `products` | `page`, `pageSize`, `search`, `yearPublished`, `minPlayers`, `maxPlayers`, `categoryId`, `priceMin`, `priceMax` | `ProductPage` filtrado con productos y metadatos de paginación. |
+
+Ejemplo de consulta:
+
+```bash
+curl http://localhost:8000/graphql/ \
+  -H 'Content-Type: application/json' \
+  --data '{"query":"query { hello products(page: 1, pageSize: 20) { items { bggId name releaseYear minPlayers maxPlayers playingTimeMinutes minAge weight category price publisher imageUrl } page pageSize total totalPages } }"}'
+```
+
+`page` y `pageSize` deben ser enteros positivos; los rangos invertidos también
+se rechazan. Los errores GraphQL se devuelven en el formato de GraphQL
+(`errors`); la consulta de productos filtra `product_boardgame` antes de
+contar y paginar. `categoryId` usa el mapa local `1` estrategia, `2` temática,
+`3` familiar. El Core no expone aquí endpoints REST de productos ni
+operaciones de autenticación, carrito, checkout, pedidos o mutaciones de
+compra.
+
+### Esquema de producto y paginación
+
+GraphQL presenta los campos en `camelCase`:
+
+```graphql
+type Product {
+  bggId: Int!
+  name: String!
+  releaseYear: Int!
+  minPlayers: Int!
+  maxPlayers: Int!
+  playingTimeMinutes: Int!
+  minAge: Int!
+  weight: Float!
+  category: [String!]!
+  price: Float!
+  publisher: String!
+  imageUrl: String!
+}
+
+type ProductPage {
+  items: [Product!]!
+  page: Int!
+  pageSize: Int!
+  total: Int!
+  totalPages: Int!
+}
+```
+
+El BFF adapta estos nombres a `snake_case` (`bgg_id`, `page_size`,
+`total_pages`, etc.) antes de responder por REST.
+
+El Frontend consume el catálogo a través del BFF; no llama GraphQL
+directamente. Para el detalle de CU-C02, ver
+[`docs/CU-C02-FILTERING-CHANGES.md`](../docs/CU-C02-FILTERING-CHANGES.md).
 
 ---
 
