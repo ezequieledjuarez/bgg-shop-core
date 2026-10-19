@@ -38,6 +38,8 @@ ruta para exploración manual. En Compose está disponible en
 | --- | --- | --- |
 | `hello` | Ninguno | Texto `Saleor API activa y respondiendo OK`. |
 | `products` | `page`, `pageSize`, `search`, `yearPublished`, `minPlayers`, `maxPlayers`, `categoryId`, `priceMin`, `priceMax` | `ProductPage` filtrado con productos y metadatos de paginación. |
+| `register` | `RegisterInput` (`email`, `password`, `firstName`, `lastName`) | Usuario creado y errores de dominio; no emite sesión. |
+| `login` | `LoginInput` (`email`, `password`) | Usuario autenticado, JWT access/refresh y errores de dominio. |
 
 Ejemplo de consulta:
 
@@ -51,9 +53,10 @@ curl http://localhost:8000/graphql/ \
 se rechazan. Los errores GraphQL se devuelven en el formato de GraphQL
 (`errors`); la consulta de productos filtra `product_boardgame` antes de
 contar y paginar. `categoryId` usa el mapa local `1` estrategia, `2` temática,
-`3` familiar. El Core no expone aquí endpoints REST de productos ni
-operaciones de autenticación, carrito, checkout, pedidos o mutaciones de
-compra.
+`3` familiar. El Core no expone aquí endpoints REST de productos ni operaciones de carrito,
+checkout, pedidos o mutaciones de compra. La documentación completa de
+autenticación está en
+[`docs/CU-C01-AUTHENTICATION-CHANGES.md`](../docs/CU-C01-AUTHENTICATION-CHANGES.md).
 
 ### Esquema de producto y paginación
 
