@@ -53,8 +53,9 @@ curl http://localhost:8000/graphql/ \
 se rechazan. Los errores GraphQL se devuelven en el formato de GraphQL
 (`errors`); la consulta de productos filtra `product_boardgame` antes de
 contar y paginar. `categoryId` usa el mapa local `1` estrategia, `2` temática,
-`3` familiar. El Core no expone aquí endpoints REST de productos ni operaciones de carrito,
-checkout, pedidos o mutaciones de compra. La documentación completa de
+`3` familiar. El Core no expone aquí endpoints REST de productos. Expone el stock (`quantity`)
+y, por GraphQL, `cart`, `addToCart`, `updateCartQuantity` y `removeFromCart`
+(el carrito no reserva ni descuenta stock). No expone checkout ni pedidos. La documentación completa de
 autenticación está en
 [`docs/CU-C01-AUTHENTICATION-CHANGES.md`](../docs/CU-C01-AUTHENTICATION-CHANGES.md).
 

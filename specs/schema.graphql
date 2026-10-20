@@ -11,6 +11,7 @@ type Product {
   price: Float!
   publisher: String!
   imageUrl: String!
+  quantity: Int!
 }
 
 type ProductPage {
@@ -44,11 +45,39 @@ type ProductDetail {
   price: Float!
   publisher: String!
   imageUrl: String!
+  quantity: Int!
   reviewSummary: ReviewSummary!
   approvedReviews: [PublicReview!]!
 }
 
+type CartLine {
+  bggId: Int!
+  name: String!
+  quantity: Int!
+  inventoryQuantity: Int!
+  unitPrice: Float!
+  subtotal: Float!
+}
+
+type Cart {
+  cartId: ID!
+  lines: [CartLine!]!
+  subtotal: Float!
+}
+
+type CartUserError {
+  field: [String!]
+  code: String!
+  message: String!
+}
+
+type CartPayload {
+  cart: Cart!
+  userErrors: [CartUserError!]!
+}
+
 type Query {
+  hello: String
   productBySlug(slug: String!): ProductDetail
   products(
     page: Int = 1
@@ -60,7 +89,8 @@ type Query {
     categoryId: Int
     priceMin: Float
     priceMax: Float
-  ): ProductPage!
+  ): ProductPage
+  cart(cartId: ID): Cart!
 }
 input RegisterInput {
   email: String!
@@ -72,6 +102,7 @@ input RegisterInput {
 input LoginInput {
   email: String!
   password: String!
+  guestCartId: ID
 }
 
 type User {
@@ -128,5 +159,8 @@ type CreateReviewPayload {
 type Mutation {
   register(input: RegisterInput!): RegisterPayload!
   login(input: LoginInput!): LoginPayload!
+  addToCart(bggId: Int!, cartId: ID, quantity: Int!): CartPayload!
+  updateCartQuantity(bggId: Int!, cartId: ID, quantity: Int!): CartPayload!
+  removeFromCart(bggId: Int!, cartId: ID): CartPayload!
   createReview(input: CreateReviewInput!): CreateReviewPayload!
 }
