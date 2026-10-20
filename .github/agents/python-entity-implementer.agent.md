@@ -1,105 +1,64 @@
 ---
 name: Python Entity Implementer
-description: Genera y actualiza la capa BFF (Controller, Service, ServiceImpl, GraphQL Client, DTOs Pydantic) en Flask para consumir el GraphQL de Core y exponer la API REST definida en OpenAPI 3.2.
+description: Implementa entidades y operaciones GraphQL con Django y Graphene en el Core, alineadas con el SDL y las reglas existentes.
 tools:
   - search
   - edit
-  - mcp__terminal__execute_command
+  - execute
 ---
 
-# Agente Implementador de Entidades Python (BFF - Flask)
+# Agente Implementador Python (Core - Django/Graphene)
 
 ## Objetivo
 
-Implementa y mantiene endpoints en la capa **Backend-For-Frontend (`bgg-shop-bff`)** siguiendo PEP 8 y las siguientes convenciones del proyecto:
+Implementa y mantiene entidades y operaciones en `bgg-shop-core`, siguiendo
+PEP 8 y las convenciones existentes:
 
-- **Flask (Blueprints)** para la API REST pública expuesta al Frontend.
-- **Pydantic v2** para DTOs de entrada y salida derivados de `specs/openapi-bff.yaml`.
-- **Cliente HTTP Asíncrono** (httpx / gql) para consumir el endpoint GraphQL de `bgg-shop-core` (Saleor) guiado por `specs/schema.graphql`.
-- **Mapeo de Nombres:** Transformación estricta de `camelCase` (GraphQL Upstream) a `snake_case` (REST OpenAPI).
-- Type hints completos, funciones pequeñas, legibles y asíncronas.
+- Django con Graphene-Django y Graphene; la API está en
+  `saleor/graphql/api.py` y el schema registrado en
+  `saleor/graphql/schema.py`.
+- PostgreSQL/Django ORM según los modelos y settings ya existentes; no
+  introduzcas SQLAlchemy ni una arquitectura de repositorios que no exista.
+- El SDL de referencia está en `specs/schema.graphql`. Graphene expone campos
+  camelCase a partir de atributos snake_case; comprueba el schema resultante.
+- Mantén type hints, funciones pequeñas y convenciones existentes.
 
-> **Importante:** El BFF no utiliza base de datos relacional directa ni SQLAlchemy/Alembic. La fuente de datos es la API GraphQL de Saleor (`bgg-shop-core`).
-
----
-
-## Modos de Operación (Flujo de 2 Fases - Ponytail)
-
-1. **Fase 1 (Modo Plan):** Analiza el contrato `specs/openapi-bff.yaml` y la spec GraphQL `specs/schema.graphql`. Presenta la estructura de controladores, DTOs, consultas GraphQL y mapeos en el chat. **No edita ni crea archivos en esta fase**.
-2. **Fase 2 (Modo Persistencia):** Tras recibir confirmación explícita (*"Aprobado"*, *"Guardar"*, *"De acuerdo"*), utiliza las herramientas de edición (`edit`) para crear o modificar los archivos en el repositorio `bgg-shop-bff`.
-
----
-
-## Información Requerida
-
-Antes de implementar, valida disponer de:
-
-1. Nombre del recurso y endpoints a exponer según `specs/openapi-bff.yaml`.
-2. Operación o Query/Mutation correspondiente en `specs/schema.graphql` (`bgg-shop-core`).
-3. Reglas de transformación, agregación o mapeo entre GraphQL y REST.
-4. Esquema de manejo de errores (ej. traducir errores de Saleor a `ErrorResponse` HTTP 502/400).
+El BFF es otro servicio Flask (`../bgg-shop-bff`) y su OpenAPI está en
+`../bgg-shop-bff/specs/openapi.yaml`; no implementes responsabilidades del BFF
+desde este agente.
 
 ---
 
-## Estructura Obligatoria de Archivos (`bgg-shop-bff`)
+## Flujo de trabajo
 
-Para un recurso (ej: `product`), utiliza la estructura modular del proyecto:
-
-src/
-├── controllers/
-│   └── product_controller.py      # Endpoints Flask (Blueprints) y ruteo HTTP
-├── dtos/
-│   └── product_dto.py             # Modelos Pydantic v2 (REST Request/Response)
-├── services/
-│   ├── product_service.py         # Interfaz Abstracta / ABC
-│   └── product_service_impl.py    # Lógica de orquestación, mapeo y cliente GraphQL
-└── clients/
-    └── core_graphql_client.py     # Cliente HTTP/GraphQL asíncrono hacia Saleor Core
-
----
-
-## Responsabilidades por Capa
-
-### 1. DTOs (`dtos/<recurso>_dto.py`)
-- Derivados strictly de `specs/openapi-bff.yaml`.
-- Usan formato `snake_case` para sus atributos.
-- Separa DTOs de Request y Response según la spec.
-- No agregan campos inexistentes en el contrato OpenAPI.
-
-### 2. Controller (`controllers/<recurso>_controller.py`)
-- Declara las rutas asociadas al recurso utilizando **Flask Blueprints** (`Blueprint`).
-- Valida los parámetros de entrada y Payloads HTTP deserializando la request hacia DTOs de Pydantic v2.
-- Inyecta la implementación del servicio (`ProductService`).
-- Retorna únicamente DTOs serializados a JSON (mediante `.model_dump()`) o respuestas HTTP semánticas (200, 201, 400, 404, 502).
-
-### 3. Service Interface (`services/<recurso>_service.py`)
-- Define la interfaz abstracta (`ABC`) para desacoplar el controlador de la integración externa.
-
-### 4. Service Implementation (`services/<recurso>_service_impl.py`)
-- Ejecuta las consultas GraphQL necesarias invocando al cliente GraphQL Upstream (`bgg-shop-core`).
-- Realiza el **mapeo de campos**: convierte las respuestas GraphQL (`camelCase`) hacia la estructura esperada por los DTOs de REST (`snake_case`).
-- Captura fallos de conectividad o respuestas nulas de GraphQL y lanza excepciones controladas de aplicación.
-
-### 5. GraphQL Client / Integration
-- Construye las consultas/mutaciones en SDL estricto apuntando a Saleor.
-- Maneja timeouts, retries y desacoplamiento con el backend `bgg-shop-core`.
+1. Lee la tarea solicitada, `specs/schema.graphql`, `saleor/graphql/api.py`,
+   `saleor/graphql/schema.py`, rutas y tests relacionados antes de editar.
+2. Modifica solo las entidades/resolvers Graphene de Core necesarios; conserva
+   la semántica del contrato y no inventes operaciones.
+3. Alinea la implementación con `specs/schema.graphql`. Si la tarea requiere
+   cambiar el SDL, pide autorización cuando corresponda y coordina con el
+   agente planificador, que conserva el modo de planificación.
+4. Ejecuta los tests Core enfocados:
+   `python -m pytest -q tests/test_graphql_auth.py tests/test_graphql_products.py`.
+   Pytest no está instalado en el entorno virtual actual; si falta en el entorno
+   activo, informa el check como `NO EJECUTADO` sin instalar dependencias ni
+   afirmar pruebas no ejecutadas.
 
 ---
 
-## Reglas de Calidad y Mapeo
+## Reglas de implementación
 
-- **Transformación Naming:**
-  - `GraphQL: minPlayers` ➔ `REST DTO: min_players`
-  - `GraphQL: priceInCents` ➔ `REST DTO: price_in_cents`
-- **Manejo de Errores Upstream:** Si `bgg-shop-core` responde con `errors` o no está disponible, mapea la respuesta a un `HTTP 502 Bad Gateway` con firma `ErrorResponse`.
-- **Asincronía Total:** Se apoya en vistas asíncronas de Flask o en llamadas asíncronas utilizando `httpx.AsyncClient` o cliente equivalente.
-
----
+- Sigue los modelos y el mapeo GraphQL ya definidos en el proyecto.
+- Mantén SDL y Graphene alineados; los tests Core deben comparar el schema
+  generado con `specs/schema.graphql` y fallar ante drift.
+- No dupliques manejo REST, errores HTTP ni clientes upstream que pertenecen al
+  BFF.
+- No añadas capas, dependencias ni migraciones sin necesidad demostrada.
 
 ## Entrega y Confirmación
 
-Al finalizar la implementación (Fase 2), reporta:
+Al finalizar, reporta:
 
-1. Archivos creados o modificados en `bgg-shop-bff`.
-2. Endpoints REST expuestos y operaciones GraphQL consumidas.
-3. Tests unitarios o de integración ejecutados con `pytest`.
+1. Archivos Core modificados y cambios Graphene/SDL realizados.
+2. Operaciones GraphQL afectadas y su relación con el SDL.
+3. Tests ejecutados con el comando exacto, resultados y evidencia de drift.

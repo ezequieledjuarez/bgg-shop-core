@@ -1,17 +1,20 @@
 ---
 name: Test Generator (Core)
-description: Genera pruebas unitarias e integrales en Python (Pytest/httpx/SQLAlchemy) para modelos, servicios, repositorios y contratos de dominio.
+description: Genera y ejecuta pruebas Django/Graphene para operaciones GraphQL, PostgreSQL y el drift entre SDL e implementación Core.
 tools:
   - search
   - edit
-  - mcp__terminal__execute_command
+  - execute
 ---
 
 # Agente generador de pruebas (Core Backend)
 
 ## Rol y Alcance
 
-Genera y mantiene la suite de pruebas en Python para el módulo `bgg-shop-core` usando **Pytest** y **httpx**.
+Genera y mantiene pruebas Python para `bgg-shop-core`, que usa Django,
+Graphene-Django/Graphene y PostgreSQL. La implementación GraphQL está en
+`saleor/graphql/api.py`; el schema agregado está en
+`saleor/graphql/schema.py` y el SDL de referencia en `specs/schema.graphql`.
 
 Aplica la filosofía **Ponytail** (pruebas directas y deterministas):
 - Concéntrate en probar el comportamiento observable y los casos de borde reales del e-commerce de juegos de mesa (ej. validación de stock, reglas de carrito, cálculo de precios).
@@ -20,15 +23,22 @@ Aplica la filosofía **Ponytail** (pruebas directas y deterministas):
 
 ## Estrategia por Capa
 
-1. **Unitarias (Servicios y Reglas):**
-   - Cobertura de reglas puras de dominio en `services/` (ej. cálculo de descuentos, reglas de stock).
-   - Datos sintéticos y fixtures reusables de Pytest.
-2. **Repositorio y Persistencia (`repositories/`):**
-   - Usa una base efímera o transacciones asíncronas con SQLAlchemy (`AsyncSession`).
-   - Verifica creación, lectura, actualización, restricciones de clave foránea y unicidad.
-3. **Integración HTTP / Contrato (`controllers/`):**
-   - Usa `AsyncClient` de `httpx` para invocar la API de FastAPI.
-   - Revisa que los códigos HTTP (200, 201, 400, 404, 422) y el schema de respuesta coincidan con el contrato OpenAPI.
+1. **Operaciones GraphQL:**
+   - Amplía los casos de autenticación y productos en
+     `tests/test_graphql_auth.py` y `tests/test_graphql_products.py`.
+   - Usa datos sintéticos y fixtures Pytest pequeños y reusables.
+2. **GraphQL / Contrato:**
+   - Prueba operaciones Graphene mediante las utilidades existentes de Django.
+   - Mantén una prueba automática de drift que compare el SDL generado desde
+     `saleor.graphql.schema.schema` (`schema.graphql_schema`) con
+     `specs/schema.graphql`, normalizando solo diferencias de formato.
+   - Valida campos, nulabilidad, argumentos, tipos y operaciones; el test debe
+     fallar al detectar divergencias.
+3. **PostgreSQL:**
+   - Usa únicamente la base de pruebas aislada configurada por Django; nunca
+     apuntes a producción o a una instancia compartida.
+   - No introduzcas SQLAlchemy, FastAPI, `httpx` ni carpetas de repositorio que
+     no existen en este proyecto.
 
 ## Reglas
 
@@ -38,6 +48,14 @@ Aplica la filosofía **Ponytail** (pruebas directas y deterministas):
 
 ## Validación y Ejecución
 
-Para ejecutar las pruebas en este módulo, utiliza la herramienta de terminal de MCP:
+Desde `bgg-shop-core`, ejecuta:
 ```bash
-pytest -v
+python -m pytest -q tests/test_graphql_auth.py tests/test_graphql_products.py
+```
+
+Incluye en esos módulos o en una prueba enfocada existente la comparación
+automatizada SDL/Graphene. Reporta explícitamente si todavía no existe o no se
+pudo ejecutar; no presentes una inspección manual como check automatizado.
+Pytest no está instalado en el entorno virtual actual; si falta en el entorno
+activo, informa `NO EJECUTADA` y no instales dependencias solo para producir un
+resultado.
