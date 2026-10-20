@@ -7,7 +7,7 @@ from django.conf import settings
 def currency_id():
     if settings.MP_CURRENCY_ID:
         return settings.MP_CURRENCY_ID
-    return {
+    countries = {
         "AR": "ARS",
         "BR": "BRL",
         "CL": "CLP",
@@ -15,7 +15,10 @@ def currency_id():
         "MX": "MXN",
         "UY": "UYU",
         "US": "USD",
-    }.get(settings.COUNTRY_MONEY_CODE.upper())
+    }
+    code = settings.COUNTRY_MONEY_CODE.upper()
+    # COUNTRY_MONEY_CODE may hold either a country or a currency code.
+    return countries.get(code) or (code if code in countries.values() else None)
 
 
 def configuration_error():

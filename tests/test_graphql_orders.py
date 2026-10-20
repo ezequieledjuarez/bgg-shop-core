@@ -466,3 +466,8 @@ def test_cancelled_order_is_not_revived_by_approved_payment(monkeypatch):
     assert result.order.status == "cancelled"
     assert db["products"][7] == 9
     assert db["invoice"] is None
+
+
+def test_currency_id_accepts_currency_code_directly():
+    with override_settings(MP_CURRENCY_ID="", COUNTRY_MONEY_CODE="ars"):
+        assert orders.payments.currency_id() == "ARS"
