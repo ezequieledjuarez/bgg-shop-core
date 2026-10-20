@@ -8,6 +8,10 @@ import jwt
 from django.db import IntegrityError, connection, transaction
 from graphql import GraphQLError
 
+from .orders import (
+    CheckoutMutation, ConfirmPaymentMutation, PurchaseOrder, RetryPaymentMutation,
+)
+
 
 class Product(graphene.ObjectType):
     bgg_id = graphene.Int(required=True)
@@ -377,6 +381,8 @@ class Query(graphene.ObjectType):
         price_max=graphene.Float(),
     )
     cart = graphene.Field(Cart, required=True, cart_id=graphene.ID())
+    my_orders = graphene.List(graphene.NonNull(PurchaseOrder), required=True)
+    my_order = graphene.Field(PurchaseOrder, id=graphene.ID(required=True))
 
     def resolve_hello(self, info):
         return "Saleor API activa y respondiendo OK"
@@ -479,6 +485,31 @@ class Query(graphene.ObjectType):
         with transaction.atomic(), connection.cursor() as cursor:
             identifier = _get_cart_id(cursor, user, cart_id)
             return _cart_details(cursor, identifier)
+
+    def resolve_my_orders(self, info):
+        user = _authenticated_user(info)
+        if user is None:
+            raise GraphQLError("Authentication is required.")
+        from .orders import _load_order, _order_payload
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT id FROM purchase_order WHERE user_id = %s ORDER BY created_at DESC",
+                [user.pk],
+            )
+            identifiers = [row[0] for row in cursor.fetchall()]
+            return [
+                _order_payload(cursor, _load_order(cursor, identifier, user.pk))
+                for identifier in identifiers
+            ]
+
+    def resolve_my_order(self, info, id):
+        user = _authenticated_user(info)
+        if user is None:
+            raise GraphQLError("Authentication is required.")
+        from .orders import _order_by_id
+
+        return _order_by_id(info, id, user)
 
 
 class RegisterInput(graphene.InputObjectType):
@@ -710,6 +741,9 @@ class Mutation(graphene.ObjectType):
     update_cart_quantity = UpdateCartQuantityMutation.Field(required=True)
     remove_from_cart = RemoveFromCartMutation.Field(required=True)
     create_review = CreateReviewMutation.Field(required=True)
+    checkout = CheckoutMutation.Field(required=True)
+    retry_payment = RetryPaymentMutation.Field(required=True)
+    confirm_payment = ConfirmPaymentMutation.Field(required=True)
 
 
 schema = graphene.Schema(query=Query, mutation=Mutation)

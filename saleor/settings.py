@@ -21,6 +21,11 @@ environ.Env.read_env(os.path.join(BASE_DIR, ".env"))
 # ==============================================================================
 SECRET_KEY = env("SECRET_KEY", default="django-insecure-super-secret-key")
 DEBUG = env("DEBUG")
+MP_ACCESS_TOKEN = env("MP_ACCESS_TOKEN", default="")
+MP_SANDBOX = env.bool("MP_SANDBOX", default=False)
+MP_CURRENCY_ID = env("MP_CURRENCY_ID", default="")
+COUNTRY_MONEY_CODE = env("COUNTRY_MONEY_CODE", default="AR")
+FRONTEND_URL = env("FRONTEND_URL", default="http://localhost:3000")
 
 # Permite cualquier Host en desarrollo para evitar el HTTP 400 Bad Request
 ALLOWED_HOSTS = env.list("ALLOWED_HOSTS", default=["*"])

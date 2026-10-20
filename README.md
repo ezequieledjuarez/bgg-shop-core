@@ -118,3 +118,9 @@ directamente. Para el detalle de CU-C02, ver
 ```bash
 git clone [https://github.com/tu-usuario/bgg-shop-core.git](https://github.com/tu-usuario/bgg-shop-core.git)
 cd bgg-shop-core
+
+## Purchase checkout
+
+Authenticated GraphQL buyers can use `checkout`, `retryPayment`, and `confirmPayment`, then query `myOrders` or `myOrder`. Paid orders expose an invoice number and the PDF route `GET /invoices/<order_id>/`. Mercado Pago Checkout Pro is sandbox-only; inventory is reduced only after the verified payment is approved.
+
+Configure `MP_ACCESS_TOKEN`, `MP_SANDBOX=true`, and either `MP_CURRENCY_ID` or `COUNTRY_MONEY_CODE` (AR defaults to ARS). Set `FRONTEND_URL` for payment return URLs. Keep the access token in the API environment only and never commit it. The order and invoice tables are provisioned by the additive DDL in `../import_catalog.sql`.

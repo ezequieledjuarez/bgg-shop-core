@@ -41,3 +41,6 @@ uvicorn[standard]>=0.27.1
 # 7. HERRAMIENTAS DE TESTING
 # ==============================================================================
 pytest>=7.0.0
+# Checkout payments and on-demand invoice PDFs
+mercadopago>=2.2.3
+reportlab>=4.1.0
