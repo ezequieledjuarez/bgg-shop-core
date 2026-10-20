@@ -1,10 +1,12 @@
 import datetime
 import re
 import unicodedata
+import uuid
 
 import graphene
 import jwt
-from django.db import IntegrityError, connection
+from django.db import IntegrityError, connection, transaction
+from graphql import GraphQLError
 
 
 class Product(graphene.ObjectType):
@@ -20,6 +22,7 @@ class Product(graphene.ObjectType):
     price = graphene.Float(required=True)
     publisher = graphene.String(required=True)
     image_url = graphene.String(required=True)
+    quantity = graphene.Int(required=True)
 
 
 class ProductPage(graphene.ObjectType):
@@ -53,8 +56,35 @@ class ProductDetail(graphene.ObjectType):
     price = graphene.Float(required=True)
     publisher = graphene.String(required=True)
     image_url = graphene.String(required=True)
+    quantity = graphene.Int(required=True)
     review_summary = graphene.Field(ReviewSummary, required=True)
     approved_reviews = graphene.List(graphene.NonNull(PublicReview), required=True)
+
+
+class CartLine(graphene.ObjectType):
+    bgg_id = graphene.Int(required=True)
+    name = graphene.String(required=True)
+    quantity = graphene.Int(required=True)
+    inventory_quantity = graphene.Int(required=True)
+    unit_price = graphene.Float(required=True)
+    subtotal = graphene.Float(required=True)
+
+
+class Cart(graphene.ObjectType):
+    cart_id = graphene.ID(required=True)
+    lines = graphene.List(graphene.NonNull(CartLine), required=True)
+    subtotal = graphene.Float(required=True)
+
+
+class CartUserError(graphene.ObjectType):
+    field = graphene.List(graphene.NonNull(graphene.String))
+    code = graphene.String(required=True)
+    message = graphene.String(required=True)
+
+
+class CartPayload(graphene.ObjectType):
+    cart = graphene.Field(Cart, required=True)
+    user_errors = graphene.List(graphene.NonNull(CartUserError), required=True)
 
 
 class ReviewUserError(graphene.ObjectType):
@@ -95,6 +125,7 @@ def _product_from_row(row):
         "price": row["price_amount"],
         "publisher": row["publisher"],
         "image_url": row["image_url"],
+        "quantity": row["quantity"],
     }
 
 
@@ -102,7 +133,7 @@ def _product_by_slug(cursor, slug):
     cursor.execute(
         "SELECT bgg_id, name, release_year, min_players, max_players, "
         "playing_time_minutes, min_age, weight, category, price_amount, "
-        "publisher, image_url FROM product_boardgame"
+        "publisher, image_url, quantity FROM product_boardgame"
     )
     columns = [column[0] for column in cursor.description]
     for row in cursor.fetchall():
@@ -134,6 +165,199 @@ def _authenticated_user(info):
         return None
 
 
+def _cart_error(code, message, field=None):
+    return CartUserError(field=field, code=code, message=message)
+
+
+def _get_cart_id(cursor, user, cart_id=None):
+    if user is not None:
+        cursor.execute(
+            "SELECT cart_id FROM shopping_cart WHERE user_id = %s FOR UPDATE",
+            [user.pk],
+        )
+        row = cursor.fetchone()
+        if row:
+            return str(row[0])
+        identifier = uuid.uuid4()
+        cursor.execute(
+            "INSERT INTO shopping_cart (cart_id, user_id) VALUES (%s, %s) "
+            "ON CONFLICT (user_id) DO NOTHING",
+            [identifier, user.pk],
+        )
+        cursor.execute(
+            "SELECT cart_id FROM shopping_cart WHERE user_id = %s FOR UPDATE",
+            [user.pk],
+        )
+        return str(cursor.fetchone()[0])
+
+    if cart_id is not None:
+        try:
+            identifier = uuid.UUID(str(cart_id))
+        except (AttributeError, TypeError, ValueError) as error:
+            raise GraphQLError("Invalid cart identifier.") from error
+        cursor.execute(
+            "SELECT cart_id FROM shopping_cart "
+            "WHERE cart_id = %s AND user_id IS NULL FOR UPDATE",
+            [identifier],
+        )
+        row = cursor.fetchone()
+        if row is None:
+            raise GraphQLError("Invalid cart identifier.")
+        return str(row[0])
+
+    identifier = uuid.uuid4()
+    cursor.execute(
+        "INSERT INTO shopping_cart (cart_id) VALUES (%s)",
+        [identifier],
+    )
+    return str(identifier)
+
+
+def _cart_details(cursor, cart_id):
+    cursor.execute(
+        "SELECT p.bgg_id, p.name, line.quantity, p.quantity, p.price_amount "
+        "FROM shopping_cart cart "
+        "LEFT JOIN shopping_cart_line line ON line.cart_id = cart.cart_id "
+        "LEFT JOIN product_boardgame p ON p.bgg_id = line.bgg_id "
+        "WHERE cart.cart_id = %s ORDER BY p.name",
+        [uuid.UUID(str(cart_id))],
+    )
+    lines = []
+    for bgg_id, name, quantity, inventory_quantity, unit_price in cursor.fetchall():
+        if bgg_id is None:
+            continue
+        price = float(unit_price)
+        lines.append(CartLine(
+            bgg_id=bgg_id,
+            name=name,
+            quantity=quantity,
+            inventory_quantity=inventory_quantity,
+            unit_price=price,
+            subtotal=price * quantity,
+        ))
+    return Cart(
+        cart_id=str(cart_id),
+        lines=lines,
+        subtotal=sum(line.subtotal for line in lines),
+    )
+
+
+def _cart_mutation(info, cart_id, bgg_id, quantity, action):
+    user = _authenticated_user(info)
+    with transaction.atomic(), connection.cursor() as cursor:
+        identifier = _get_cart_id(cursor, user, cart_id)
+        errors = []
+        if action != "remove":
+            if quantity is None or quantity < 1:
+                errors.append(_cart_error(
+                    "INVALID_QUANTITY", "Quantity must be a positive integer.", ["quantity"]
+                ))
+            else:
+                cursor.execute(
+                    "SELECT quantity FROM product_boardgame WHERE bgg_id = %s",
+                    [bgg_id],
+                )
+                product = cursor.fetchone()
+                if product is None:
+                    errors.append(_cart_error(
+                        "PRODUCT_NOT_FOUND", "The requested game does not exist.", ["bggId"]
+                    ))
+                else:
+                    inventory_quantity = product[0]
+                    cursor.execute(
+                        "SELECT quantity FROM shopping_cart_line "
+                        "WHERE cart_id = %s AND bgg_id = %s",
+                        [uuid.UUID(identifier), bgg_id],
+                    )
+                    existing = cursor.fetchone()
+                    if action == "update" and existing is None:
+                        errors.append(_cart_error(
+                            "CART_LINE_NOT_FOUND", "The game is not in this cart.", ["bggId"]
+                        ))
+                    else:
+                        requested = quantity + (existing[0] if existing and action == "add" else 0)
+                        if requested > inventory_quantity:
+                            errors.append(_cart_error(
+                                "INSUFFICIENT_STOCK",
+                                "Requested quantity exceeds current inventory; adjusted to the available stock.",
+                                ["quantity"],
+                            ))
+                            requested = inventory_quantity
+                        if requested > 0:
+                            cursor.execute(
+                                "INSERT INTO shopping_cart_line (cart_id, bgg_id, quantity) "
+                                "VALUES (%s, %s, %s) "
+                                "ON CONFLICT (cart_id, bgg_id) "
+                                "DO UPDATE SET quantity = EXCLUDED.quantity",
+                                [uuid.UUID(identifier), bgg_id, requested],
+                            )
+        if action == "remove":
+            cursor.execute(
+                "DELETE FROM shopping_cart_line WHERE cart_id = %s AND bgg_id = %s",
+                [uuid.UUID(identifier), bgg_id],
+            )
+        cart = _cart_details(cursor, identifier)
+    return CartPayload(cart=cart, user_errors=errors)
+
+
+def _merge_guest_cart(guest_cart_id, user):
+    if not guest_cart_id:
+        return
+    try:
+        guest_id = uuid.UUID(str(guest_cart_id))
+    except (AttributeError, TypeError, ValueError):
+        return
+    with transaction.atomic(), connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT cart_id FROM shopping_cart "
+            "WHERE cart_id = %s AND user_id IS NULL FOR UPDATE",
+            [guest_id],
+        )
+        if cursor.fetchone() is None:
+            return
+        account_id = uuid.UUID(_get_cart_id(cursor, user))
+        cursor.execute(
+            "SELECT bgg_id, quantity FROM shopping_cart_line "
+            "WHERE cart_id = %s FOR UPDATE",
+            [guest_id],
+        )
+        guest_lines = cursor.fetchall()
+        for bgg_id, guest_quantity in guest_lines:
+            cursor.execute(
+                "SELECT quantity FROM product_boardgame WHERE bgg_id = %s",
+                [bgg_id],
+            )
+            product = cursor.fetchone()
+            if product is None:
+                continue
+            inventory_quantity = product[0]
+            cursor.execute(
+                "SELECT quantity FROM shopping_cart_line "
+                "WHERE cart_id = %s AND bgg_id = %s FOR UPDATE",
+                [account_id, bgg_id],
+            )
+            account_line = cursor.fetchone()
+            merged_quantity = min(
+                inventory_quantity,
+                guest_quantity + (account_line[0] if account_line else 0),
+            )
+            if merged_quantity:
+                cursor.execute(
+                    "INSERT INTO shopping_cart_line (cart_id, bgg_id, quantity) "
+                    "VALUES (%s, %s, %s) "
+                    "ON CONFLICT (cart_id, bgg_id) "
+                    "DO UPDATE SET quantity = EXCLUDED.quantity",
+                    [account_id, bgg_id, merged_quantity],
+                )
+            else:
+                cursor.execute(
+                    "DELETE FROM shopping_cart_line "
+                    "WHERE cart_id = %s AND bgg_id = %s",
+                    [account_id, bgg_id],
+                )
+        cursor.execute("DELETE FROM shopping_cart WHERE cart_id = %s", [guest_id])
+
+
 class Query(graphene.ObjectType):
     hello = graphene.String(default_value="Saleor API activa y respondiendo OK")
     product_by_slug = graphene.Field(
@@ -152,6 +376,7 @@ class Query(graphene.ObjectType):
         price_min=graphene.Float(),
         price_max=graphene.Float(),
     )
+    cart = graphene.Field(Cart, required=True, cart_id=graphene.ID())
 
     def resolve_hello(self, info):
         return "Saleor API activa y respondiendo OK"
@@ -229,7 +454,7 @@ class Query(graphene.ObjectType):
             total = cursor.fetchone()[0]
             cursor.execute(
                 f"SELECT bgg_id, name, release_year, min_players, max_players, playing_time_minutes, "
-                f"min_age, weight, category, price_amount, publisher, image_url "
+                f"min_age, weight, category, price_amount, publisher, image_url, quantity "
                 f"FROM product_boardgame {where} ORDER BY id LIMIT %s OFFSET %s",
                 [*parameters, page_size, (page - 1) * page_size],
             )
@@ -242,11 +467,18 @@ class Query(graphene.ObjectType):
                 playing_time_minutes=row["playing_time_minutes"], min_age=row["min_age"],
                 weight=row["weight"], price=row["price_amount"], publisher=row["publisher"],
                 image_url=row["image_url"],
+                quantity=row["quantity"],
                 category=[item.strip() for item in (row["category"] or "").split(",") if item.strip()],
             ) for row in rows],
             page=page, page_size=page_size, total=total,
             total_pages=(total + page_size - 1) // page_size,
         )
+
+    def resolve_cart(self, info, cart_id=None):
+        user = _authenticated_user(info)
+        with transaction.atomic(), connection.cursor() as cursor:
+            identifier = _get_cart_id(cursor, user, cart_id)
+            return _cart_details(cursor, identifier)
 
 
 class RegisterInput(graphene.InputObjectType):
@@ -259,6 +491,7 @@ class RegisterInput(graphene.InputObjectType):
 class LoginInput(graphene.InputObjectType):
     email = graphene.String(required=True)
     password = graphene.String(required=True)
+    guest_cart_id = graphene.ID()
 
 
 class AuthUser(graphene.ObjectType):
@@ -355,7 +588,47 @@ class LoginMutation(graphene.Mutation):
             return LoginPayload(errors=[_auth_error(
                 "Invalid email or password.", "INVALID_CREDENTIALS"
             )])
+        if input.guest_cart_id:
+            _merge_guest_cart(input.guest_cart_id, user)
         return LoginPayload(user=_auth_user(user), tokens=_auth_tokens(user.pk), errors=[])
+
+
+class AddToCartMutation(graphene.Mutation):
+    class Arguments:
+        cart_id = graphene.ID()
+        bgg_id = graphene.Int(required=True)
+        quantity = graphene.Int(required=True)
+
+    Output = CartPayload
+
+    @staticmethod
+    def mutate(_root, info, bgg_id, quantity, cart_id=None):
+        return _cart_mutation(info, cart_id, bgg_id, quantity, "add")
+
+
+class UpdateCartQuantityMutation(graphene.Mutation):
+    class Arguments:
+        cart_id = graphene.ID()
+        bgg_id = graphene.Int(required=True)
+        quantity = graphene.Int(required=True)
+
+    Output = CartPayload
+
+    @staticmethod
+    def mutate(_root, info, bgg_id, quantity, cart_id=None):
+        return _cart_mutation(info, cart_id, bgg_id, quantity, "update")
+
+
+class RemoveFromCartMutation(graphene.Mutation):
+    class Arguments:
+        cart_id = graphene.ID()
+        bgg_id = graphene.Int(required=True)
+
+    Output = CartPayload
+
+    @staticmethod
+    def mutate(_root, info, bgg_id, cart_id=None):
+        return _cart_mutation(info, cart_id, bgg_id, None, "remove")
 
 
 class CreateReviewMutation(graphene.Mutation):
@@ -433,6 +706,9 @@ class CreateReviewMutation(graphene.Mutation):
 class Mutation(graphene.ObjectType):
     register = RegisterMutation.Field(required=True)
     login = LoginMutation.Field(required=True)
+    add_to_cart = AddToCartMutation.Field(required=True)
+    update_cart_quantity = UpdateCartQuantityMutation.Field(required=True)
+    remove_from_cart = RemoveFromCartMutation.Field(required=True)
     create_review = CreateReviewMutation.Field(required=True)
 
 

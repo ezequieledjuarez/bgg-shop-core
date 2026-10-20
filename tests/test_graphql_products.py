@@ -1,14 +1,37 @@
 import os
 import sys
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import django
+from graphql import build_schema
+from graphql.utilities import introspection_from_schema
 
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "saleor.settings")
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 django.setup()
 
 from saleor.graphql.api import schema
+
+
+def _normalize_schema(value):
+    if isinstance(value, dict):
+        return {key: _normalize_schema(item) for key, item in sorted(value.items())}
+    if isinstance(value, list):
+        normalized = [_normalize_schema(item) for item in value]
+        if all(isinstance(item, dict) and "name" in item for item in normalized):
+            return sorted(normalized, key=lambda item: item["name"])
+        return normalized
+    return value
+
+
+def test_generated_schema_matches_reference_sdl():
+    schema_path = Path(__file__).resolve().parents[1] / "specs" / "schema.graphql"
+    reference_schema = build_schema(schema_path.read_text())
+
+    assert _normalize_schema(introspection_from_schema(schema.graphql_schema)) == (
+        _normalize_schema(introspection_from_schema(reference_schema))
+    )
 
 
 def test_products_query_maps_rows_and_paginates():
@@ -27,9 +50,10 @@ def test_products_query_maps_rows_and_paginates():
         ("price_amount",),
         ("publisher",),
         ("image_url",),
+        ("quantity",),
     ]
     cursor.fetchall.return_value = [
-        (1, "Game", 2020, 2, 4, 60, 10, 2.5, "Strategy, Family", 12.5, "Pub", "/game.jpg")
+        (1, "Game", 2020, 2, 4, 60, 10, 2.5, "Strategy, Family", 12.5, "Pub", "/game.jpg", 10)
     ]
     connection = MagicMock()
     connection.cursor.return_value.__enter__.return_value = cursor
@@ -38,7 +62,7 @@ def test_products_query_maps_rows_and_paginates():
         result = schema.execute(
             """
             { products(page: 2, pageSize: 1) {
-              items { bggId name category price imageUrl }
+              items { bggId name category price imageUrl quantity }
               page pageSize total totalPages
             } }
             """
@@ -52,6 +76,7 @@ def test_products_query_maps_rows_and_paginates():
             "category": ["Strategy", "Family"],
             "price": 12.5,
             "imageUrl": "/game.jpg",
+            "quantity": 10,
         }],
         "page": 2,
         "pageSize": 1,
@@ -68,9 +93,10 @@ def test_products_query_applies_filters_before_pagination():
         ("max_players",), ("playing_time_minutes",), ("min_age",),
         ("weight",), ("category",), ("price_amount",), ("publisher",),
         ("image_url",),
+        ("quantity",),
     ]
     cursor.fetchall.return_value = [
-        (7, "Game", 2020, 2, 4, 60, 10, 2.5, "Juegos de Estrategia", 12.5, "Pub", "/game.jpg")
+        (7, "Game", 2020, 2, 4, 60, 10, 2.5, "Juegos de Estrategia", 12.5, "Pub", "/game.jpg", 10)
     ]
     connection = MagicMock()
     connection.cursor.return_value.__enter__.return_value = cursor
