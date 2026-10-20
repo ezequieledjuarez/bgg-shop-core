@@ -1,8 +1,10 @@
 import datetime
+import re
+import unicodedata
 
 import graphene
 import jwt
-from django.db import connection
+from django.db import IntegrityError, connection
 
 
 class Product(graphene.ObjectType):
@@ -28,8 +30,116 @@ class ProductPage(graphene.ObjectType):
     total_pages = graphene.Int(required=True)
 
 
+class PublicReview(graphene.ObjectType):
+    rating = graphene.Int(required=True)
+    body = graphene.String(required=True)
+    created_at = graphene.String(required=True)
+
+
+class ReviewSummary(graphene.ObjectType):
+    approved_review_count = graphene.Int(required=True)
+    average_rating = graphene.Float()
+
+
+class ProductDetail(graphene.ObjectType):
+    name = graphene.String(required=True)
+    release_year = graphene.Int(required=True)
+    min_players = graphene.Int(required=True)
+    max_players = graphene.Int(required=True)
+    playing_time_minutes = graphene.Int(required=True)
+    min_age = graphene.Int(required=True)
+    weight = graphene.Float(required=True)
+    category = graphene.List(graphene.NonNull(graphene.String), required=True)
+    price = graphene.Float(required=True)
+    publisher = graphene.String(required=True)
+    image_url = graphene.String(required=True)
+    review_summary = graphene.Field(ReviewSummary, required=True)
+    approved_reviews = graphene.List(graphene.NonNull(PublicReview), required=True)
+
+
+class ReviewUserError(graphene.ObjectType):
+    field = graphene.List(graphene.NonNull(graphene.String))
+    code = graphene.String(required=True)
+    message = graphene.String(required=True)
+
+
+class CreateReviewPayload(graphene.ObjectType):
+    created = graphene.Boolean(required=True)
+    status = graphene.String()
+    created_at = graphene.String()
+    user_errors = graphene.List(graphene.NonNull(ReviewUserError), required=True)
+
+
+class CreateReviewInput(graphene.InputObjectType):
+    product_slug = graphene.String(required=True)
+    rating = graphene.Int(required=True)
+    body = graphene.String(required=True)
+
+
+def _slugify(value):
+    normalized = unicodedata.normalize("NFKD", value)
+    normalized = "".join(char for char in normalized if not unicodedata.combining(char))
+    return re.sub(r"-+", "-", re.sub(r"[^a-z0-9]+", "-", normalized.casefold())).strip("-")
+
+
+def _product_from_row(row):
+    return {
+        "name": row["name"],
+        "release_year": row["release_year"],
+        "min_players": row["min_players"],
+        "max_players": row["max_players"],
+        "playing_time_minutes": row["playing_time_minutes"],
+        "min_age": row["min_age"],
+        "weight": row["weight"],
+        "category": [item.strip() for item in (row["category"] or "").split(",") if item.strip()],
+        "price": row["price_amount"],
+        "publisher": row["publisher"],
+        "image_url": row["image_url"],
+    }
+
+
+def _product_by_slug(cursor, slug):
+    cursor.execute(
+        "SELECT bgg_id, name, release_year, min_players, max_players, "
+        "playing_time_minutes, min_age, weight, category, price_amount, "
+        "publisher, image_url FROM product_boardgame"
+    )
+    columns = [column[0] for column in cursor.description]
+    for row in cursor.fetchall():
+        product = dict(zip(columns, row))
+        if _slugify(product["name"]) == slug:
+            return product
+    return None
+
+
+def _review_error(code, message, field=None):
+    return ReviewUserError(field=field, code=code, message=message)
+
+
+def _authenticated_user(info):
+    from django.conf import settings
+    from django.contrib.auth.models import User
+
+    request = info.context
+    header = request.headers.get("Authorization", "")
+    if not header.startswith("Bearer "):
+        return None
+    token = header[7:].strip()
+    try:
+        claims = jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
+        if claims.get("token_type") != "access":
+            return None
+        return User.objects.get(pk=int(claims["sub"]), is_active=True)
+    except (KeyError, TypeError, ValueError, OverflowError, jwt.PyJWTError, User.DoesNotExist):
+        return None
+
+
 class Query(graphene.ObjectType):
     hello = graphene.String(default_value="Saleor API activa y respondiendo OK")
+    product_by_slug = graphene.Field(
+        ProductDetail,
+        slug=graphene.String(required=True),
+    )
     products = graphene.Field(
         ProductPage,
         page=graphene.Int(default_value=1),
@@ -45,6 +155,34 @@ class Query(graphene.ObjectType):
 
     def resolve_hello(self, info):
         return "Saleor API activa y respondiendo OK"
+
+    def resolve_product_by_slug(self, info, slug):
+        with connection.cursor() as cursor:
+            product = _product_by_slug(cursor, slug)
+            if product is None:
+                return None
+            cursor.execute(
+                "SELECT rating, body, created_at FROM product_review "
+                "WHERE bgg_id = %s AND status = 'APPROVED' ORDER BY created_at DESC",
+                [product["bgg_id"]],
+            )
+            reviews = cursor.fetchall()
+        public_reviews = [
+            PublicReview(rating=rating, body=body, created_at=created_at.isoformat())
+            for rating, body, created_at in reviews
+        ]
+        average = (
+            sum(review.rating for review in public_reviews) / len(public_reviews)
+            if public_reviews else None
+        )
+        return ProductDetail(
+            **_product_from_row(product),
+            review_summary=ReviewSummary(
+                approved_review_count=len(public_reviews),
+                average_rating=average,
+            ),
+            approved_reviews=public_reviews,
+        )
 
     def resolve_products(self, info, page=1, page_size=20, search=None,
                          year_published=None, min_players=None, max_players=None,
@@ -220,9 +358,82 @@ class LoginMutation(graphene.Mutation):
         return LoginPayload(user=_auth_user(user), tokens=_auth_tokens(user.pk), errors=[])
 
 
+class CreateReviewMutation(graphene.Mutation):
+    class Arguments:
+        input = CreateReviewInput(required=True)
+
+    Output = CreateReviewPayload
+
+    @staticmethod
+    def mutate(_root, info, input):
+        user = _authenticated_user(info)
+        if user is None:
+            return CreateReviewPayload(
+                created=False,
+                user_errors=[_review_error(
+                    "UNAUTHENTICATED", "Authentication is required."
+                )],
+            )
+        body = input.body.strip()
+        if not 1 <= input.rating <= 5:
+            return CreateReviewPayload(
+                created=False,
+                user_errors=[_review_error(
+                    "RATING_OUT_OF_RANGE", "Rating must be between 1 and 5.", ["rating"]
+                )],
+            )
+        if not body:
+            return CreateReviewPayload(
+                created=False,
+                user_errors=[_review_error(
+                    "BODY_REQUIRED", "Review text is required.", ["body"]
+                )],
+            )
+        if len(body) > 2000:
+            return CreateReviewPayload(
+                created=False,
+                user_errors=[_review_error(
+                    "BODY_TOO_LONG", "Review text must not exceed 2000 characters.", ["body"]
+                )],
+            )
+
+        with connection.cursor() as cursor:
+            product = _product_by_slug(cursor, input.product_slug)
+            if product is None:
+                return CreateReviewPayload(
+                    created=False,
+                    user_errors=[_review_error(
+                        "PRODUCT_NOT_FOUND", "The requested game does not exist.", ["productSlug"]
+                    )],
+                )
+            try:
+                cursor.execute(
+                    "INSERT INTO product_review (bgg_id, user_id, rating, body, status) "
+                    "VALUES (%s, %s, %s, %s, 'PENDING') "
+                    "RETURNING created_at",
+                    [product["bgg_id"], user.pk, input.rating, body],
+                )
+                created_at = cursor.fetchone()[0]
+            except IntegrityError:
+                return CreateReviewPayload(
+                    created=False,
+                    user_errors=[_review_error(
+                        "REVIEW_ALREADY_EXISTS",
+                        "You already reviewed this game.",
+                    )],
+                )
+        return CreateReviewPayload(
+            created=True,
+            status="PENDING",
+            created_at=created_at.isoformat(),
+            user_errors=[],
+        )
+
+
 class Mutation(graphene.ObjectType):
     register = RegisterMutation.Field(required=True)
     login = LoginMutation.Field(required=True)
+    create_review = CreateReviewMutation.Field(required=True)
 
 
 schema = graphene.Schema(query=Query, mutation=Mutation)

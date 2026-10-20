@@ -21,7 +21,35 @@ type ProductPage {
   totalPages: Int!
 }
 
+type PublicReview {
+  rating: Int!
+  body: String!
+  createdAt: String!
+}
+
+type ReviewSummary {
+  approvedReviewCount: Int!
+  averageRating: Float
+}
+
+type ProductDetail {
+  name: String!
+  releaseYear: Int!
+  minPlayers: Int!
+  maxPlayers: Int!
+  playingTimeMinutes: Int!
+  minAge: Int!
+  weight: Float!
+  category: [String!]!
+  price: Float!
+  publisher: String!
+  imageUrl: String!
+  reviewSummary: ReviewSummary!
+  approvedReviews: [PublicReview!]!
+}
+
 type Query {
+  productBySlug(slug: String!): ProductDetail
   products(
     page: Int = 1
     pageSize: Int = 20
@@ -78,7 +106,27 @@ type LoginPayload {
   errors: [UserError!]!
 }
 
+input CreateReviewInput {
+  productSlug: String!
+  rating: Int!
+  body: String!
+}
+
+type ReviewUserError {
+  field: [String!]
+  code: String!
+  message: String!
+}
+
+type CreateReviewPayload {
+  created: Boolean!
+  status: String
+  createdAt: String
+  userErrors: [ReviewUserError!]!
+}
+
 type Mutation {
   register(input: RegisterInput!): RegisterPayload!
   login(input: LoginInput!): LoginPayload!
+  createReview(input: CreateReviewInput!): CreateReviewPayload!
 }
