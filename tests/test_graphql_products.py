@@ -143,3 +143,35 @@ def test_products_query_rejects_inverted_price_range():
 
     assert result.data["products"] is None
     assert "priceMin" in str(result.errors[0])
+
+
+def test_product_by_slug_exposes_public_bgg_id():
+    cursor = MagicMock()
+    cursor.fetchall.return_value = []
+    connection = MagicMock()
+    connection.cursor.return_value.__enter__.return_value = cursor
+    product = {
+        "bgg_id": 13,
+        "name": "Catan",
+        "release_year": 1995,
+        "min_players": 3,
+        "max_players": 4,
+        "playing_time_minutes": 90,
+        "min_age": 10,
+        "weight": 2.3,
+        "category": "Strategy",
+        "price_amount": 49.99,
+        "publisher": "Kosmos",
+        "image_url": "/catan.jpg",
+        "quantity": 8,
+    }
+
+    with patch("saleor.graphql.api.connection", connection), patch(
+        "saleor.graphql.api._product_by_slug", return_value=product
+    ):
+        result = schema.execute(
+            '{ productBySlug(slug: "catan") { bggId } }'
+        )
+
+    assert result.errors is None
+    assert result.data["productBySlug"]["bggId"] == 13

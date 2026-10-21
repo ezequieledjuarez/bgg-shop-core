@@ -34,6 +34,7 @@ type ReviewSummary {
 }
 
 type ProductDetail {
+  bggId: Int!
   name: String!
   releaseYear: Int!
   minPlayers: Int!

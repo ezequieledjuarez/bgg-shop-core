@@ -50,6 +50,7 @@ class ReviewSummary(graphene.ObjectType):
 
 
 class ProductDetail(graphene.ObjectType):
+    bgg_id = graphene.Int(required=True)
     name = graphene.String(required=True)
     release_year = graphene.Int(required=True)
     min_players = graphene.Int(required=True)
@@ -119,6 +120,7 @@ def _slugify(value):
 
 def _product_from_row(row):
     return {
+        "bgg_id": row["bgg_id"],
         "name": row["name"],
         "release_year": row["release_year"],
         "min_players": row["min_players"],

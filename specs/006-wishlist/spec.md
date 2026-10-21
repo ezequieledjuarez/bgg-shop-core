@@ -2,6 +2,11 @@
 
 ## Core contract
 
+`ProductDetail` exposes the public BoardGameGeek product identifier as
+`bggId: Int!`. The BFF uses this value as `bgg_id` in its product-detail
+response so the Frontend can add the product to Wishlist from either catalog
+navigation or a direct detail route.
+
 Core stores Wishlist membership in `wishlist_entry`, keyed by the authenticated
 user and product. The composite primary key prevents duplicate entries, and
 foreign keys cascade when a user or catalog product is deleted. Apply this
