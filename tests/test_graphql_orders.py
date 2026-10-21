@@ -130,6 +130,8 @@ class OrderCursor:
                 for line in self.db["cart_lines"]
                 if not (line[0] == bgg_id and line[3] <= quantity)
             ]
+        elif sql.startswith("DELETE FROM wishlist_entry"):
+            self.db["wishlist_entries"].discard((params[0], params[1]))
         elif sql.startswith("UPDATE shopping_cart_line SET quantity = quantity -"):
             bought, bgg_id, quantity = params[0], params[2], params[3]
             self.db["cart_lines"] = [
@@ -195,6 +197,7 @@ def database(stock=9):
         "products": {7: stock},
         "order": None,
         "invoice": None,
+        "wishlist_entries": {(USER.pk, 7), (USER.pk, 8), (99, 7)},
         "created_at": __import__("datetime").datetime(2026, 1, 1),
     }
 
@@ -303,6 +306,10 @@ def test_confirm_payment_statuses(monkeypatch, status, expected):
     assert result.order.status == expected
     assert db["products"][7] == (7 if status == "approved" else 9)
     assert bool(db["invoice"]) is (status == "approved")
+    if status == "approved":
+        assert db["wishlist_entries"] == {(USER.pk, 8), (99, 7)}
+    else:
+        assert db["wishlist_entries"] == {(USER.pk, 7), (USER.pk, 8), (99, 7)}
     if status == "rejected":
         assert result.order.payment_status_detail == "accredited"
 
@@ -323,6 +330,7 @@ def test_approved_payment_with_stock_conflict_has_no_invoice(monkeypatch):
     assert result.order.status == "paid_stock_conflict"
     assert db["products"][7] == 1
     assert db["invoice"] is None
+    assert db["wishlist_entries"] == {(USER.pk, 7), (USER.pk, 8), (99, 7)}
 
 
 def test_confirm_rejects_owner_and_anonymous(monkeypatch):
@@ -341,6 +349,7 @@ def test_confirm_rejects_payment_amount_mismatch(monkeypatch):
     result = confirm(db, monkeypatch, payment(transaction_amount=99))
     assert result.user_errors[0].code == "PAYMENT_AMOUNT_MISMATCH"
     assert db["products"][7] == 9
+    assert db["wishlist_entries"] == {(USER.pk, 7), (USER.pk, 8), (99, 7)}
 
 
 def test_invoice_pdf_generates_pdf_and_hides_other_owners(monkeypatch):
@@ -404,6 +413,7 @@ def test_confirm_rejects_live_mode_payment(monkeypatch):
     result = confirm(db, monkeypatch, payment(live_mode=True))
     assert result.user_errors[0].code == "PAYMENT_NOT_VERIFIED"
     assert db["products"][7] == 9
+    assert db["wishlist_entries"] == {(USER.pk, 7), (USER.pk, 8), (99, 7)}
 
 
 def test_paid_confirmation_keeps_cart_changes_made_after_checkout(monkeypatch):
@@ -455,6 +465,7 @@ def test_confirm_rejects_payment_with_wrong_external_reference(monkeypatch):
     result = confirm(db, monkeypatch, payment(external_reference=str(uuid.uuid4())))
     assert result.user_errors[0].code == "PAYMENT_ORDER_MISMATCH"
     assert db["products"][7] == 9
+    assert db["wishlist_entries"] == {(USER.pk, 7), (USER.pk, 8), (99, 7)}
 
 
 def test_cancelled_order_is_not_revived_by_approved_payment(monkeypatch):

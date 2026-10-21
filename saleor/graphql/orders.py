@@ -479,6 +479,13 @@ def confirm_payment(info, order_id, payment_id):
                             "VALUES (%s, %s, %s) ON CONFLICT (order_id) DO NOTHING",
                             [identifier, now, order["total"]],
                         )
+                        # Remove only this buyer's purchased Wishlist products.
+                        for bgg_id, _quantity in lines:
+                            cursor.execute(
+                                "DELETE FROM wishlist_entry "
+                                "WHERE user_id = %s AND bgg_id = %s",
+                                [user.pk, bgg_id],
+                            )
                         # Remove only what was purchased; keep later cart edits.
                         for bgg_id, quantity in lines:
                             cart_filter = (
