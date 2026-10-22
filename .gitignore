@@ -71,7 +71,7 @@ Thumbs.db
 ehthumbs.db
 
 # Ignore Windows Zone.Identifier alternate data stream artifacts
-*.Zone.Identifier
+*.Identifier
 
 # ==========================================
 # Logs
