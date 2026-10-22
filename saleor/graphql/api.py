@@ -8,6 +8,7 @@ import jwt
 from django.db import IntegrityError, connection, transaction
 from graphql import GraphQLError
 
+from . import wishlist
 from .orders import (
     CheckoutMutation, ConfirmPaymentMutation, PurchaseOrder, RetryPaymentMutation,
 )
@@ -49,6 +50,7 @@ class ReviewSummary(graphene.ObjectType):
 
 
 class ProductDetail(graphene.ObjectType):
+    bgg_id = graphene.Int(required=True)
     name = graphene.String(required=True)
     release_year = graphene.Int(required=True)
     min_players = graphene.Int(required=True)
@@ -118,6 +120,7 @@ def _slugify(value):
 
 def _product_from_row(row):
     return {
+        "bgg_id": row["bgg_id"],
         "name": row["name"],
         "release_year": row["release_year"],
         "min_players": row["min_players"],
@@ -381,6 +384,7 @@ class Query(graphene.ObjectType):
         price_max=graphene.Float(),
     )
     cart = graphene.Field(Cart, required=True, cart_id=graphene.ID())
+    my_wishlist = graphene.List(graphene.NonNull(Product), required=True)
     my_orders = graphene.List(graphene.NonNull(PurchaseOrder), required=True)
     my_order = graphene.Field(PurchaseOrder, id=graphene.ID(required=True))
 
@@ -485,6 +489,9 @@ class Query(graphene.ObjectType):
         with transaction.atomic(), connection.cursor() as cursor:
             identifier = _get_cart_id(cursor, user, cart_id)
             return _cart_details(cursor, identifier)
+
+    def resolve_my_wishlist(self, info):
+        return wishlist.list_products(info)
 
     def resolve_my_orders(self, info):
         user = _authenticated_user(info)
@@ -662,6 +669,28 @@ class RemoveFromCartMutation(graphene.Mutation):
         return _cart_mutation(info, cart_id, bgg_id, None, "remove")
 
 
+class AddToWishlistMutation(graphene.Mutation):
+    class Arguments:
+        bgg_id = graphene.Int(required=True)
+
+    Output = Product
+
+    @staticmethod
+    def mutate(_root, info, bgg_id):
+        return wishlist.add_product(info, bgg_id)
+
+
+class RemoveFromWishlistMutation(graphene.Mutation):
+    class Arguments:
+        bgg_id = graphene.Int(required=True)
+
+    Output = Product
+
+    @staticmethod
+    def mutate(_root, info, bgg_id):
+        return wishlist.remove_product(info, bgg_id)
+
+
 class CreateReviewMutation(graphene.Mutation):
     class Arguments:
         input = CreateReviewInput(required=True)
@@ -740,6 +769,8 @@ class Mutation(graphene.ObjectType):
     add_to_cart = AddToCartMutation.Field(required=True)
     update_cart_quantity = UpdateCartQuantityMutation.Field(required=True)
     remove_from_cart = RemoveFromCartMutation.Field(required=True)
+    add_to_wishlist = AddToWishlistMutation.Field(required=True)
+    remove_from_wishlist = RemoveFromWishlistMutation.Field(required=True)
     create_review = CreateReviewMutation.Field(required=True)
     checkout = CheckoutMutation.Field(required=True)
     retry_payment = RetryPaymentMutation.Field(required=True)

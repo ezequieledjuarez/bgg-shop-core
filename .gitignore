@@ -70,6 +70,9 @@ podman-compose.override.yml
 Thumbs.db
 ehthumbs.db
 
+# Ignore Windows Zone.Identifier alternate data stream artifacts
+*.Identifier
+
 # ==========================================
 # Logs
 # ==========================================

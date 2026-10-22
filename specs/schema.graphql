@@ -34,6 +34,7 @@ type ReviewSummary {
 }
 
 type ProductDetail {
+  bggId: Int!
   name: String!
   releaseYear: Int!
   minPlayers: Int!
@@ -91,6 +92,7 @@ type Query {
     priceMax: Float
   ): ProductPage
   cart(cartId: ID): Cart!
+  myWishlist: [Product!]!
   myOrders: [PurchaseOrder!]!
   myOrder(id: ID!): PurchaseOrder
 }
@@ -164,6 +166,8 @@ type Mutation {
   addToCart(bggId: Int!, cartId: ID, quantity: Int!): CartPayload!
   updateCartQuantity(bggId: Int!, cartId: ID, quantity: Int!): CartPayload!
   removeFromCart(bggId: Int!, cartId: ID): CartPayload!
+  addToWishlist(bggId: Int!): Product!
+  removeFromWishlist(bggId: Int!): Product!
   createReview(input: CreateReviewInput!): CreateReviewPayload!
   checkout(address: ShippingAddressInput, cartId: ID, shippingMode: ShippingMode!): CheckoutPayload!
   retryPayment(orderId: ID!): CheckoutPayload!

@@ -38,6 +38,9 @@ ruta para exploración manual. En Compose está disponible en
 | --- | --- | --- |
 | `hello` | Ninguno | Texto `Saleor API activa y respondiendo OK`. |
 | `products` | `page`, `pageSize`, `search`, `yearPublished`, `minPlayers`, `maxPlayers`, `categoryId`, `priceMin`, `priceMax` | `ProductPage` filtrado con productos y metadatos de paginación. |
+| `myWishlist` | None; requires an access token | Lists products saved by the authenticated buyer. |
+| `addToWishlist` | `bggId`; requires an access token | Idempotently saves a product and returns its data. |
+| `removeFromWishlist` | `bggId`; requires an access token | Removes a product from the buyer's Wishlist and returns its data. |
 | `register` | `RegisterInput` (`email`, `password`, `firstName`, `lastName`) | Usuario creado y errores de dominio; no emite sesión. |
 | `login` | `LoginInput` (`email`, `password`) | Usuario autenticado, JWT access/refresh y errores de dominio. |
 
