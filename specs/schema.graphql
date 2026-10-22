@@ -91,6 +91,8 @@ type Query {
     priceMax: Float
   ): ProductPage
   cart(cartId: ID): Cart!
+  myOrders: [PurchaseOrder!]!
+  myOrder(id: ID!): PurchaseOrder
 }
 input RegisterInput {
   email: String!
@@ -163,4 +165,78 @@ type Mutation {
   updateCartQuantity(bggId: Int!, cartId: ID, quantity: Int!): CartPayload!
   removeFromCart(bggId: Int!, cartId: ID): CartPayload!
   createReview(input: CreateReviewInput!): CreateReviewPayload!
+  checkout(address: ShippingAddressInput, cartId: ID, shippingMode: ShippingMode!): CheckoutPayload!
+  retryPayment(orderId: ID!): CheckoutPayload!
+  confirmPayment(orderId: ID!, paymentId: ID!): ConfirmPaymentPayload!
+}
+
+
+type PurchaseOrder {
+  id: ID!
+  status: String!
+  total: Float!
+  currency: String!
+  shippingMode: String!
+  recipient: String
+  street: String
+  city: String
+  postalCode: String
+  phone: String
+  paymentStatus: String
+  paymentStatusDetail: String
+  createdAt: String!
+  paidAt: String
+  lines: [OrderLine!]!
+  invoice: Invoice
+}
+
+type OrderLine {
+  bggId: Int!
+  name: String!
+  unitPrice: Float!
+  quantity: Int!
+  subtotal: Float!
+}
+
+type Invoice {
+  number: BigInt!
+  issuedAt: String!
+  total: Float!
+}
+
+"""
+The `BigInt` scalar type represents non-fractional whole numeric values.
+`BigInt` is not constrained to 32-bit like the `Int` type and thus is a less
+compatible type.
+"""
+scalar BigInt
+
+type CheckoutPayload {
+  order: PurchaseOrder
+  initPoint: String
+  userErrors: [OrderUserError!]!
+}
+
+type ConfirmPaymentPayload {
+  order: PurchaseOrder
+  userErrors: [OrderUserError!]!
+}
+
+type OrderUserError {
+  field: [String!]
+  code: String!
+  message: String!
+}
+
+input ShippingAddressInput {
+  recipient: String
+  street: String
+  city: String
+  postalCode: String
+  phone: String
+}
+
+enum ShippingMode {
+  STANDARD
+  PICKUP
 }
