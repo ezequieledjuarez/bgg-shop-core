@@ -112,6 +112,33 @@ class CreateReviewInput(graphene.InputObjectType):
     body = graphene.String(required=True)
 
 
+class Promotion(graphene.ObjectType):
+    id = graphene.ID(required=True)
+    name = graphene.String(required=True)
+    stackable = graphene.Boolean(required=True)
+    discount_pct = graphene.Float(required=True)
+    starts_at = graphene.String()
+    ends_at = graphene.String()
+    created_at = graphene.String(required=True)
+
+
+class Coupon(graphene.ObjectType):
+    id = graphene.ID(required=True)
+    code = graphene.String(required=True)
+    promotion = graphene.Field(Promotion)
+    remaining = graphene.Int(required=True)
+    created_at = graphene.String(required=True)
+
+
+class StockReservation(graphene.ObjectType):
+    id = graphene.ID(required=True)
+    bgg_id = graphene.Int(required=True)
+    reserved_qty = graphene.Int(required=True)
+    reason = graphene.String()
+    expires_at = graphene.String()
+    created_at = graphene.String(required=True)
+
+
 def _slugify(value):
     normalized = unicodedata.normalize("NFKD", value)
     normalized = "".join(char for char in normalized if not unicodedata.combining(char))
@@ -517,6 +544,73 @@ class Query(graphene.ObjectType):
         from .orders import _order_by_id
 
         return _order_by_id(info, id, user)
+
+    def resolve_promotions(self, info):
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT id, name, stackable, discount_pct, starts_at, ends_at, created_at FROM promotion"
+            )
+            rows = cursor.fetchall()
+            columns = [c[0] for c in cursor.description]
+        result = []
+        for row in rows:
+            r = dict(zip(columns, row))
+            result.append(Promotion(
+                id=r["id"], name=r["name"], stackable=r["stackable"],
+                discount_pct=float(r["discount_pct"]),
+                starts_at=r["starts_at"].isoformat() if r["starts_at"] else None,
+                ends_at=r["ends_at"].isoformat() if r["ends_at"] else None,
+                created_at=r["created_at"].isoformat(),
+            ))
+        return result
+
+    def resolve_coupon_by_code(self, info, code):
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT c.id, c.code, c.promotion_id, c.remaining, c.created_at, p.name, p.stackable, p.discount_pct, p.starts_at, p.ends_at, p.created_at as p_created "
+                "FROM coupon c LEFT JOIN promotion p ON p.id = c.promotion_id WHERE c.code = %s",
+                [code],
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            cols = [c[0] for c in cursor.description]
+            r = dict(zip(cols, row))
+        promotion = None
+        if r.get("promotion_id"):
+            promotion = Promotion(
+                id=r.get("promotion_id"), name=r.get("name"), stackable=r.get("stackable"),
+                discount_pct=float(r.get("discount_pct") or 0),
+                starts_at=r.get("starts_at").isoformat() if r.get("starts_at") else None,
+                ends_at=r.get("ends_at").isoformat() if r.get("ends_at") else None,
+                created_at=r.get("p_created").isoformat() if r.get("p_created") else None,
+            )
+        return Coupon(id=r["id"], code=r["code"], promotion=promotion, remaining=r["remaining"], created_at=r["created_at"].isoformat())
+
+    def resolve_stock_reservations(self, info, bgg_id=None):
+        with connection.cursor() as cursor:
+            if bgg_id is None:
+                cursor.execute(
+                    "SELECT id, bgg_id, reserved_qty, reason, expires_at, created_at FROM stock_reservation ORDER BY created_at DESC"
+                )
+                rows = cursor.fetchall()
+            else:
+                cursor.execute(
+                    "SELECT id, bgg_id, reserved_qty, reason, expires_at, created_at FROM stock_reservation WHERE bgg_id = %s ORDER BY created_at DESC",
+                    [bgg_id],
+                )
+                rows = cursor.fetchall()
+            cols = [c[0] for c in cursor.description]
+        result = []
+        for row in rows:
+            r = dict(zip(cols, row))
+            result.append(StockReservation(
+                id=r["id"], bgg_id=r["bgg_id"], reserved_qty=r["reserved_qty"],
+                reason=r.get("reason"),
+                expires_at=r.get("expires_at").isoformat() if r.get("expires_at") else None,
+                created_at=r.get("created_at").isoformat(),
+            ))
+        return result
 
 
 class RegisterInput(graphene.InputObjectType):
