@@ -126,7 +126,7 @@ class Coupon(graphene.ObjectType):
     id = graphene.ID(required=True)
     code = graphene.String(required=True)
     promotion = graphene.Field(Promotion)
-    remaining = graphene.Int(required=True)
+    remaining = graphene.BigInt(required=True)
     created_at = graphene.String(required=True)
 
 
@@ -394,6 +394,7 @@ def _merge_guest_cart(guest_cart_id, user):
 
 class Query(graphene.ObjectType):
     hello = graphene.String(default_value="Saleor API activa y respondiendo OK")
+    me = graphene.Field(lambda: AuthUser)
     product_by_slug = graphene.Field(
         ProductDetail,
         slug=graphene.String(required=True),
@@ -414,9 +415,18 @@ class Query(graphene.ObjectType):
     my_wishlist = graphene.List(graphene.NonNull(Product), required=True)
     my_orders = graphene.List(graphene.NonNull(PurchaseOrder), required=True)
     my_order = graphene.Field(PurchaseOrder, id=graphene.ID(required=True))
+    promotions = graphene.List(graphene.NonNull(Promotion), required=True)
+    coupon_by_code = graphene.Field(Coupon, code=graphene.String(required=True))
+    stock_reservations = graphene.List(graphene.NonNull(StockReservation), bgg_id=graphene.Int(), required=True)
 
     def resolve_hello(self, info):
         return "Saleor API activa y respondiendo OK"
+
+    def resolve_me(self, info):
+        user = _authenticated_user(info)
+        if user is None:
+            return None
+        return _auth_user(user)
 
     def resolve_product_by_slug(self, info, slug):
         with connection.cursor() as cursor:
@@ -635,12 +645,15 @@ class AuthUser(graphene.ObjectType):
     first_name = graphene.String(required=True)
     last_name = graphene.String(required=True)
     is_active = graphene.Boolean(required=True)
+    is_staff = graphene.Boolean(required=True)
+    is_superuser = graphene.Boolean(required=True)
 
 
 class AuthToken(graphene.ObjectType):
     token = graphene.String()
     refresh_token = graphene.String()
     csrf_token = graphene.String()
+    op_key = graphene.String()
 
 
 class UserError(graphene.ObjectType):
@@ -664,8 +677,15 @@ def _auth_error(message, code, field=None):
 
 
 def _auth_user(user):
-    return AuthUser(id=user.pk, email=user.email, first_name=user.first_name,
-                    last_name=user.last_name, is_active=user.is_active)
+    return AuthUser(
+        id=user.pk,
+        email=user.email,
+        first_name=user.first_name,
+        last_name=user.last_name,
+        is_active=user.is_active,
+        is_staff=getattr(user, "is_staff", False),
+        is_superuser=getattr(user, "is_superuser", False),
+    )
 
 
 def _auth_tokens(user_id):
@@ -712,6 +732,9 @@ class LoginMutation(graphene.Mutation):
     @staticmethod
     def mutate(_root, info, input):
         from django.contrib.auth import authenticate
+        # OpKeys: create a one-time OpSession for privileged users
+        from opkeys.utils import generate_raw_key, key_hash, default_expiry
+        from opkeys.models import OpSession
 
         user = authenticate(
             request=info.context, username=input.email.strip().casefold(), password=input.password
@@ -722,7 +745,24 @@ class LoginMutation(graphene.Mutation):
             )])
         if input.guest_cart_id:
             _merge_guest_cart(input.guest_cart_id, user)
-        return LoginPayload(user=_auth_user(user), tokens=_auth_tokens(user.pk), errors=[])
+        tokens = _auth_tokens(user.pk)
+
+        # Issue op_key only for staff/superusers (configurable later)
+        try:
+            if getattr(user, "is_staff", False) or getattr(user, "is_superuser", False):
+                raw = generate_raw_key()
+                h = key_hash(raw)
+                # default ops: admin endpoints wildcard for main HTTP methods
+                methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+                ops = [f"{m}:/api/v1/admin/*" for m in methods]
+                sess = OpSession.objects.create(user=user, key_hash=h, ops=ops, expires_at=default_expiry())
+                # expose raw op_key only once in the login payload
+                tokens.op_key = raw
+        except Exception:
+            # don't break login if op session creation fails
+            pass
+
+        return LoginPayload(user=_auth_user(user), tokens=tokens, errors=[])
 
 
 class AddToCartMutation(graphene.Mutation):
@@ -857,6 +897,251 @@ class CreateReviewMutation(graphene.Mutation):
         )
 
 
+class CreateProductInput(graphene.InputObjectType):
+    name = graphene.String(required=True)
+    price = graphene.Float(required=True)
+    quantity = graphene.Int(required=True)
+    publisher = graphene.String()
+    image_url = graphene.String()
+
+
+class CreateProductPayload(graphene.ObjectType):
+    product = graphene.Field(Product)
+    userErrors = graphene.List(graphene.NonNull(UserError), required=True)
+
+
+class CreateProductMutation(graphene.Mutation):
+    class Arguments:
+        input = CreateProductInput(required=True)
+
+    Output = CreateProductPayload
+
+    @staticmethod
+    def mutate(_root, info, input):
+        user = _authenticated_user(info)
+        if user is None or (not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False)):
+            return CreateProductPayload(product=None, userErrors=[_auth_error("Authentication required", "UNAUTHENTICATED")])
+        name = (input.name or "").strip()
+        if not name:
+            return CreateProductPayload(product=None, userErrors=[_auth_error("Name is required", "NAME_REQUIRED", ["name"])])
+        try:
+            with connection.cursor() as cursor:
+                # Assign a new bgg_id deterministically based on the current max to avoid
+                # duplicate key errors when the table has no serial default for bgg_id.
+                cursor.execute(
+                    "INSERT INTO product_boardgame (bgg_id, name, price_amount, quantity, publisher, image_url, image_filename, release_year, min_players, max_players, playing_time_minutes, min_age, weight, category) VALUES ((SELECT COALESCE(MAX(bgg_id), 0) + 1 FROM product_boardgame), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING bgg_id, name",
+                    [name, input.price, input.quantity, input.publisher or "", input.image_url or "", "", 0, 1, 1, 0, 0, 0.0, ""],
+                )
+                row = cursor.fetchone()
+            product = Product(
+                bgg_id=row[0],
+                name=row[1],
+                release_year=0,
+                min_players=1,
+                max_players=1,
+                playing_time_minutes=0,
+                min_age=0,
+                weight=0.0,
+                category=[],
+                price=float(input.price),
+                publisher=input.publisher or "",
+                image_url=input.image_url or "",
+                quantity=int(input.quantity),
+            )
+            return CreateProductPayload(product=product, userErrors=[])
+        except IntegrityError:
+            return CreateProductPayload(product=None, userErrors=[_auth_error("Conflict creating product", "DUPLICATE")])
+        except Exception:
+            return CreateProductPayload(product=None, userErrors=[_auth_error("Create product failed", "SERVER_ERROR")])
+
+
+class UpdateProductInput(graphene.InputObjectType):
+    name = graphene.String()
+    price = graphene.Float()
+    quantity = graphene.Int()
+    publisher = graphene.String()
+    image_url = graphene.String()
+
+
+class UpdateProductPayload(graphene.ObjectType):
+    product = graphene.Field(Product)
+    userErrors = graphene.List(graphene.NonNull(UserError), required=True)
+
+
+class UpdateProductMutation(graphene.Mutation):
+    class Arguments:
+        id = graphene.ID(required=True)
+        input = UpdateProductInput(required=True)
+
+    Output = UpdateProductPayload
+
+    @staticmethod
+    def mutate(_root, info, id, input):
+        user = _authenticated_user(info)
+        if user is None or (not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False)):
+            return UpdateProductPayload(product=None, userErrors=[_auth_error("Authentication required", "UNAUTHENTICATED")])
+        try:
+            with connection.cursor() as cursor:
+                # Build update statement dynamically
+                fields = []
+                values = []
+                if input.name is not None:
+                    fields.append("name = %s")
+                    values.append(input.name.strip())
+                if input.price is not None:
+                    fields.append("price_amount = %s")
+                    values.append(input.price)
+                if input.quantity is not None:
+                    fields.append("quantity = %s")
+                    values.append(input.quantity)
+                if input.publisher is not None:
+                    fields.append("publisher = %s")
+                    values.append(input.publisher)
+                if input.image_url is not None:
+                    fields.append("image_url = %s")
+                    values.append(input.image_url)
+                if not fields:
+                    return UpdateProductPayload(product=None, userErrors=[_auth_error("No fields to update", "NO_OP")])
+                values.append(id)
+                sql = f"UPDATE product_boardgame SET {', '.join(fields)} WHERE bgg_id = %s RETURNING bgg_id, name, price_amount, quantity"
+                cursor.execute(sql, values)
+                row = cursor.fetchone()
+                if not row:
+                    return UpdateProductPayload(product=None, userErrors=[_auth_error("Product not found", "PRODUCT_NOT_FOUND")])
+            product = Product(
+                bgg_id=row[0],
+                name=row[1],
+                release_year=0,
+                min_players=1,
+                max_players=1,
+                playing_time_minutes=0,
+                min_age=0,
+                weight=0.0,
+                category=[],
+                price=float(row[2]),
+                publisher="",
+                image_url="",
+                quantity=int(row[3]),
+            )
+            return UpdateProductPayload(product=product, userErrors=[])
+        except Exception:
+            return UpdateProductPayload(product=None, userErrors=[_auth_error("Update failed", "SERVER_ERROR")])
+
+
+class AdjustVariantStockPayload(graphene.ObjectType):
+    success = graphene.Boolean()
+    errors = graphene.List(graphene.NonNull(UserError), required=True)
+
+
+class AdjustVariantStockMutation(graphene.Mutation):
+    class Arguments:
+        productId = graphene.ID(required=True)
+        variantId = graphene.ID(required=True)
+        newStock = graphene.Int(required=True)
+
+    Output = AdjustVariantStockPayload
+
+    @staticmethod
+    def mutate(_root, info, productId, variantId, newStock):
+        user = _authenticated_user(info)
+        if user is None or (not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False)):
+            return AdjustVariantStockPayload(success=False, errors=[_auth_error("Authentication required", "UNAUTHENTICATED")])
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("UPDATE product_boardgame SET quantity = %s WHERE bgg_id = %s RETURNING bgg_id", [newStock, productId])
+                row = cursor.fetchone()
+                if not row:
+                    return AdjustVariantStockPayload(success=False, errors=[_auth_error("Product or variant not found", "NOT_FOUND")])
+            return AdjustVariantStockPayload(success=True, errors=[])
+        except Exception:
+            return AdjustVariantStockPayload(success=False, errors=[_auth_error("Adjust stock failed", "SERVER_ERROR")])
+
+
+class CreatePromotionInput(graphene.InputObjectType):
+    name = graphene.String(required=True)
+    discount_percent = graphene.Float(required=True)
+    active = graphene.Boolean(required=True)
+
+
+class CreatePromotionPayload(graphene.ObjectType):
+    promotion = graphene.Field(lambda: Promotion)
+    userErrors = graphene.List(graphene.NonNull(UserError), required=True)
+
+
+class CreatePromotionMutation(graphene.Mutation):
+    class Arguments:
+        input = CreatePromotionInput(required=True)
+
+    Output = CreatePromotionPayload
+
+    @staticmethod
+    def mutate(_root, info, input):
+        user = _authenticated_user(info)
+        if user is None or (not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False)):
+            return CreatePromotionPayload(promotion=None, userErrors=[_auth_error("Authentication required", "UNAUTHENTICATED")])
+        name = (input.name or "").strip()
+        if not name:
+            return CreatePromotionPayload(promotion=None, userErrors=[_auth_error("Name is required", "NAME_REQUIRED", ["name"])])
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "INSERT INTO promotion (name, discount_pct, starts_at, ends_at, stackable, created_at) VALUES (%s, %s, %s, %s, %s, now()) RETURNING id, name",
+                    [name, input.discount_percent, None, None, False],
+                )
+                row = cursor.fetchone()
+            promo = Promotion(id=row[0], name=row[1], stackable=False, discount_pct=float(input.discount_percent), starts_at=None, ends_at=None, created_at="")
+            return CreatePromotionPayload(promotion=promo, userErrors=[])
+        except Exception:
+            return CreatePromotionPayload(promotion=None, userErrors=[_auth_error("Create promotion failed", "SERVER_ERROR")])
+
+
+class UpdatePromotionInput(graphene.InputObjectType):
+    name = graphene.String()
+    discount_percent = graphene.Float()
+    active = graphene.Boolean()
+
+
+class UpdatePromotionPayload(graphene.ObjectType):
+    promotion = graphene.Field(lambda: Promotion)
+    userErrors = graphene.List(graphene.NonNull(UserError), required=True)
+
+
+class UpdatePromotionMutation(graphene.Mutation):
+    class Arguments:
+        id = graphene.ID(required=True)
+        input = UpdatePromotionInput(required=True)
+
+    Output = UpdatePromotionPayload
+
+    @staticmethod
+    def mutate(_root, info, id, input):
+        user = _authenticated_user(info)
+        if user is None or (not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False)):
+            return UpdatePromotionPayload(promotion=None, userErrors=[_auth_error("Authentication required", "UNAUTHENTICATED")])
+        try:
+            with connection.cursor() as cursor:
+                fields = []
+                values = []
+                if input.name is not None:
+                    fields.append("name = %s")
+                    values.append(input.name)
+                if input.discount_percent is not None:
+                    fields.append("discount_pct = %s")
+                    values.append(input.discount_percent)
+                if not fields:
+                    return UpdatePromotionPayload(promotion=None, userErrors=[_auth_error("No fields to update", "NO_OP")])
+                values.append(id)
+                sql = f"UPDATE promotion SET {', '.join(fields)} WHERE id = %s RETURNING id, name"
+                cursor.execute(sql, values)
+                row = cursor.fetchone()
+                if not row:
+                    return UpdatePromotionPayload(promotion=None, userErrors=[_auth_error("Promotion not found", "NOT_FOUND")])
+            promo = Promotion(id=row[0], name=row[1], stackable=False, discount_pct=float(input.discount_percent or 0), starts_at=None, ends_at=None, created_at="")
+            return UpdatePromotionPayload(promotion=promo, userErrors=[])
+        except Exception:
+            return UpdatePromotionPayload(promotion=None, userErrors=[_auth_error("Update promotion failed", "SERVER_ERROR")])
+
+
 class Mutation(graphene.ObjectType):
     register = RegisterMutation.Field(required=True)
     login = LoginMutation.Field(required=True)
@@ -866,6 +1151,12 @@ class Mutation(graphene.ObjectType):
     add_to_wishlist = AddToWishlistMutation.Field(required=True)
     remove_from_wishlist = RemoveFromWishlistMutation.Field(required=True)
     create_review = CreateReviewMutation.Field(required=True)
+    # Admin mutations for BFF
+    create_product = CreateProductMutation.Field(required=True)
+    update_product = UpdateProductMutation.Field(required=True)
+    adjust_variant_stock = AdjustVariantStockMutation.Field(required=True)
+    create_promotion = CreatePromotionMutation.Field(required=True)
+    update_promotion = UpdatePromotionMutation.Field(required=True)
     checkout = CheckoutMutation.Field(required=True)
     retry_payment = RetryPaymentMutation.Field(required=True)
     confirm_payment = ConfirmPaymentMutation.Field(required=True)
