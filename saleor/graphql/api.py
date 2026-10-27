@@ -5,6 +5,8 @@ import uuid
 
 import graphene
 import jwt
+import logging
+import traceback
 from django.db import IntegrityError, connection, transaction
 from graphql import GraphQLError
 
@@ -654,6 +656,8 @@ class AuthToken(graphene.ObjectType):
     refresh_token = graphene.String()
     csrf_token = graphene.String()
     op_key = graphene.String()
+    op_key_expires_at = graphene.String()
+    ops = graphene.List(graphene.String)
 
 
 class UserError(graphene.ObjectType):
@@ -747,17 +751,22 @@ class LoginMutation(graphene.Mutation):
             _merge_guest_cart(input.guest_cart_id, user)
         tokens = _auth_tokens(user.pk)
 
-        # Issue op_key only for staff/superusers (configurable later)
+        # Issue op_key only when enabled in settings and for staff/superusers
+        from django.conf import settings as dj_settings
         try:
-            if getattr(user, "is_staff", False) or getattr(user, "is_superuser", False):
+            if getattr(dj_settings, "OPKEYS_ISSUE_ON_LOGIN", False) and (
+                getattr(user, "is_staff", False) or getattr(user, "is_superuser", False)
+            ):
                 raw = generate_raw_key()
                 h = key_hash(raw)
                 # default ops: admin endpoints wildcard for main HTTP methods
                 methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
-                ops = [f"{m}:/api/v1/admin/*" for m in methods]
-                sess = OpSession.objects.create(user=user, key_hash=h, ops=ops, expires_at=default_expiry())
+                ops_list = [f"{m}:/api/v1/admin/*" for m in methods]
+                sess = OpSession.objects.create(user=user, key_hash=h, ops=ops_list, expires_at=default_expiry())
                 # expose raw op_key only once in the login payload
                 tokens.op_key = raw
+                tokens.op_key_expires_at = sess.expires_at.isoformat() if sess.expires_at else None
+                tokens.ops = sess.ops
         except Exception:
             # don't break login if op session creation fails
             pass
@@ -901,8 +910,20 @@ class CreateProductInput(graphene.InputObjectType):
     name = graphene.String(required=True)
     price = graphene.Float(required=True)
     quantity = graphene.Int(required=True)
+    # Business id provided by client
+    bggId = graphene.Int()
     publisher = graphene.String()
-    image_url = graphene.String()
+    # Contract: accept camelCase fields only
+    imageUrl = graphene.String()
+    imageFileName = graphene.String()
+    releaseYear = graphene.Int()
+    minPlayers = graphene.Int()
+    maxPlayers = graphene.Int()
+    playingTimeMinutes = graphene.Int()
+    minAge = graphene.Int()
+    maxAge = graphene.Int()
+    weight = graphene.Float()
+    category = graphene.List(graphene.String)
 
 
 class CreateProductPayload(graphene.ObjectType):
@@ -926,11 +947,33 @@ class CreateProductMutation(graphene.Mutation):
             return CreateProductPayload(product=None, userErrors=[_auth_error("Name is required", "NAME_REQUIRED", ["name"])])
         try:
             with connection.cursor() as cursor:
-                # Assign a new bgg_id deterministically based on the current max to avoid
-                # duplicate key errors when the table has no serial default for bgg_id.
+                # Use provided bggId if present, otherwise generate next sequential bgg_id
+                provided_bgg = getattr(input, 'bggId', None)
+                if provided_bgg is None:
+                    cursor.execute("SELECT COALESCE(MAX(bgg_id), 0) + 1 FROM product_boardgame")
+                    provided_bgg = cursor.fetchone()[0]
+
                 cursor.execute(
-                    "INSERT INTO product_boardgame (bgg_id, name, price_amount, quantity, publisher, image_url, image_filename, release_year, min_players, max_players, playing_time_minutes, min_age, weight, category) VALUES ((SELECT COALESCE(MAX(bgg_id), 0) + 1 FROM product_boardgame), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING bgg_id, name",
-                    [name, input.price, input.quantity, input.publisher or "", input.image_url or "", "", 0, 1, 1, 0, 0, 0.0, ""],
+                    "INSERT INTO product_boardgame (bgg_id, name, price_amount, quantity, publisher, image_url, image_filename, release_year, min_players, max_players, playing_time_minutes, min_age, max_age, weight, category) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING bgg_id, name",
+                    [
+                        provided_bgg,
+                        name,
+                        input.price,
+                        input.quantity,
+                        (getattr(input, 'publisher', None) or ''),
+                        # imageUrl (camelCase) per contract
+                        (getattr(input, 'imageUrl', None) or ''),
+                        (getattr(input, 'imageFileName', None) or ''),
+                        (getattr(input, 'releaseYear', None) or 0),
+                        (getattr(input, 'minPlayers', None) or 1),
+                        (getattr(input, 'maxPlayers', None) or 1),
+                        (getattr(input, 'playingTimeMinutes', None) or 0),
+                        (getattr(input, 'minAge', None) or 0),
+                        (getattr(input, 'maxAge', None) or 0),
+                        (getattr(input, 'weight', None) or 0.0),
+                        # category stored as comma-separated string internally
+                        (','.join(getattr(input, 'category', []) or []) if (getattr(input, 'category', None) is not None) else ''),
+                    ],
                 )
                 row = cursor.fetchone()
             product = Product(
@@ -945,13 +988,20 @@ class CreateProductMutation(graphene.Mutation):
                 category=[],
                 price=float(input.price),
                 publisher=input.publisher or "",
-                image_url=input.image_url or "",
+                image_url=input.imageUrl or "",
                 quantity=int(input.quantity),
             )
             return CreateProductPayload(product=product, userErrors=[])
         except IntegrityError:
             return CreateProductPayload(product=None, userErrors=[_auth_error("Conflict creating product", "DUPLICATE")])
-        except Exception:
+        except Exception as e:
+            # Log the full stacktrace so the root cause is visible in core container logs
+            logging.exception("Unhandled exception in CreateProductMutation: %s", e)
+            try:
+                traceback_str = traceback.format_exc()
+                logging.error("Traceback:\n%s", traceback_str)
+            except Exception:
+                pass
             return CreateProductPayload(product=None, userErrors=[_auth_error("Create product failed", "SERVER_ERROR")])
 
 
@@ -960,7 +1010,17 @@ class UpdateProductInput(graphene.InputObjectType):
     price = graphene.Float()
     quantity = graphene.Int()
     publisher = graphene.String()
-    image_url = graphene.String()
+    # Contract: accept camelCase fields only
+    imageUrl = graphene.String()
+    imageFileName = graphene.String()
+    releaseYear = graphene.Int()
+    minPlayers = graphene.Int()
+    maxPlayers = graphene.Int()
+    playingTimeMinutes = graphene.Int()
+    minAge = graphene.Int()
+    maxAge = graphene.Int()
+    weight = graphene.Float()
+    category = graphene.List(graphene.String)
 
 
 class UpdateProductPayload(graphene.ObjectType):
@@ -997,9 +1057,37 @@ class UpdateProductMutation(graphene.Mutation):
                 if input.publisher is not None:
                     fields.append("publisher = %s")
                     values.append(input.publisher)
-                if input.image_url is not None:
+                # Accept camelCase and snake_case variants for image and other fields
+                if getattr(input, 'imageUrl', None) is not None or getattr(input, 'image_url', None) is not None:
                     fields.append("image_url = %s")
-                    values.append(input.image_url)
+                    values.append(getattr(input, 'imageUrl', None) or getattr(input, 'image_url', None))
+                if getattr(input, 'imageFileName', None) is not None or getattr(input, 'image_file_name', None) is not None:
+                    fields.append("image_filename = %s")
+                    values.append(getattr(input, 'imageFileName', None) or getattr(input, 'image_file_name', None))
+                if getattr(input, 'releaseYear', None) is not None:
+                    fields.append("release_year = %s")
+                    values.append(getattr(input, 'releaseYear', None))
+                if getattr(input, 'minPlayers', None) is not None:
+                    fields.append("min_players = %s")
+                    values.append(getattr(input, 'minPlayers', None))
+                if getattr(input, 'maxPlayers', None) is not None:
+                    fields.append("max_players = %s")
+                    values.append(getattr(input, 'maxPlayers', None))
+                if getattr(input, 'playingTimeMinutes', None) is not None:
+                    fields.append("playing_time_minutes = %s")
+                    values.append(getattr(input, 'playingTimeMinutes', None))
+                if getattr(input, 'minAge', None) is not None:
+                    fields.append("min_age = %s")
+                    values.append(getattr(input, 'minAge', None))
+                if getattr(input, 'maxAge', None) is not None:
+                    fields.append("max_age = %s")
+                    values.append(getattr(input, 'maxAge', None))
+                if getattr(input, 'weight', None) is not None:
+                    fields.append("weight = %s")
+                    values.append(getattr(input, 'weight', None))
+                if getattr(input, 'category', None) is not None:
+                    fields.append("category = %s")
+                    values.append(','.join(input.category) if isinstance(input.category, (list, tuple)) else input.category)
                 if not fields:
                     return UpdateProductPayload(product=None, userErrors=[_auth_error("No fields to update", "NO_OP")])
                 values.append(id)

@@ -109,7 +109,8 @@ type Query {
   productBySlug(slug: String!): ProductDetail
   products(
     page: Int = 1
-    pageSize: Int = 20
+    # Default pageSize changed from 20 to 50 to align BFF defaults and admin UX requirements
+    pageSize: Int = 50
     search: String
     yearPublished: Int
     minPlayers: Int
@@ -151,6 +152,9 @@ type AuthToken {
   token: String
   refreshToken: String
   csrfToken: String
+  # One-time operations key (raw) returned at login when the server creates an OpSession.
+  # This value is shown only once and should be stored by the client.
+  opKey: String
 }
 
 type UserError {

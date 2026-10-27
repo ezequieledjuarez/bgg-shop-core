@@ -63,6 +63,8 @@ INSTALLED_APPS = [
     # Dominio de Saleor Core (Módulos activos)
     "saleor.graphql",
     "saleor.promotions",
+    # Operations & Keys app for short-lived op sessions
+    "opkeys",
 ]
 
 # ==============================================================================
@@ -75,6 +77,8 @@ MIDDLEWARE = [
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
+    # OpKeys middleware: accept X-Op-Key and set request.user when valid
+    "opkeys.middleware.OpKeyAuthMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
 ]
 
@@ -120,3 +124,8 @@ MEDIA_URL = "/media/"
 MEDIA_ROOT = env("MEDIA_ROOT", default=os.path.join(BASE_DIR, "media"))
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+
+# Feature flags and secrets for OpKeys
+OPKEYS_ISSUE_ON_LOGIN = env.bool("OPKEYS_ISSUE_ON_LOGIN", default=False)
+# Secret header value required by internal endpoints (BFF -> Core)
+OPKEY_INTERNAL_SECRET = env("OPKEY_INTERNAL_SECRET", default="changeme-internal-secret")
