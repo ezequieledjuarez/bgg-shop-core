@@ -51,3 +51,27 @@ tests/test_graphql_products.py
 ## Complexity Tracking
 
 No new abstraction framework is recorded. Live PostgreSQL DDL/application and full authenticated live-flow verification remain pending, as reported in the ODD record.
+
+## Delegación a agentes
+
+Objetivo: delegar tareas de implementación, pruebas y generación de parches a un agente o equipo automatizado para producir parches listos para revisión sin ejecutar commits ni pushes.
+
+- Allowed edit surfaces (ejemplos):
+	- bgg-shop-core/saleor/wishlist/**
+	- bgg-shop-core/saleor/graphql/wishlist.py
+	- bgg-shop-core/tests/test_graphql_wishlist.py
+	- specs/006-wishlist/*
+
+- Qué entregar (por agente):
+	- Parche/diff aplicable (o carpeta con cambios) listo para revisión.
+	- Comandos reproducibles de verificación (migrations + pytest) y logs de ejecución.
+	- Mensaje de commit propuesto (Conventional Commits).
+	- Bloque "## Key Learnings:" con 1–5 puntos.
+
+- Comandos de verificación recomendados:
+	- `python manage.py makemigrations` y `python manage.py migrate`
+	- `pytest tests/test_graphql_wishlist.py -q`
+
+- Restricción importante: NO hacer commit ni push automático. Preparar `git diff` o `git format-patch` y adjuntar al resultado.
+
+Colocar esta sección en `plan.md` permite que las instrucciones de ejecución y entrega queden junto a la planificación técnica y criterios de aceptación, facilitando la orquestación ODD antes del primer write.

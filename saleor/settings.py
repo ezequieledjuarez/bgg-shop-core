@@ -62,6 +62,7 @@ INSTALLED_APPS = [
     
     # Dominio de Saleor Core (Módulos activos)
     "saleor.graphql",
+    "saleor.promotions",
 ]
 
 # ==============================================================================

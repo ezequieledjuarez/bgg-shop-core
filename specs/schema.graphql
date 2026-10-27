@@ -77,6 +77,33 @@ type CartPayload {
   userErrors: [CartUserError!]!
 }
 
+type Promotion {
+  id: ID!
+  name: String!
+  stackable: Boolean!
+  discountPct: Float!
+  startsAt: String
+  endsAt: String
+  createdAt: String!
+}
+
+type Coupon {
+  id: ID!
+  code: String!
+  promotion: Promotion
+  remaining: BigInt!
+  createdAt: String!
+}
+
+type StockReservation {
+  id: ID!
+  bggId: Int!
+  reservedQty: Int!
+  reason: String
+  expiresAt: String
+  createdAt: String!
+}
+
 type Query {
   hello: String
   productBySlug(slug: String!): ProductDetail
@@ -95,6 +122,9 @@ type Query {
   myWishlist: [Product!]!
   myOrders: [PurchaseOrder!]!
   myOrder(id: ID!): PurchaseOrder
+  promotions: [Promotion!]!
+  couponByCode(code: String!): Coupon
+  stockReservations(bggId: Int): [StockReservation!]!
 }
 input RegisterInput {
   email: String!
