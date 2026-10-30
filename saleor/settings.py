@@ -1,6 +1,8 @@
+import json
 import os
 from pathlib import Path
 import environ
+from django.core.exceptions import ImproperlyConfigured
 
 # ==============================================================================
 # 1. RUTAS BASE DEL PROYECTO & ENTORNO
@@ -21,6 +23,16 @@ environ.Env.read_env(os.path.join(BASE_DIR, ".env"))
 # ==============================================================================
 SECRET_KEY = env("SECRET_KEY", default="django-insecure-super-secret-key")
 DEBUG = env("DEBUG")
+if not DEBUG and (len(SECRET_KEY) < 50 or len(set(SECRET_KEY)) < 5 or SECRET_KEY.startswith("django-insecure-")):
+    raise ImproperlyConfigured("A strong SECRET_KEY is required when DEBUG is disabled.")
+try:
+    SECRET_KEY_FALLBACKS = json.loads(env("SECRET_KEY_FALLBACKS", default="[]"))
+except (TypeError, ValueError):
+    raise ImproperlyConfigured("SECRET_KEY_FALLBACKS must be a JSON array of nonempty strings.") from None
+if not isinstance(SECRET_KEY_FALLBACKS, list) or any(
+    not isinstance(key, str) or not key for key in SECRET_KEY_FALLBACKS
+):
+    raise ImproperlyConfigured("SECRET_KEY_FALLBACKS must be a JSON array of nonempty strings.")
 MP_ACCESS_TOKEN = env("MP_ACCESS_TOKEN", default="")
 MP_SANDBOX = env.bool("MP_SANDBOX", default=False)
 MP_CURRENCY_ID = env("MP_CURRENCY_ID", default="")

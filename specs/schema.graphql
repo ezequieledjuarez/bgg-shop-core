@@ -14,6 +14,102 @@ type Product {
   quantity: Int!
 }
 
+type PaymentReview {
+  orderId: ID!
+  paymentId: ID!
+  userId: ID!
+  creditOrderId: ID
+  detectedAt: String!
+  resolution: PaymentReviewResolution
+  release: PaymentReviewRelease
+}
+
+type PaymentAttempt {
+  attemptId: ID!
+  orderId: ID!
+  userId: ID!
+  orderStatus: String!
+  preferenceId: ID
+}
+
+type PaymentAttemptPage {
+  items: [PaymentAttempt!]!
+  hasNext: Boolean!
+  userErrors: [OrderUserError!]!
+}
+
+type PaymentAttemptObservation {
+  id: ID!
+  attemptId: ID!
+  orderId: ID!
+  actorId: ID!
+  preferenceId: ID
+  statement: String!
+  recordedAt: String!
+}
+
+type PaymentAttemptObservationPage {
+  items: [PaymentAttemptObservation!]!
+  hasNext: Boolean!
+  userErrors: [OrderUserError!]!
+}
+
+type RecordPaymentAttemptObservationPayload {
+  observation: PaymentAttemptObservation
+  userErrors: [OrderUserError!]!
+}
+
+type PaymentAttemptRelease {
+  attemptId: ID!
+  orderId: ID!
+  observationId: ID!
+  actorId: ID!
+  preferenceId: ID
+  reason: String!
+  riskAcknowledged: Boolean!
+  releasedAt: String!
+}
+
+type PaymentAttemptReleasePayload {
+  release: PaymentAttemptRelease
+  providerResponse: PaymentAttemptProviderResponse
+  userErrors: [OrderUserError!]!
+}
+
+type PaymentAttemptProviderResponse {
+  preferenceId: ID!
+  recordedAt: String!
+}
+
+type PaymentReviewPage {
+  items: [PaymentReview!]!
+  hasNext: Boolean!
+  userErrors: [OrderUserError!]!
+}
+
+type PaymentReviewResolution {
+  actorId: ID!
+  action: String!
+  reason: String!
+  resolvedAt: String!
+}
+
+type PaymentReviewRelease {
+  actorId: ID!
+  reason: String!
+  releasedAt: String!
+}
+
+type ReleasePaymentReviewPayload {
+  release: PaymentReviewRelease
+  userErrors: [OrderUserError!]!
+}
+
+type ResolvePaymentReviewPayload {
+  resolution: PaymentReviewResolution
+  userErrors: [OrderUserError!]!
+}
+
 type ProductPage {
   items: [Product!]!
   page: Int!
@@ -106,6 +202,7 @@ type StockReservation {
 
 type Query {
   hello: String
+  me: User
   productBySlug(slug: String!): ProductDetail
   products(
     page: Int = 1
@@ -123,6 +220,12 @@ type Query {
   myWishlist: [Product!]!
   myOrders: [PurchaseOrder!]!
   myOrder(id: ID!): PurchaseOrder
+  """Returns the authenticated buyer's ARS balance, or zero if no credit exists."""
+  myCredit: CreditBalancePayload!
+  adminPaymentReviews(page: Int = 1, pageSize: Int = 50): PaymentReviewPage!
+  adminPaymentAttempts(page: Int = 1, pageSize: Int = 50): PaymentAttemptPage!
+  adminPaymentAttemptObservations(attemptId: ID!, page: Int = 1, pageSize: Int = 50): PaymentAttemptObservationPage!
+  adminPaymentAttemptRelease(attemptId: ID!): PaymentAttemptReleasePayload!
   promotions: [Promotion!]!
   couponByCode(code: String!): Coupon
   stockReservations(bggId: Int): [StockReservation!]!
@@ -146,6 +249,8 @@ type User {
   firstName: String!
   lastName: String!
   isActive: Boolean!
+  isStaff: Boolean!
+  isSuperuser: Boolean!
 }
 
 type AuthToken {
@@ -155,6 +260,8 @@ type AuthToken {
   # One-time operations key (raw) returned at login when the server creates an OpSession.
   # This value is shown only once and should be stored by the client.
   opKey: String
+  opKeyExpiresAt: String
+  ops: [String]
 }
 
 type UserError {
@@ -194,6 +301,49 @@ type CreateReviewPayload {
   userErrors: [ReviewUserError!]!
 }
 
+type IssuedGiftCard {
+  id: ID!
+  code: String!
+  amount: String!
+  currency: String!
+}
+
+type CreateGiftCardPayload {
+  giftCard: IssuedGiftCard
+  userErrors: [UserError!]!
+}
+
+input RedeemGiftCardInput {
+  code: String!
+  """A UUID scoped to the authenticated buyer and redemption operation."""
+  idempotencyKey: String!
+}
+
+input CheckoutWithCreditInput {
+  shippingMode: ShippingMode!
+  address: ShippingAddressInput
+  """A UUID scoped to the authenticated buyer and credit checkout operation."""
+  idempotencyKey: String!
+}
+
+type CreditBalance {
+  """Available credit expressed as a decimal string."""
+  balance: String!
+  """The credit currency is ARS."""
+  currency: String!
+}
+
+type CreditBalancePayload {
+  credit: CreditBalance
+  userErrors: [OrderUserError!]!
+}
+
+type CreditCheckoutPayload {
+  order: PurchaseOrder
+  credit: CreditBalance
+  userErrors: [OrderUserError!]!
+}
+
 type Mutation {
   register(input: RegisterInput!): RegisterPayload!
   login(input: LoginInput!): LoginPayload!
@@ -203,9 +353,106 @@ type Mutation {
   addToWishlist(bggId: Int!): Product!
   removeFromWishlist(bggId: Int!): Product!
   createReview(input: CreateReviewInput!): CreateReviewPayload!
+  createGiftCard(amount: String!): CreateGiftCardPayload!
+  """
+  Redeems an unused gift card atomically. Successful results do not expire.
+  Recorded rejections expire after 30 days and their keys can be reused.
+  While a record exists, a different request with that key conflicts.
+  """
+  redeemGiftCard(input: RedeemGiftCardInput!): CreditBalancePayload!
+  """
+  Pays the server-calculated order total atomically with account credit.
+  Insufficient credit or stock rejects the purchase without a partial debit.
+  A pending Mercado Pago order owned by the buyer blocks a new credit checkout.
+  Successful results do not expire. Recorded rejections expire after 30 days
+  and their keys can be reused. While a record exists, a different request
+  with that key conflicts.
+  """
+  checkoutWithCredit(input: CheckoutWithCreditInput!): CreditCheckoutPayload!
   checkout(address: ShippingAddressInput, cartId: ID, shippingMode: ShippingMode!): CheckoutPayload!
   retryPayment(orderId: ID!): CheckoutPayload!
   confirmPayment(orderId: ID!, paymentId: ID!): ConfirmPaymentPayload!
+  resolvePaymentReview(orderId: ID!, paymentId: ID!, action: String!, reason: String!): ResolvePaymentReviewPayload!
+  releasePaymentReview(orderId: ID!, paymentId: ID!, reason: String!): ReleasePaymentReviewPayload!
+  recordPaymentAttemptObservation(orderId: ID!, attemptId: ID!, requestId: ID!, statement: String!): RecordPaymentAttemptObservationPayload!
+  releasePaymentAttempt(orderId: ID!, attemptId: ID!, observationId: ID!, reason: String!, acknowledgeRisk: Boolean!): PaymentAttemptReleasePayload!
+  createProduct(input: CreateProductInput!): CreateProductPayload!
+  updateProduct(id: ID!, input: UpdateProductInput!): UpdateProductPayload!
+  adjustVariantStock(productId: ID!, variantId: ID!, newStock: Int!): AdjustVariantStockPayload!
+  createPromotion(input: CreatePromotionInput!): CreatePromotionPayload!
+  updatePromotion(id: ID!, input: UpdatePromotionInput!): UpdatePromotionPayload!
+}
+
+input CreateProductInput {
+  bggId: Int
+  category: [String]
+  imageFileName: String
+  imageUrl: String
+  maxAge: Int
+  maxPlayers: Int
+  minAge: Int
+  minPlayers: Int
+  name: String!
+  playingTimeMinutes: Int
+  price: Float!
+  publisher: String
+  quantity: Int!
+  releaseYear: Int
+  weight: Float
+}
+
+input UpdateProductInput {
+  category: [String]
+  imageFileName: String
+  imageUrl: String
+  maxAge: Int
+  maxPlayers: Int
+  minAge: Int
+  minPlayers: Int
+  name: String
+  playingTimeMinutes: Int
+  price: Float
+  publisher: String
+  quantity: Int
+  releaseYear: Int
+  weight: Float
+}
+
+type CreateProductPayload {
+  product: Product
+  userErrors: [UserError!]!
+}
+
+type UpdateProductPayload {
+  product: Product
+  userErrors: [UserError!]!
+}
+
+type AdjustVariantStockPayload {
+  success: Boolean
+  errors: [UserError!]!
+}
+
+input CreatePromotionInput {
+  active: Boolean!
+  discountPercent: Float!
+  name: String!
+}
+
+input UpdatePromotionInput {
+  active: Boolean
+  discountPercent: Float
+  name: String
+}
+
+type CreatePromotionPayload {
+  promotion: Promotion
+  userErrors: [UserError!]!
+}
+
+type UpdatePromotionPayload {
+  promotion: Promotion
+  userErrors: [UserError!]!
 }
 
 

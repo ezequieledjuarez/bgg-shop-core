@@ -42,5 +42,6 @@ uvicorn[standard]>=0.27.1
 # ==============================================================================
 pytest>=7.0.0
 # Checkout payments and on-demand invoice PDFs
-mercadopago>=2.2.3
+mercadopago>=3.6.0,<4
+requests>=2.31.0,<3
 reportlab>=4.1.0

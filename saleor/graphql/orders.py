@@ -1,5 +1,6 @@
 """Purchase order GraphQL types and operations."""
 
+import re
 import uuid
 from decimal import Decimal
 
@@ -8,6 +9,9 @@ from django.db import connection, transaction
 from django.utils import timezone
 
 from . import payments
+
+
+_ADDRESS_LIMITS = {"recipient": 250, "street": 500, "city": 150, "postal_code": 32, "phone": 50}
 
 
 class ShippingMode(graphene.Enum):
@@ -173,9 +177,27 @@ def _preference(order_id, lines):
     if not isinstance(result, dict) or result.get("status") not in (200, 201):
         return None, None
     response = result.get("response", {})
-    if not response.get("id"):
+    if not isinstance(response, dict):
         return None, None
-    return str(response["id"]), response.get("init_point")
+    preference_id = response.get("id")
+    if (isinstance(preference_id, bool) or not isinstance(preference_id, (str, int))
+            or (isinstance(preference_id, int) and preference_id <= 0)):
+        return None, None
+    preference_id = str(preference_id)
+    if (not 1 <= len(preference_id) <= 128 or preference_id != preference_id.strip()
+            or not preference_id.isprintable()):
+        return None, None
+    return preference_id, response.get("init_point")
+
+
+def _lock_credit_account(cursor, user_id):
+    cursor.execute(
+        "INSERT INTO credit_account (user_id, balance, currency) VALUES (%s, %s, %s) "
+        "ON CONFLICT (user_id) DO NOTHING", [user_id, Decimal("0.00"), "ARS"]
+    )
+    cursor.execute(
+        "SELECT user_id FROM credit_account WHERE user_id = %s FOR UPDATE", [user_id]
+    )
 
 
 def checkout(info, shipping_mode, address=None, cart_id=None):
@@ -207,9 +229,13 @@ def checkout(info, shipping_mode, address=None, cart_id=None):
         )
         for key in ("recipient", "street", "city", "postal_code", "phone")
     }
-    if mode == "standard" and any(
-        not values[key] for key in ("recipient", "street", "city", "postal_code")
-    ):
+    invalid_lengths = any(
+        value is not None and (not isinstance(value, str) or len(value) > _ADDRESS_LIMITS[key])
+        for key, value in values.items()
+    )
+    if invalid_lengths or (mode == "standard" and any(
+        not (values[key] or "").strip() for key in ("recipient", "street", "city", "postal_code")
+    )):
         return CheckoutPayload(
             user_errors=[
                 _error(
@@ -219,8 +245,9 @@ def checkout(info, shipping_mode, address=None, cart_id=None):
                 )
             ]
         )
-    with transaction.atomic():
+    with transaction.atomic(durable=True):
         with connection.cursor() as cursor:
+            _lock_credit_account(cursor, user.pk)
             cart_identifier = _get_cart_id(cursor, user, cart_id)
             cursor.execute(
                 "SELECT p.bgg_id, p.name, p.price_amount, line.quantity, p.quantity "
@@ -285,6 +312,11 @@ def checkout(info, shipping_mode, address=None, cart_id=None):
                         "quantity": quantity,
                     }
                 )
+            cursor.execute(
+                "INSERT INTO credit_retry_attempt (order_id, user_id) VALUES (%s, %s) "
+                "RETURNING attempt_id", [order_id, user.pk]
+            )
+            attempt_id = cursor.fetchone()[0]
     preference_id, init_point = _preference(order_id, lines)
     if not preference_id:
         return CheckoutPayload(
@@ -295,14 +327,7 @@ def checkout(info, shipping_mode, address=None, cart_id=None):
                 )
             ]
         )
-    with connection.cursor() as cursor:
-        cursor.execute(
-            "UPDATE purchase_order SET mp_preference_id = %s WHERE id = %s",
-            [preference_id, order_id],
-        )
-        order = _load_order(cursor, order_id, user.pk)
-        result_order = _order_payload(cursor, order)
-    return CheckoutPayload(order=result_order, init_point=init_point, user_errors=[])
+    return _complete_preference_attempt(user, order_id, attempt_id, preference_id, init_point)
 
 
 def retry_payment(info, order_id):
@@ -322,8 +347,9 @@ def retry_payment(info, order_id):
         return CheckoutPayload(
             user_errors=[_error("ORDER_NOT_FOUND", "Order not found.")]
         )
-    with connection.cursor() as cursor:
-        order = _load_order(cursor, identifier, user.pk)
+    with transaction.atomic(durable=True), connection.cursor() as cursor:
+        _lock_credit_account(cursor, user.pk)
+        order = _load_order(cursor, identifier, user.pk, lock=True)
         if not order:
             return CheckoutPayload(
                 user_errors=[_error("ORDER_NOT_FOUND", "Order not found.")]
@@ -333,6 +359,43 @@ def retry_payment(info, order_id):
                 user_errors=[
                     _error("ORDER_NOT_PAYABLE", "This order cannot be paid again.")
                 ]
+            )
+        cursor.execute(
+            "SELECT 1 FROM credit_retry_guard WHERE order_id = %s AND user_id = %s",
+            [identifier, user.pk],
+        )
+        if cursor.fetchone():
+            return CheckoutPayload(
+                user_errors=[_error("ORDER_NOT_PAYABLE", "This order cannot be paid again.")]
+            )
+        cursor.execute(
+            "SELECT 1 FROM credit_payment_review review WHERE review.order_id = %s "
+            "AND NOT EXISTS (SELECT 1 FROM credit_payment_review_release release "
+            "WHERE release.order_id = review.order_id AND release.payment_id = review.payment_id) LIMIT 1",
+            [identifier],
+        )
+        if cursor.fetchone():
+            return CheckoutPayload(
+                user_errors=[_error("PAYMENT_REQUIRES_REVIEW", "Payment requires manual review.")]
+            )
+        cursor.execute(
+            "INSERT INTO credit_retry_attempt (order_id, user_id) VALUES (%s, %s) "
+            "ON CONFLICT (order_id) DO NOTHING RETURNING attempt_id", [identifier, user.pk]
+        )
+        created_attempt = cursor.fetchone()
+        if created_attempt is None:
+            return CheckoutPayload(
+                user_errors=[_error("PENDING_PAYMENT", "A payment attempt requires reconciliation.")]
+            )
+        attempt_id = created_attempt[0]
+        cursor.execute(
+            "UPDATE purchase_order SET status = %s WHERE id = %s "
+            "AND user_id = %s AND status IN ('pending_payment', 'rejected')",
+            ["pending_payment", identifier, user.pk],
+        )
+        if cursor.rowcount == 0:
+            return CheckoutPayload(
+                user_errors=[_error("ORDER_NOT_PAYABLE", "This order cannot be paid again.")]
             )
         cursor.execute(
             "SELECT bgg_id, name, unit_price, quantity FROM purchase_order_line "
@@ -353,7 +416,32 @@ def retry_payment(info, order_id):
                 )
             ]
         )
-    with connection.cursor() as cursor:
+    return _complete_preference_attempt(user, identifier, attempt_id, preference_id, init_point)
+
+
+def _complete_preference_attempt(user, identifier, attempt_id, preference_id, init_point):
+    with transaction.atomic(), connection.cursor() as cursor:
+        _lock_credit_account(cursor, user.pk)
+        order = _load_order(cursor, identifier, user.pk, lock=True)
+        if not order:
+            return CheckoutPayload(
+                user_errors=[_error("ORDER_NOT_FOUND", "Order not found.")]
+            )
+        cursor.execute(
+            "SELECT attempt_id FROM credit_retry_attempt WHERE order_id = %s AND user_id = %s FOR UPDATE",
+            [identifier, user.pk],
+        )
+        current_attempt = cursor.fetchone()
+        if current_attempt is None or current_attempt[0] != attempt_id:
+            cursor.execute(
+                "INSERT INTO credit_retry_attempt_release_response (attempt_id, preference_id) "
+                "SELECT attempt_id, %s FROM credit_retry_attempt_release WHERE attempt_id = %s "
+                "ON CONFLICT (attempt_id) DO NOTHING",
+                [preference_id, attempt_id],
+            )
+            return CheckoutPayload(
+                user_errors=[_error("PENDING_PAYMENT", "A payment attempt requires reconciliation.")]
+            )
         # Conditional update: a concurrent confirmation must never be overwritten.
         cursor.execute(
             "UPDATE purchase_order SET mp_preference_id = %s, status = %s, "
@@ -361,7 +449,12 @@ def retry_payment(info, order_id):
             "WHERE id = %s AND status IN ('pending_payment', 'rejected')",
             [preference_id, "pending_payment", identifier],
         )
-        if cursor.rowcount == 0:
+        order_updated = cursor.rowcount != 0
+        cursor.execute(
+            "UPDATE credit_retry_attempt SET preference_id = %s WHERE order_id = %s AND attempt_id = %s",
+            [preference_id, identifier, attempt_id],
+        )
+        if not order_updated:
             return CheckoutPayload(
                 user_errors=[
                     _error("ORDER_NOT_PAYABLE", "This order cannot be paid again.")
@@ -373,12 +466,16 @@ def retry_payment(info, order_id):
 
 
 def confirm_payment(info, order_id, payment_id):
-    from .api import _authenticated_user
+    from .api import _authenticated_user, _get_cart_id
 
     user = _authenticated_user(info)
     if user is None:
         return ConfirmPaymentPayload(
             user_errors=[_error("UNAUTHENTICATED", "Authentication is required.")]
+        )
+    if not isinstance(payment_id, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", payment_id):
+        return ConfirmPaymentPayload(
+            user_errors=[_error("PAYMENT_NOT_VERIFIED", "Mercado Pago payment could not be verified.")]
         )
     try:
         identifier = uuid.UUID(str(order_id))
@@ -395,7 +492,10 @@ def confirm_payment(info, order_id, payment_id):
     try:
         result = payments.fetch_payment(payment_id)
         payment = result.get("response", {})
-        if result.get("status") != 200 or payment.get("live_mode") is True:
+        returned_id = payment.get("id")
+        if (result.get("status") != 200 or not payments.is_sandbox_payment(payment)
+            or isinstance(returned_id, bool) or returned_id is None
+            or str(returned_id) != payment_id):
             raise ValueError
         external_reference = str(payment.get("external_reference", ""))
         amount = Decimal(str(payment.get("transaction_amount")))
@@ -416,24 +516,76 @@ def confirm_payment(info, order_id, payment_id):
                 )
             ]
         )
-    if (
-        amount != Decimal(str(order["total"]))
-        or payment.get("currency_id") != order["currency"]
-    ):
-        return ConfirmPaymentPayload(
-            user_errors=[
-                _error(
-                    "PAYMENT_AMOUNT_MISMATCH",
-                    "Payment amount or currency does not match the order.",
-                )
-            ]
-        )
     status, detail = payment.get("status"), payment.get("status_detail")
+    preference_id = payments.verified_preference(payment, str(identifier)) if status == "approved" else None
     with transaction.atomic():
         with connection.cursor() as cursor:
+            _lock_credit_account(cursor, user.pk)
             order = _load_order(cursor, identifier, user.pk, lock=True)
+            if not order:
+                return ConfirmPaymentPayload(
+                    user_errors=[_error("ORDER_NOT_FOUND", "Order not found.")]
+                )
+            cursor.execute(
+                "SELECT 1 FROM credit_retry_guard WHERE order_id = %s AND user_id = %s",
+                [identifier, user.pk],
+            )
+            if cursor.fetchone():
+                if status == "approved":
+                    cursor.execute(
+                        "INSERT INTO credit_payment_review (order_id, payment_id) "
+                        "VALUES (%s, %s) ON CONFLICT (order_id, payment_id) DO NOTHING",
+                        [identifier, str(payment_id)],
+                    )
+                    return ConfirmPaymentPayload(
+                        user_errors=[_error("PAYMENT_REQUIRES_REVIEW", "Payment requires manual review.")]
+                    )
+                return ConfirmPaymentPayload(
+                    user_errors=[_error("ORDER_NOT_PAYABLE", "This order cannot be paid again.")]
+                )
+            cursor.execute(
+                "SELECT 1 FROM credit_payment_review WHERE order_id = %s AND payment_id = %s",
+                [identifier, str(payment_id)],
+            )
+            if cursor.fetchone():
+                return ConfirmPaymentPayload(
+                    user_errors=[_error("PAYMENT_REQUIRES_REVIEW", "Payment requires manual review.")]
+                )
+            cursor.execute(
+                "SELECT 1 FROM credit_payment_review review WHERE review.order_id = %s "
+                "AND NOT EXISTS (SELECT 1 FROM credit_payment_review_release release "
+                "WHERE release.order_id = review.order_id AND release.payment_id = review.payment_id) LIMIT 1",
+                [identifier],
+            )
+            reviewed = cursor.fetchone() is not None
+            if status == "approved" and (reviewed or not preference_id or preference_id != order["mp_preference_id"]):
+                cursor.execute(
+                    "INSERT INTO credit_payment_review (order_id, payment_id) "
+                    "VALUES (%s, %s) ON CONFLICT (order_id, payment_id) DO NOTHING",
+                    [identifier, str(payment_id)],
+                )
+                return ConfirmPaymentPayload(
+                    user_errors=[_error("PAYMENT_REQUIRES_REVIEW", "Payment requires manual review.")]
+                )
+            if reviewed:
+                return ConfirmPaymentPayload(
+                    user_errors=[_error("PAYMENT_REQUIRES_REVIEW", "Payment requires manual review.")]
+                )
+            if (
+                amount != Decimal(str(order["total"]))
+                or payment.get("currency_id") != order["currency"]
+            ):
+                return ConfirmPaymentPayload(
+                    user_errors=[
+                        _error(
+                            "PAYMENT_AMOUNT_MISMATCH",
+                            "Payment amount or currency does not match the order.",
+                        )
+                    ]
+                )
             if order["status"] not in ("paid", "paid_stock_conflict", "cancelled"):
                 if status == "approved":
+                    _get_cart_id(cursor, user)
                     cursor.execute(
                         "SELECT bgg_id, quantity FROM purchase_order_line "
                         "WHERE order_id = %s ORDER BY bgg_id",
@@ -520,6 +672,11 @@ def confirm_payment(info, order_id, payment_id):
                         "payment_status_detail = %s, mp_payment_id = %s WHERE id = %s",
                         [status, detail, str(payment_id), identifier],
                     )
+            if status == "approved" and preference_id == order["mp_preference_id"]:
+                cursor.execute(
+                    "DELETE FROM credit_retry_attempt WHERE order_id = %s AND preference_id = %s",
+                    [identifier, preference_id],
+                )
             order = _load_order(cursor, identifier, user.pk)
             result_order = _order_payload(cursor, order)
     return ConfirmPaymentPayload(order=result_order, user_errors=[])

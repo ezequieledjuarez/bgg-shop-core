@@ -34,7 +34,9 @@ class OrderCursor:
         params = params or []
         sql = " ".join(sql.split())
         self.rows = []
-        if sql.startswith("SELECT p.bgg_id, p.name, p.price_amount"):
+        if sql.startswith("SELECT cart_id FROM shopping_cart WHERE user_id = %s"):
+            self.rows = [(CART_ID,)] if params[0] == USER.pk else []
+        elif sql.startswith("SELECT p.bgg_id, p.name, p.price_amount"):
             self.rows = list(self.db["cart_lines"])
         elif sql.startswith("INSERT INTO purchase_order ("):
             oid, uid, status, total, currency, mode, *address = params
@@ -70,6 +72,26 @@ class OrderCursor:
                 self.db["order"]["payment_status_detail"] = None
             else:
                 self.rowcount = 0
+        elif sql.startswith("SELECT 1 FROM credit_retry_guard"):
+            self.rows = [(1,)] if self.db.get("credit_retry_blocked") else []
+        elif sql.startswith("INSERT INTO credit_retry_attempt"):
+            self.rowcount = int(not self.db.get("credit_retry_attempt"))
+            if self.rowcount:
+                self.db["credit_retry_attempt"] = True
+                self.db["attempt_preference_id"] = None
+                self.db["attempt_id"] = uuid.uuid4()
+                self.rows = [(self.db["attempt_id"],)]
+        elif sql.startswith("SELECT attempt_id FROM credit_retry_attempt"):
+            self.rows = [(self.db["attempt_id"],)] if self.db.get("credit_retry_attempt") else []
+        elif sql.startswith("UPDATE credit_retry_attempt SET preference_id"):
+            self.db["attempt_preference_id"] = params[0]
+        elif sql.startswith("DELETE FROM credit_retry_attempt"):
+            if self.db.get("attempt_preference_id") == params[1]:
+                self.db["credit_retry_attempt"] = False
+        elif sql.startswith("UPDATE purchase_order SET status = %s WHERE"):
+            self.rowcount = int(self.db["order"]["status"] in ("pending_payment", "rejected"))
+            if self.rowcount:
+                self.db["order"]["status"] = params[0]
         elif sql.startswith("SELECT id, user_id, status, total"):
             order = self.db.get("order")
             owner_id = params[-1] if "AND user_id = %s" in sql else None
@@ -228,11 +250,17 @@ def setup_order(db, monkeypatch, status="pending_payment"):
         paid_at=None,
     )
     monkeypatch.setattr(orders, "connection", OrderConnection(db))
-    monkeypatch.setattr(orders.transaction, "atomic", nullcontext)
+    monkeypatch.setattr(orders.transaction, "atomic", lambda **_kwargs: nullcontext())
+    monkeypatch.setattr(
+        orders.payments, "verified_preference",
+        lambda provider_payment, _order_id: provider_payment.get("preference_id", "pref-1"),
+    )
 
 
 def payment(status="approved", **updates):
     value = {
+        "id": "mp-9",
+        "live_mode": False,
         "external_reference": str(ORDER_ID),
         "transaction_amount": 25.0,
         "currency_id": "ARS",
@@ -255,7 +283,7 @@ def confirm(db, monkeypatch, response=None, user=USER):
 def test_checkout_creates_order_snapshot_and_preference(monkeypatch):
     db = database()
     monkeypatch.setattr(orders, "connection", OrderConnection(db))
-    monkeypatch.setattr(orders.transaction, "atomic", nullcontext)
+    monkeypatch.setattr(orders.transaction, "atomic", lambda **_kwargs: nullcontext())
     monkeypatch.setattr("saleor.graphql.api._get_cart_id", lambda *_args: str(CART_ID))
     monkeypatch.setattr(orders.payments, "configuration_error", lambda: None)
     monkeypatch.setattr(orders.payments, "currency_id", lambda: "ARS")
@@ -271,6 +299,34 @@ def test_checkout_creates_order_snapshot_and_preference(monkeypatch):
     assert db["lines"][0][1:4] == ("Board Game", Decimal("12.50"), 2)
 
 
+@pytest.mark.parametrize("field,limit", [("recipient", 250), ("street", 500), ("city", 150), ("postal_code", 32), ("phone", 50)])
+def test_checkout_validates_address_field_boundaries(monkeypatch, field, limit):
+    db = database()
+    monkeypatch.setattr(orders, "connection", OrderConnection(db))
+    monkeypatch.setattr(orders.transaction, "atomic", lambda **_kwargs: nullcontext())
+    monkeypatch.setattr("saleor.graphql.api._get_cart_id", lambda *_args: str(CART_ID))
+    monkeypatch.setattr(orders.payments, "configuration_error", lambda: None)
+    monkeypatch.setattr(orders.payments, "currency_id", lambda: "ARS")
+    with patch.object(orders, "_preference", return_value=("pref-1", "https://mp.test/pay")) as preference, auth():
+        valid = orders.checkout(SimpleNamespace(), "pickup", {field: "x" * limit})
+        invalid = orders.checkout(SimpleNamespace(), "pickup", {field: "x" * (limit + 1)})
+    assert valid.user_errors == []
+    assert invalid.user_errors[0].code == "ADDRESS_REQUIRED"
+    preference.assert_called_once()
+
+
+def test_checkout_rejects_whitespace_only_required_address(monkeypatch):
+    monkeypatch.setattr(orders, "connection", OrderConnection(database()))
+    monkeypatch.setattr(orders.transaction, "atomic", lambda **_kwargs: nullcontext())
+    monkeypatch.setattr("saleor.graphql.api._get_cart_id", lambda *_args: str(CART_ID))
+    monkeypatch.setattr(orders.payments, "configuration_error", lambda: None)
+    monkeypatch.setattr(orders.payments, "currency_id", lambda: "ARS")
+    with patch.object(orders, "_preference", return_value=("pref-1", "https://mp.test/pay")) as preference, auth():
+        result = orders.checkout(SimpleNamespace(), "standard", {"recipient": "  ", "street": "Street", "city": "City", "postal_code": "1000"})
+    assert result.user_errors[0].code == "ADDRESS_REQUIRED"
+    preference.assert_not_called()
+
+
 def test_checkout_refuses_sandbox_disabled(monkeypatch):
     monkeypatch.setattr(
         orders.payments, "configuration_error", lambda: "sandbox disabled"
@@ -283,7 +339,7 @@ def test_checkout_refuses_sandbox_disabled(monkeypatch):
 def test_checkout_rejects_empty_cart_and_insufficient_stock(monkeypatch):
     db = database(stock=1)
     monkeypatch.setattr(orders, "connection", OrderConnection(db))
-    monkeypatch.setattr(orders.transaction, "atomic", nullcontext)
+    monkeypatch.setattr(orders.transaction, "atomic", lambda **_kwargs: nullcontext())
     monkeypatch.setattr("saleor.graphql.api._get_cart_id", lambda *_args: str(CART_ID))
     monkeypatch.setattr(orders.payments, "configuration_error", lambda: None)
     with auth():
@@ -352,6 +408,36 @@ def test_confirm_rejects_payment_amount_mismatch(monkeypatch):
     assert db["wishlist_entries"] == {(USER.pk, 7), (USER.pk, 8), (99, 7)}
 
 
+@pytest.mark.parametrize("returned_id", [None, "different-payment"])
+def test_confirm_rejects_unverified_provider_payment_id(monkeypatch, returned_id):
+    db = database()
+    result = confirm(db, monkeypatch, payment(id=returned_id))
+    assert result.user_errors[0].code == "PAYMENT_NOT_VERIFIED"
+    assert db["order"]["status"] == "pending_payment"
+    assert db["products"][7] == 9
+    assert db["invoice"] is None
+
+
+@pytest.mark.parametrize("live_mode", [None, True, "false", 0])
+def test_confirm_requires_explicit_sandbox_payment(monkeypatch, live_mode):
+    db = database()
+    result = confirm(db, monkeypatch, payment(live_mode=live_mode))
+    assert result.user_errors[0].code == "PAYMENT_NOT_VERIFIED"
+    assert db["order"]["status"] == "pending_payment"
+    assert db["products"][7] == 9
+    assert db["invoice"] is None
+
+
+@pytest.mark.parametrize("payment_id", ["", "x" * 129, "../payment", "payment\nsecret"])
+def test_confirm_rejects_invalid_payment_id_before_provider_request(monkeypatch, payment_id):
+    db = database()
+    setup_order(db, monkeypatch)
+    with auth(), patch.object(orders.payments, "fetch_payment") as fetch:
+        result = orders.confirm_payment(SimpleNamespace(), ORDER_ID, payment_id)
+    assert result.user_errors[0].code == "PAYMENT_NOT_VERIFIED"
+    fetch.assert_not_called()
+
+
 def test_invoice_pdf_generates_pdf_and_hides_other_owners(monkeypatch):
     db = database()
     setup_order(db, monkeypatch, "paid")
@@ -386,6 +472,77 @@ def test_retry_payment_creates_new_preference_for_rejected_order(monkeypatch):
     assert result.init_point == "https://mp.test/retry"
     assert db["order"]["mp_preference_id"] == "pref-2"
     assert db["order"]["status"] == "pending_payment"
+    assert db["credit_retry_attempt"] is True
+    assert db["attempt_preference_id"] == "pref-2"
+
+
+def test_retry_blocked_rejected_order_never_creates_preference(monkeypatch):
+    db = database()
+    setup_order(db, monkeypatch, status="rejected")
+    db["credit_retry_blocked"] = True
+    monkeypatch.setattr(orders.payments, "configuration_error", lambda: None)
+    with auth(), patch.object(orders, "_preference", return_value=("pref-2", "https://mp.test/retry")) as preference:
+        result = orders.retry_payment(SimpleNamespace(), ORDER_ID)
+    assert result.user_errors[0].code == "ORDER_NOT_PAYABLE"
+    preference.assert_not_called()
+    assert db["order"]["status"] == "rejected"
+
+
+def test_retry_ambiguous_provider_response_keeps_attempt_pending(monkeypatch):
+    db = database()
+    setup_order(db, monkeypatch, status="rejected")
+    monkeypatch.setattr(orders.payments, "configuration_error", lambda: None)
+    monkeypatch.setattr(orders, "_preference", lambda *_args: (None, None))
+    with auth():
+        result = orders.retry_payment(SimpleNamespace(), ORDER_ID)
+    assert result.user_errors[0].code == "PAYMENT_INITIALIZATION_FAILED"
+    assert db["order"]["status"] == "pending_payment"
+    assert db["credit_retry_attempt"] is True
+    assert db["attempt_preference_id"] is None
+
+
+@pytest.mark.parametrize("terminal_status", ["paid", "paid_stock_conflict", "cancelled"])
+def test_retry_records_preference_when_order_becomes_terminal(monkeypatch, terminal_status):
+    db = database()
+    setup_order(db, monkeypatch, status="rejected")
+    monkeypatch.setattr(orders.payments, "configuration_error", lambda: None)
+
+    def preference(*_args):
+        db["order"].update(
+            status=terminal_status,
+            mp_preference_id="pref-1",
+            mp_payment_id="confirmed-payment",
+            payment_status="approved",
+            payment_status_detail="accredited",
+        )
+        return "pref-2", "https://example.invalid/retry"
+
+    monkeypatch.setattr(orders, "_preference", preference)
+    with auth():
+        result = orders.retry_payment(SimpleNamespace(), ORDER_ID)
+
+    assert result.user_errors[0].code == "ORDER_NOT_PAYABLE"
+    assert result.init_point is None
+    assert db["order"]["status"] == terminal_status
+    assert db["order"]["mp_preference_id"] == "pref-1"
+    assert db["order"]["mp_payment_id"] == "confirmed-payment"
+    assert db["order"]["payment_status"] == "approved"
+    assert db["order"]["payment_status_detail"] == "accredited"
+    assert db["credit_retry_attempt"] is True
+    assert db["attempt_preference_id"] == "pref-2"
+
+
+@pytest.mark.parametrize("status,preference_id,cleared,review", [
+    ("approved", "pref-1", True, False), ("approved", "old-pref", False, True),
+    ("approved", None, False, True), ("rejected", "pref-1", False, False),
+])
+def test_confirmation_only_clears_matching_retry_attempt(monkeypatch, status, preference_id, cleared, review):
+    db = database()
+    db["credit_retry_attempt"] = True
+    db["attempt_preference_id"] = "pref-1"
+    result = confirm(db, monkeypatch, payment(status, preference_id=preference_id))
+    assert ([error.code for error in result.user_errors] == ["PAYMENT_REQUIRES_REVIEW"]) if review else result.user_errors == []
+    assert db["credit_retry_attempt"] is not cleared
 
 
 def test_retry_payment_does_not_revive_paid_order(monkeypatch):
@@ -414,6 +571,59 @@ def test_confirm_rejects_live_mode_payment(monkeypatch):
     assert result.user_errors[0].code == "PAYMENT_NOT_VERIFIED"
     assert db["products"][7] == 9
     assert db["wishlist_entries"] == {(USER.pk, 7), (USER.pk, 8), (99, 7)}
+
+
+def test_confirm_accepts_live_mode_for_verified_test_seller(monkeypatch):
+    db = database()
+    identity = SimpleNamespace(status_code=200, json=lambda: {"id": 123, "tags": ["test_user"]})
+    with override_settings(MP_SANDBOX=True, MP_ACCESS_TOKEN="synthetic-token"), \
+            patch("requests.get", return_value=identity) as get_identity:
+        result = confirm(db, monkeypatch, payment(live_mode=True, collector_id=123))
+    assert result.user_errors == []
+    assert result.order.status == "paid"
+    assert db["products"][7] == 7
+    get_identity.assert_called_once()
+
+
+@pytest.mark.parametrize("identity", [
+    {"id": 124, "tags": ["test_user"]},
+    {"id": 123, "tags": []},
+    {"id": 123, "tags": "test_user"},
+    {"id": "123", "tags": ["test_user"]},
+    {"tags": ["test_user"]},
+    None,
+])
+def test_confirm_rejects_unverified_live_mode_seller(monkeypatch, identity):
+    db = database()
+    response = SimpleNamespace(status_code=200, json=lambda: identity)
+    with override_settings(MP_SANDBOX=True, MP_ACCESS_TOKEN="synthetic-token"), \
+            patch("requests.get", return_value=response):
+        result = confirm(db, monkeypatch, payment(live_mode=True, collector_id=123))
+    assert result.user_errors[0].code == "PAYMENT_NOT_VERIFIED"
+    assert db["order"]["status"] == "pending_payment"
+    assert db["products"][7] == 9
+    assert db["invoice"] is None
+
+
+@pytest.mark.parametrize("failure", ["http", "timeout", "sandbox_disabled"])
+def test_confirm_fails_closed_when_test_seller_cannot_be_verified(monkeypatch, failure, capsys, caplog):
+    import requests
+
+    db = database()
+    response = SimpleNamespace(status_code=403)
+    error = requests.Timeout("synthetic-private-token") if failure == "timeout" else None
+    with override_settings(MP_SANDBOX=failure != "sandbox_disabled", MP_ACCESS_TOKEN="synthetic-private-token"), \
+            patch("requests.get", return_value=response, side_effect=error) as get_identity:
+        result = confirm(db, monkeypatch, payment(live_mode=True, collector_id=123))
+    assert result.user_errors[0].code == "PAYMENT_NOT_VERIFIED"
+    assert db["products"][7] == 9
+    if failure == "sandbox_disabled":
+        get_identity.assert_not_called()
+    else:
+        assert get_identity.call_args.kwargs["timeout"] == 10
+        assert get_identity.call_args.kwargs["allow_redirects"] is False
+    captured = capsys.readouterr()
+    assert "synthetic-private-token" not in captured.out + captured.err + caplog.text
 
 
 def test_paid_confirmation_keeps_cart_changes_made_after_checkout(monkeypatch):
@@ -458,6 +668,170 @@ def test_payment_sdk_preference_uses_sandbox_currency_and_return_urls(monkeypatc
         "pending": "http://localhost:3000/compra/resultado",
     }
     assert "auto_return" not in data
+
+
+def test_payment_sdk_does_not_log_preference_url(monkeypatch, capsys, caplog):
+    import mercadopago
+
+    fake_sdk = __import__("unittest.mock", fromlist=["MagicMock"]).MagicMock()
+    secret_url = "https://example.invalid/checkout/synthetic-private-reference"
+    fake_sdk.preference.return_value.create.return_value = {
+        "status": 201, "response": {"id": "p-1", "init_point": secret_url},
+    }
+    monkeypatch.setattr(mercadopago, "SDK", lambda token: fake_sdk)
+    with override_settings(MP_ACCESS_TOKEN="synthetic-token", MP_CURRENCY_ID="ARS"):
+        result = orders.payments.create_preference(ORDER_ID, [])
+    assert result["response"]["init_point"] == secret_url
+    captured = capsys.readouterr()
+    assert secret_url not in captured.out + captured.err + caplog.text
+    assert "synthetic-token" not in captured.out + captured.err + caplog.text
+
+
+def test_preference_creation_uses_no_sdk_retries(monkeypatch):
+    import mercadopago
+
+    fake_sdk = __import__("unittest.mock", fromlist=["MagicMock"]).MagicMock()
+    monkeypatch.setattr(mercadopago, "SDK", lambda token: fake_sdk)
+    with override_settings(MP_ACCESS_TOKEN="synthetic-token", MP_CURRENCY_ID="ARS"):
+        orders.payments.create_preference(ORDER_ID, [])
+    options = fake_sdk.preference.call_args.kwargs["request_options"]
+    assert options.max_retries == 0
+    assert options.connection_timeout == 10.0
+
+
+@pytest.mark.parametrize("provider_response", [
+    None, [], {"id": True}, {"id": {}}, {"id": " "}, {"id": "x" * 129},
+    {"id": "pref\nsecret"}, {"id": -1},
+])
+def test_preference_rejects_malformed_provider_identifiers(provider_response):
+    with patch.object(orders.payments, "create_preference", return_value={"status": 201, "response": provider_response}):
+        assert orders._preference(ORDER_ID, []) == (None, None)
+
+
+def test_discovery_sdk_requests_use_bounded_timeouts(monkeypatch):
+    import mercadopago
+
+    fake_sdk = __import__("unittest.mock", fromlist=["MagicMock"]).MagicMock()
+    monkeypatch.setattr(mercadopago, "SDK", lambda token: fake_sdk)
+    with override_settings(MP_ACCESS_TOKEN="synthetic-token"):
+        orders.payments.search_payments(str(ORDER_ID), 0, 50)
+        orders.payments.fetch_payment("123", bounded=True)
+    search = fake_sdk.payment.return_value.search.call_args
+    fetch = fake_sdk.payment.return_value.get.call_args
+    for call in (search, fetch):
+        options = call.kwargs["request_options"]
+        assert options.connection_timeout == 10.0
+        assert options.max_retries == 0
+    assert search.args[0]["external_reference"] == str(ORDER_ID)
+    assert search.args[0]["offset"] == 0 and search.args[0]["limit"] == 50
+
+
+def test_discovery_accepts_live_mode_for_verified_test_seller():
+    from saleor.graphql.management.commands.discover_credit_payments import Command
+
+    search = {"status": 200, "response": {
+        "paging": {"total": 1, "offset": 0, "limit": 50}, "results": [{"id": 42}],
+    }}
+    fetched = {"status": 200, "response": {
+        "id": 42, "status": "approved", "live_mode": True,
+        "collector_id": 123, "external_reference": str(ORDER_ID),
+    }}
+    identity = SimpleNamespace(status_code=200, json=lambda: {"id": 123, "tags": ["test_user"]})
+    with override_settings(MP_SANDBOX=True, MP_ACCESS_TOKEN="synthetic-token"), \
+            patch.object(orders.payments, "search_payments", return_value=search), \
+            patch.object(orders.payments, "fetch_payment", return_value=fetched), \
+            patch("requests.get", return_value=identity):
+        assert Command()._verified_payments(str(ORDER_ID), 1, [1]) == ["42"]
+
+
+def test_discovery_rejects_live_mode_for_unverified_seller():
+    from saleor.graphql.management.commands.discover_credit_payments import Command
+
+    search = {"status": 200, "response": {
+        "paging": {"total": 1, "offset": 0, "limit": 50}, "results": [{"id": 42}],
+    }}
+    fetched = {"status": 200, "response": {
+        "id": 42, "status": "approved", "live_mode": True,
+        "collector_id": 123, "external_reference": str(ORDER_ID),
+    }}
+    identity = SimpleNamespace(status_code=200, json=lambda: {"id": 123, "tags": []})
+    with override_settings(MP_SANDBOX=True, MP_ACCESS_TOKEN="synthetic-token"), \
+            patch.object(orders.payments, "search_payments", return_value=search), \
+            patch.object(orders.payments, "fetch_payment", return_value=fetched), \
+            patch("requests.get", return_value=identity), pytest.raises(ValueError):
+        Command()._verified_payments(str(ORDER_ID), 1, [1])
+
+
+def test_verified_merchant_order_returns_preference():
+    provider_payment = {
+        "id": 42, "collector_id": 123, "external_reference": str(ORDER_ID),
+        "order": {"id": "789", "type": "mercadopago"},
+    }
+    merchant_order = {
+        "id": 789, "collector": {"id": 123}, "external_reference": str(ORDER_ID),
+        "payments": [{"id": 42}], "preference_id": "pref-1",
+    }
+    response = SimpleNamespace(status_code=200, json=lambda: merchant_order)
+    with override_settings(MP_ACCESS_TOKEN="synthetic-token"), \
+            patch("requests.get", return_value=response) as lookup:
+        assert orders.payments.verified_preference(provider_payment, str(ORDER_ID)) == "pref-1"
+    assert lookup.call_args.kwargs["timeout"] == 10
+    assert lookup.call_args.kwargs["allow_redirects"] is False
+
+
+@pytest.mark.parametrize("changes", [
+    {"id": 790},
+    {"collector": {"id": 124}},
+    {"collector": {"id": True}},
+    {"external_reference": "other-order"},
+    {"payments": [{"id": 43}]},
+    {"payments": []},
+    {"preference_id": ""},
+    {"preference_id": None},
+])
+def test_verified_merchant_order_rejects_mismatches(changes):
+    provider_payment = {
+        "id": 42, "collector_id": 123, "external_reference": str(ORDER_ID),
+        "order": {"id": "789", "type": "mercadopago"},
+    }
+    merchant_order = {
+        "id": 789, "collector": {"id": 123}, "external_reference": str(ORDER_ID),
+        "payments": [{"id": 42}], "preference_id": "pref-1", **changes,
+    }
+    response = SimpleNamespace(status_code=200, json=lambda: merchant_order)
+    with override_settings(MP_ACCESS_TOKEN="synthetic-token"), \
+            patch("requests.get", return_value=response):
+        assert orders.payments.verified_preference(provider_payment, str(ORDER_ID)) is None
+
+
+def test_verified_merchant_order_rejects_unsafe_identifier_and_timeout(capsys, caplog):
+    import requests
+
+    provider_payment = {
+        "id": 42, "collector_id": 123, "external_reference": str(ORDER_ID),
+        "order": {"id": "../secret", "type": "mercadopago"},
+    }
+    with override_settings(MP_ACCESS_TOKEN="synthetic-private-token"), \
+            patch("requests.get", side_effect=requests.Timeout("synthetic-private-token")) as lookup:
+        assert orders.payments.verified_preference(provider_payment, str(ORDER_ID)) is None
+        lookup.assert_not_called()
+        provider_payment["order"]["id"] = "789"
+        assert orders.payments.verified_preference(provider_payment, str(ORDER_ID)) is None
+    captured = capsys.readouterr()
+    assert "synthetic-private-token" not in captured.out + captured.err + caplog.text
+
+
+def test_verified_merchant_order_rejects_boolean_collector_id():
+    provider_payment = {
+        "id": 42, "collector_id": 1, "external_reference": str(ORDER_ID),
+        "order": {"id": "789", "type": "mercadopago"},
+    }
+    merchant_order = {"id": 789, "collector": {"id": True}, "external_reference": str(ORDER_ID),
+                      "payments": [{"id": 42}], "preference_id": "pref-1"}
+    response = SimpleNamespace(status_code=200, json=lambda: merchant_order)
+    with override_settings(MP_ACCESS_TOKEN="synthetic-token"), \
+            patch("requests.get", return_value=response):
+        assert orders.payments.verified_preference(provider_payment, str(ORDER_ID)) is None
 
 
 def test_confirm_rejects_payment_with_wrong_external_reference(monkeypatch):

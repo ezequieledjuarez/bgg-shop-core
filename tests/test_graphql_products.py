@@ -34,6 +34,27 @@ def test_generated_schema_matches_reference_sdl():
     )
 
 
+def test_products_graphql_default_matches_contract():
+    query = schema.graphql_schema.query_type
+    assert query.fields["products"].args["pageSize"].default_value == 50
+
+
+def test_create_product_sanitizes_database_exception_logs(capsys, caplog):
+    from types import SimpleNamespace
+    from saleor.graphql.api import CreateProductMutation
+
+    secret = "synthetic-private-database-detail"
+    connection = MagicMock()
+    connection.cursor.return_value.__enter__.return_value.execute.side_effect = RuntimeError(secret)
+    admin = SimpleNamespace(is_staff=True, is_superuser=False)
+    product = SimpleNamespace(name="Game", price=1, quantity=1, bggId=123)
+    with patch("saleor.graphql.api._authenticated_user", return_value=admin), patch("saleor.graphql.api.connection", connection):
+        result = CreateProductMutation.mutate(None, None, product)
+    assert result.userErrors[0].code == "SERVER_ERROR"
+    captured = capsys.readouterr()
+    assert secret not in captured.out + captured.err + caplog.text + str(result.userErrors)
+
+
 def test_products_query_maps_rows_and_paginates():
     cursor = MagicMock()
     cursor.fetchone.return_value = (2,)

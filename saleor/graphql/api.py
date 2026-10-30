@@ -1,18 +1,25 @@
 import datetime
+import hashlib
 import re
+import secrets
 import unicodedata
 import uuid
+from decimal import Decimal
 
 import graphene
 import jwt
 import logging
-import traceback
 from django.db import IntegrityError, connection, transaction
 from graphql import GraphQLError
 
 from . import wishlist
+from .credit import (
+    CheckoutWithCreditMutation, CreditBalancePayload, RedeemGiftCardMutation,
+    _error, balance_for_user,
+)
 from .orders import (
-    CheckoutMutation, ConfirmPaymentMutation, PurchaseOrder, RetryPaymentMutation,
+    CheckoutMutation, ConfirmPaymentMutation, OrderUserError, PurchaseOrder, RetryPaymentMutation,
+    _lock_credit_account,
 )
 
 
@@ -394,6 +401,98 @@ def _merge_guest_cart(guest_cart_id, user):
         cursor.execute("DELETE FROM shopping_cart WHERE cart_id = %s", [guest_id])
 
 
+class PaymentReviewResolution(graphene.ObjectType):
+    actor_id = graphene.ID(required=True)
+    action = graphene.String(required=True)
+    reason = graphene.String(required=True)
+    resolved_at = graphene.String(required=True)
+
+
+class PaymentReviewRelease(graphene.ObjectType):
+    actor_id = graphene.ID(required=True)
+    reason = graphene.String(required=True)
+    released_at = graphene.String(required=True)
+
+
+class PaymentReview(graphene.ObjectType):
+    order_id = graphene.ID(required=True)
+    payment_id = graphene.ID(required=True)
+    user_id = graphene.ID(required=True)
+    credit_order_id = graphene.ID()
+    detected_at = graphene.String(required=True)
+    resolution = graphene.Field(PaymentReviewResolution)
+    release = graphene.Field(PaymentReviewRelease)
+
+
+class PaymentReviewPage(graphene.ObjectType):
+    items = graphene.List(graphene.NonNull(PaymentReview), required=True)
+    has_next = graphene.Boolean(required=True)
+    user_errors = graphene.List(graphene.NonNull(OrderUserError), required=True)
+
+
+class PaymentAttempt(graphene.ObjectType):
+    attempt_id = graphene.ID(required=True)
+    order_id = graphene.ID(required=True)
+    user_id = graphene.ID(required=True)
+    order_status = graphene.String(required=True)
+    preference_id = graphene.ID()
+
+
+class PaymentAttemptPage(graphene.ObjectType):
+    items = graphene.List(graphene.NonNull(PaymentAttempt), required=True)
+    has_next = graphene.Boolean(required=True)
+    user_errors = graphene.List(graphene.NonNull(OrderUserError), required=True)
+
+
+class PaymentAttemptObservation(graphene.ObjectType):
+    id = graphene.ID(required=True)
+    attempt_id = graphene.ID(required=True)
+    order_id = graphene.ID(required=True)
+    actor_id = graphene.ID(required=True)
+    preference_id = graphene.ID()
+    statement = graphene.String(required=True)
+    recorded_at = graphene.String(required=True)
+
+
+class PaymentAttemptObservationPage(graphene.ObjectType):
+    items = graphene.List(graphene.NonNull(PaymentAttemptObservation), required=True)
+    has_next = graphene.Boolean(required=True)
+    user_errors = graphene.List(graphene.NonNull(OrderUserError), required=True)
+
+
+class PaymentAttemptRelease(graphene.ObjectType):
+    attempt_id = graphene.ID(required=True)
+    order_id = graphene.ID(required=True)
+    observation_id = graphene.ID(required=True)
+    actor_id = graphene.ID(required=True)
+    preference_id = graphene.ID()
+    reason = graphene.String(required=True)
+    risk_acknowledged = graphene.Boolean(required=True)
+    released_at = graphene.String(required=True)
+
+
+class PaymentAttemptProviderResponse(graphene.ObjectType):
+    preference_id = graphene.ID(required=True)
+    recorded_at = graphene.String(required=True)
+
+
+class PaymentAttemptReleasePayload(graphene.ObjectType):
+    release = graphene.Field(PaymentAttemptRelease)
+    provider_response = graphene.Field(PaymentAttemptProviderResponse)
+    user_errors = graphene.List(graphene.NonNull(OrderUserError), required=True)
+
+
+def _payment_attempt_release(attempt_id, record, provider_response=None):
+    order_id, observation_id, actor_id, reason, preference_id, risk_acknowledged, released_at = record
+    return PaymentAttemptReleasePayload(release=PaymentAttemptRelease(
+        attempt_id=str(attempt_id), order_id=str(order_id), observation_id=str(observation_id),
+        actor_id=str(actor_id), preference_id=preference_id, reason=reason,
+        risk_acknowledged=risk_acknowledged, released_at=released_at.isoformat(),
+    ), provider_response=(PaymentAttemptProviderResponse(preference_id=provider_response[0],
+                            recorded_at=provider_response[1].isoformat()) if provider_response is not None else None),
+        user_errors=[])
+
+
 class Query(graphene.ObjectType):
     hello = graphene.String(default_value="Saleor API activa y respondiendo OK")
     me = graphene.Field(lambda: AuthUser)
@@ -404,7 +503,7 @@ class Query(graphene.ObjectType):
     products = graphene.Field(
         ProductPage,
         page=graphene.Int(default_value=1),
-        page_size=graphene.Int(default_value=20),
+        page_size=graphene.Int(default_value=50),
         search=graphene.String(),
         year_published=graphene.Int(),
         min_players=graphene.Int(),
@@ -417,6 +516,25 @@ class Query(graphene.ObjectType):
     my_wishlist = graphene.List(graphene.NonNull(Product), required=True)
     my_orders = graphene.List(graphene.NonNull(PurchaseOrder), required=True)
     my_order = graphene.Field(PurchaseOrder, id=graphene.ID(required=True))
+    my_credit = graphene.Field(
+        CreditBalancePayload, required=True,
+        description="Returns the authenticated buyer's ARS balance, or zero if no credit exists.",
+    )
+    admin_payment_reviews = graphene.Field(
+        PaymentReviewPage, required=True,
+        page=graphene.Int(default_value=1), page_size=graphene.Int(default_value=50),
+    )
+    admin_payment_attempts = graphene.Field(
+        PaymentAttemptPage, required=True,
+        page=graphene.Int(default_value=1), page_size=graphene.Int(default_value=50),
+    )
+    admin_payment_attempt_observations = graphene.Field(
+        PaymentAttemptObservationPage, required=True, attempt_id=graphene.ID(required=True),
+        page=graphene.Int(default_value=1), page_size=graphene.Int(default_value=50),
+    )
+    admin_payment_attempt_release = graphene.Field(
+        PaymentAttemptReleasePayload, required=True, attempt_id=graphene.ID(required=True),
+    )
     promotions = graphene.List(graphene.NonNull(Promotion), required=True)
     coupon_by_code = graphene.Field(Coupon, code=graphene.String(required=True))
     stock_reservations = graphene.List(graphene.NonNull(StockReservation), bgg_id=graphene.Int(), required=True)
@@ -429,6 +547,184 @@ class Query(graphene.ObjectType):
         if user is None:
             return None
         return _auth_user(user)
+
+    def resolve_my_credit(self, info):
+        try:
+            return balance_for_user(_authenticated_user(info))
+        except Exception:
+            return _error("SERVER_ERROR")
+
+    def resolve_admin_payment_attempt_release(self, info, attempt_id):
+        try:
+            user = _authenticated_user(info)
+        except Exception:
+            return PaymentAttemptReleasePayload(user_errors=[OrderUserError(code="SERVER_ERROR", message="Could not load payment attempt release.")])
+        if user is None:
+            return PaymentAttemptReleasePayload(user_errors=[OrderUserError(code="UNAUTHENTICATED", message="Authentication required.")])
+        if not (getattr(user, "is_staff", False) or getattr(user, "is_superuser", False)):
+            return PaymentAttemptReleasePayload(user_errors=[OrderUserError(code="FORBIDDEN", message="Administrator permission required.")])
+        try:
+            identifier = uuid.UUID(str(attempt_id))
+        except (ValueError, TypeError, AttributeError):
+            return PaymentAttemptReleasePayload(user_errors=[OrderUserError(code="INVALID", message="Invalid attempt identifier.")])
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT order_id, observation_id, actor_user_id, reason, preference_id, risk_acknowledged, released_at "
+                    "FROM credit_retry_attempt_release WHERE attempt_id = %s", [identifier],
+                )
+                record = cursor.fetchone()
+                provider_response = None
+                if record is not None:
+                    cursor.execute(
+                        "SELECT preference_id, recorded_at FROM credit_retry_attempt_release_response WHERE attempt_id = %s",
+                        [identifier],
+                    )
+                    provider_response = cursor.fetchone()
+            if record is None:
+                return PaymentAttemptReleasePayload(user_errors=[OrderUserError(code="NOT_FOUND", message="Payment attempt release not found.")])
+            return _payment_attempt_release(identifier, record, provider_response)
+        except Exception:
+            return PaymentAttemptReleasePayload(user_errors=[OrderUserError(code="SERVER_ERROR", message="Could not load payment attempt release.")])
+
+    def resolve_admin_payment_attempt_observations(self, info, attempt_id, page=1, page_size=50):
+        try:
+            user = _authenticated_user(info)
+        except Exception:
+            return PaymentAttemptObservationPage(items=[], has_next=False, user_errors=[
+                OrderUserError(code="SERVER_ERROR", message="Could not load payment attempt observations.")
+            ])
+        if user is None:
+            return PaymentAttemptObservationPage(items=[], has_next=False, user_errors=[
+                OrderUserError(code="UNAUTHENTICATED", message="Authentication required.")
+            ])
+        if not (getattr(user, "is_staff", False) or getattr(user, "is_superuser", False)):
+            return PaymentAttemptObservationPage(items=[], has_next=False, user_errors=[
+                OrderUserError(code="FORBIDDEN", message="Administrator permission required.")
+            ])
+        try:
+            identifier = uuid.UUID(str(attempt_id))
+            if page is None or page_size is None or not 1 <= page <= 10000 or not 1 <= page_size <= 100:
+                raise ValueError
+        except (ValueError, TypeError, AttributeError):
+            return PaymentAttemptObservationPage(items=[], has_next=False, user_errors=[
+                OrderUserError(code="INVALID", message="Invalid observation query.")
+            ])
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT id, attempt_id, order_id, actor_user_id, preference_id, statement, recorded_at "
+                    "FROM credit_retry_attempt_observation WHERE attempt_id = %s "
+                    "ORDER BY recorded_at DESC, id DESC LIMIT %s OFFSET %s",
+                    [identifier, page_size + 1, (page - 1) * page_size],
+                )
+                rows = cursor.fetchall()
+            return PaymentAttemptObservationPage(
+                items=[PaymentAttemptObservation(id=str(record_id), attempt_id=str(attempt), order_id=str(order_id),
+                       actor_id=str(actor_id), preference_id=preference_id, statement=statement,
+                       recorded_at=recorded_at.isoformat())
+                       for record_id, attempt, order_id, actor_id, preference_id, statement, recorded_at in rows[:page_size]],
+                has_next=len(rows) > page_size, user_errors=[],
+            )
+        except Exception:
+            return PaymentAttemptObservationPage(items=[], has_next=False, user_errors=[
+                OrderUserError(code="SERVER_ERROR", message="Could not load payment attempt observations.")
+            ])
+
+    def resolve_admin_payment_attempts(self, info, page=1, page_size=50):
+        try:
+            user = _authenticated_user(info)
+        except Exception:
+            return PaymentAttemptPage(items=[], has_next=False, user_errors=[
+                OrderUserError(code="SERVER_ERROR", message="Could not load payment attempts.")
+            ])
+        if user is None:
+            return PaymentAttemptPage(items=[], has_next=False, user_errors=[
+                OrderUserError(code="UNAUTHENTICATED", message="Authentication required.")
+            ])
+        if not (getattr(user, "is_staff", False) or getattr(user, "is_superuser", False)):
+            return PaymentAttemptPage(items=[], has_next=False, user_errors=[
+                OrderUserError(code="FORBIDDEN", message="Administrator permission required.")
+            ])
+        if page is None or page_size is None or not 1 <= page <= 10000 or not 1 <= page_size <= 100:
+            return PaymentAttemptPage(items=[], has_next=False, user_errors=[
+                OrderUserError(code="INVALID", message="Invalid pagination.")
+            ])
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT attempt.attempt_id, attempt.order_id, attempt.user_id, purchase.status, attempt.preference_id "
+                    "FROM credit_retry_attempt attempt JOIN purchase_order purchase "
+                    "ON purchase.id = attempt.order_id AND purchase.user_id = attempt.user_id "
+                    "ORDER BY attempt.order_id LIMIT %s OFFSET %s",
+                    [page_size + 1, (page - 1) * page_size],
+                )
+                rows = cursor.fetchall()
+            return PaymentAttemptPage(
+                  items=[PaymentAttempt(attempt_id=str(attempt_id), order_id=str(order_id), user_id=str(user_id),
+                                      order_status=status, preference_id=preference_id)
+                      for attempt_id, order_id, user_id, status, preference_id in rows[:page_size]],
+                has_next=len(rows) > page_size, user_errors=[],
+            )
+        except Exception:
+            return PaymentAttemptPage(items=[], has_next=False, user_errors=[
+                OrderUserError(code="SERVER_ERROR", message="Could not load payment attempts.")
+            ])
+
+    def resolve_admin_payment_reviews(self, info, page=1, page_size=50):
+        try:
+            user = _authenticated_user(info)
+        except Exception:
+            return PaymentReviewPage(items=[], has_next=False, user_errors=[
+                OrderUserError(code="SERVER_ERROR", message="Could not load payment reviews.")
+            ])
+        if user is None:
+            return PaymentReviewPage(items=[], has_next=False, user_errors=[
+                OrderUserError(code="UNAUTHENTICATED", message="Authentication required.")
+            ])
+        if not (getattr(user, "is_staff", False) or getattr(user, "is_superuser", False)):
+            return PaymentReviewPage(items=[], has_next=False, user_errors=[
+                OrderUserError(code="FORBIDDEN", message="Administrator permission required.")
+            ])
+        if page is None or page_size is None or not 1 <= page <= 10000 or not 1 <= page_size <= 100:
+            return PaymentReviewPage(items=[], has_next=False, user_errors=[
+                OrderUserError(code="INVALID", message="Invalid pagination.")
+            ])
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT review.order_id, review.payment_id, purchase.user_id, "
+                    "guard.credit_order_id, review.detected_at, resolution.actor_user_id, "
+                    "resolution.action, resolution.reason, resolution.resolved_at, "
+                    "release.actor_user_id, release.reason, release.released_at "
+                    "FROM credit_payment_review review "
+                    "JOIN purchase_order purchase ON purchase.id = review.order_id "
+                    "LEFT JOIN credit_retry_guard guard ON guard.order_id = review.order_id "
+                    "LEFT JOIN credit_payment_review_resolution resolution "
+                    "ON resolution.order_id = review.order_id AND resolution.payment_id = review.payment_id "
+                    "LEFT JOIN credit_payment_review_release release "
+                    "ON release.order_id = review.order_id AND release.payment_id = review.payment_id "
+                    "ORDER BY review.detected_at DESC, review.order_id DESC, review.payment_id DESC "
+                    "LIMIT %s OFFSET %s",
+                    [page_size + 1, (page - 1) * page_size],
+                )
+                rows = cursor.fetchall()
+            return PaymentReviewPage(
+                items=[PaymentReview(order_id=str(order_id), payment_id=payment_id, user_id=str(user_id),
+                                     credit_order_id=str(credit_order_id) if credit_order_id is not None else None, detected_at=detected_at.isoformat(),
+                                     resolution=(PaymentReviewResolution(actor_id=str(actor_id), action=action,
+                                                 reason=reason, resolved_at=resolved_at.isoformat())
+                                                 if actor_id is not None else None),
+                                     release=(PaymentReviewRelease(actor_id=str(release_actor_id), reason=release_reason,
+                                              released_at=released_at.isoformat()) if release_actor_id is not None else None))
+                       for order_id, payment_id, user_id, credit_order_id, detected_at, actor_id,
+                           action, reason, resolved_at, release_actor_id, release_reason, released_at in rows[:page_size]],
+                has_next=len(rows) > page_size, user_errors=[],
+            )
+        except Exception:
+            return PaymentReviewPage(items=[], has_next=False, user_errors=[
+                OrderUserError(code="SERVER_ERROR", message="Could not load payment reviews.")
+            ])
 
     def resolve_product_by_slug(self, info, slug):
         with connection.cursor() as cursor:
@@ -458,7 +754,7 @@ class Query(graphene.ObjectType):
             approved_reviews=public_reviews,
         )
 
-    def resolve_products(self, info, page=1, page_size=20, search=None,
+    def resolve_products(self, info, page=1, page_size=50, search=None,
                          year_published=None, min_players=None, max_players=None,
                          category_id=None, price_min=None, price_max=None):
         if page < 1 or page_size < 1:
@@ -994,14 +1290,8 @@ class CreateProductMutation(graphene.Mutation):
             return CreateProductPayload(product=product, userErrors=[])
         except IntegrityError:
             return CreateProductPayload(product=None, userErrors=[_auth_error("Conflict creating product", "DUPLICATE")])
-        except Exception as e:
-            # Log the full stacktrace so the root cause is visible in core container logs
-            logging.exception("Unhandled exception in CreateProductMutation: %s", e)
-            try:
-                traceback_str = traceback.format_exc()
-                logging.error("Traceback:\n%s", traceback_str)
-            except Exception:
-                pass
+        except Exception:
+            logging.error("Create product failed.")
             return CreateProductPayload(product=None, userErrors=[_auth_error("Create product failed", "SERVER_ERROR")])
 
 
@@ -1230,6 +1520,371 @@ class UpdatePromotionMutation(graphene.Mutation):
             return UpdatePromotionPayload(promotion=None, userErrors=[_auth_error("Update promotion failed", "SERVER_ERROR")])
 
 
+class IssuedGiftCard(graphene.ObjectType):
+    id = graphene.ID(required=True)
+    code = graphene.String(required=True)
+    amount = graphene.String(required=True)
+    currency = graphene.String(required=True)
+
+
+class CreateGiftCardPayload(graphene.ObjectType):
+    gift_card = graphene.Field(IssuedGiftCard)
+    user_errors = graphene.List(graphene.NonNull(UserError), required=True)
+
+
+class CreateGiftCardMutation(graphene.Mutation):
+    class Arguments:
+        amount = graphene.String(required=True)
+
+    Output = CreateGiftCardPayload
+
+    @staticmethod
+    def mutate(_root, info, amount):
+        user = _authenticated_user(info)
+        if user is None:
+            return CreateGiftCardPayload(user_errors=[_auth_error("Authentication required", "UNAUTHENTICATED")])
+        if not (getattr(user, "is_staff", False) or getattr(user, "is_superuser", False)):
+            return CreateGiftCardPayload(user_errors=[_auth_error("Administrator permission required", "FORBIDDEN")])
+        if not re.fullmatch(r"[0-9]{1,10}(?:\.[0-9]{1,2})?", amount) or Decimal(amount) <= 0:
+            return CreateGiftCardPayload(user_errors=[_auth_error("Invalid amount", "INVALID_AMOUNT", ["amount"])])
+        value = Decimal(amount).quantize(Decimal("0.01"))
+        code = secrets.token_hex(32)
+        code_hash = hashlib.sha256(code.encode("utf-8")).digest()
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "INSERT INTO gift_card (code_hash, amount, currency) VALUES (%s, %s, %s) RETURNING id",
+                    [code_hash, value, "ARS"],
+                )
+                card_id = cursor.fetchone()[0]
+        except Exception:
+            return CreateGiftCardPayload(user_errors=[_auth_error("Could not issue gift card", "SERVER_ERROR")])
+        return CreateGiftCardPayload(
+            gift_card=IssuedGiftCard(id=str(card_id), code=code, amount=str(value), currency="ARS"),
+            user_errors=[],
+        )
+
+
+class ResolvePaymentReviewPayload(graphene.ObjectType):
+    resolution = graphene.Field(PaymentReviewResolution)
+    user_errors = graphene.List(graphene.NonNull(OrderUserError), required=True)
+
+
+class ResolvePaymentReviewMutation(graphene.Mutation):
+    class Arguments:
+        order_id = graphene.ID(required=True)
+        payment_id = graphene.ID(required=True)
+        action = graphene.String(required=True)
+        reason = graphene.String(required=True)
+
+    Output = ResolvePaymentReviewPayload
+
+    @staticmethod
+    def mutate(_root, info, order_id, payment_id, action, reason):
+        try:
+            user = _authenticated_user(info)
+        except Exception:
+            return ResolvePaymentReviewPayload(user_errors=[OrderUserError(code="SERVER_ERROR", message="Could not resolve payment review.")])
+        if user is None:
+            return ResolvePaymentReviewPayload(user_errors=[OrderUserError(code="UNAUTHENTICATED", message="Authentication required.")])
+        if not (getattr(user, "is_staff", False) or getattr(user, "is_superuser", False)):
+            return ResolvePaymentReviewPayload(user_errors=[OrderUserError(code="FORBIDDEN", message="Administrator permission required.")])
+        try:
+            identifier = uuid.UUID(str(order_id))
+            action, reason = action.strip(), reason.strip()
+            if (not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", payment_id)
+                    or not action or len(action) > 200 or not action.isprintable()
+                    or not reason or len(reason) > 1000 or not reason.isprintable()):
+                raise ValueError
+        except (ValueError, TypeError, AttributeError):
+            return ResolvePaymentReviewPayload(user_errors=[OrderUserError(code="INVALID", message="Invalid review details.")])
+        try:
+            with transaction.atomic(), connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT 1 FROM credit_payment_review WHERE order_id = %s AND payment_id = %s FOR UPDATE",
+                    [identifier, payment_id],
+                )
+                if cursor.fetchone() is None:
+                    return ResolvePaymentReviewPayload(user_errors=[OrderUserError(code="NOT_FOUND", message="Payment review not found.")])
+                cursor.execute(
+                    "SELECT actor_user_id, action, reason, resolved_at FROM credit_payment_review_resolution "
+                    "WHERE order_id = %s AND payment_id = %s", [identifier, payment_id],
+                )
+                existing = cursor.fetchone()
+                if existing is not None:
+                    if existing[:3] != (user.pk, action, reason):
+                        return ResolvePaymentReviewPayload(user_errors=[OrderUserError(code="ALREADY_RESOLVED", message="Payment review is already resolved.")])
+                    resolved_at = existing[3]
+                else:
+                    cursor.execute(
+                        "INSERT INTO credit_payment_review_resolution "
+                        "(order_id, payment_id, actor_user_id, action, reason) "
+                        "VALUES (%s, %s, %s, %s, %s) RETURNING resolved_at",
+                        [identifier, payment_id, user.pk, action, reason],
+                    )
+                    resolved_at = cursor.fetchone()[0]
+            return ResolvePaymentReviewPayload(
+                resolution=PaymentReviewResolution(actor_id=str(user.pk), action=action, reason=reason,
+                                                   resolved_at=resolved_at.isoformat()), user_errors=[],
+            )
+        except Exception:
+            return ResolvePaymentReviewPayload(user_errors=[OrderUserError(code="SERVER_ERROR", message="Could not resolve payment review.")])
+
+
+class ReleasePaymentReviewPayload(graphene.ObjectType):
+    release = graphene.Field(PaymentReviewRelease)
+    user_errors = graphene.List(graphene.NonNull(OrderUserError), required=True)
+
+
+class ReleasePaymentReviewMutation(graphene.Mutation):
+    class Arguments:
+        order_id = graphene.ID(required=True)
+        payment_id = graphene.ID(required=True)
+        reason = graphene.String(required=True)
+
+    Output = ReleasePaymentReviewPayload
+
+    @staticmethod
+    def mutate(_root, info, order_id, payment_id, reason):
+        try:
+            user = _authenticated_user(info)
+        except Exception:
+            return ReleasePaymentReviewPayload(user_errors=[OrderUserError(code="SERVER_ERROR", message="Could not release payment review.")])
+        if user is None:
+            return ReleasePaymentReviewPayload(user_errors=[OrderUserError(code="UNAUTHENTICATED", message="Authentication required.")])
+        if not (getattr(user, "is_staff", False) or getattr(user, "is_superuser", False)):
+            return ReleasePaymentReviewPayload(user_errors=[OrderUserError(code="FORBIDDEN", message="Administrator permission required.")])
+        try:
+            identifier = uuid.UUID(str(order_id))
+            reason = reason.strip()
+            if (not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", payment_id)
+                    or not reason or len(reason) > 1000 or not reason.isprintable()):
+                raise ValueError
+        except (ValueError, TypeError, AttributeError):
+            return ReleasePaymentReviewPayload(user_errors=[OrderUserError(code="INVALID", message="Invalid release details.")])
+        try:
+            with transaction.atomic(), connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT purchase.user_id, EXISTS (SELECT 1 FROM credit_payment_review_resolution resolution "
+                    "WHERE resolution.order_id = review.order_id AND resolution.payment_id = review.payment_id) "
+                    "FROM purchase_order purchase JOIN credit_payment_review review ON review.order_id = purchase.id "
+                    "WHERE purchase.id = %s AND review.payment_id = %s",
+                    [identifier, payment_id],
+                )
+                owner = cursor.fetchone()
+                if owner is None:
+                    return ReleasePaymentReviewPayload(user_errors=[OrderUserError(code="NOT_FOUND", message="Payment review not found.")])
+                if not owner[1]:
+                    return ReleasePaymentReviewPayload(user_errors=[OrderUserError(code="UNRESOLVED", message="Payment review must be resolved first.")])
+                _lock_credit_account(cursor, owner[0])
+                cursor.execute("SELECT user_id FROM purchase_order WHERE id = %s FOR UPDATE", [identifier])
+                if cursor.fetchone() != (owner[0],):
+                    return ReleasePaymentReviewPayload(user_errors=[OrderUserError(code="NOT_FOUND", message="Payment review not found.")])
+                cursor.execute("SELECT 1 FROM credit_payment_review WHERE order_id = %s AND payment_id = %s FOR UPDATE", [identifier, payment_id])
+                if cursor.fetchone() is None:
+                    return ReleasePaymentReviewPayload(user_errors=[OrderUserError(code="NOT_FOUND", message="Payment review not found.")])
+                cursor.execute("SELECT actor_user_id, reason, released_at FROM credit_payment_review_release WHERE order_id = %s AND payment_id = %s", [identifier, payment_id])
+                existing = cursor.fetchone()
+                if existing is not None:
+                    if existing[:2] != (user.pk, reason):
+                        return ReleasePaymentReviewPayload(user_errors=[OrderUserError(code="ALREADY_RELEASED", message="Payment review is already released.")])
+                    released_at = existing[2]
+                else:
+                    cursor.execute("SELECT 1 FROM credit_payment_review_resolution WHERE order_id = %s AND payment_id = %s", [identifier, payment_id])
+                    if cursor.fetchone() is None:
+                        return ReleasePaymentReviewPayload(user_errors=[OrderUserError(code="UNRESOLVED", message="Payment review must be resolved first.")])
+                    cursor.execute("INSERT INTO credit_payment_review_release (order_id, payment_id, actor_user_id, reason) VALUES (%s, %s, %s, %s) RETURNING released_at", [identifier, payment_id, user.pk, reason])
+                    released_at = cursor.fetchone()[0]
+            return ReleasePaymentReviewPayload(release=PaymentReviewRelease(actor_id=str(user.pk), reason=reason, released_at=released_at.isoformat()), user_errors=[])
+        except Exception:
+            return ReleasePaymentReviewPayload(user_errors=[OrderUserError(code="SERVER_ERROR", message="Could not release payment review.")])
+
+
+class RecordPaymentAttemptObservationPayload(graphene.ObjectType):
+    observation = graphene.Field(PaymentAttemptObservation)
+    user_errors = graphene.List(graphene.NonNull(OrderUserError), required=True)
+
+
+class RecordPaymentAttemptObservationMutation(graphene.Mutation):
+    class Arguments:
+        order_id = graphene.ID(required=True)
+        attempt_id = graphene.ID(required=True)
+        request_id = graphene.ID(required=True)
+        statement = graphene.String(required=True)
+
+    Output = RecordPaymentAttemptObservationPayload
+
+    @staticmethod
+    def mutate(_root, info, order_id, attempt_id, request_id, statement):
+        try:
+            user = _authenticated_user(info)
+        except Exception:
+            return RecordPaymentAttemptObservationPayload(user_errors=[OrderUserError(code="SERVER_ERROR", message="Could not record payment attempt observation.")])
+        if user is None:
+            return RecordPaymentAttemptObservationPayload(user_errors=[OrderUserError(code="UNAUTHENTICATED", message="Authentication required.")])
+        if not (getattr(user, "is_staff", False) or getattr(user, "is_superuser", False)):
+            return RecordPaymentAttemptObservationPayload(user_errors=[OrderUserError(code="FORBIDDEN", message="Administrator permission required.")])
+        try:
+            order_identifier = uuid.UUID(str(order_id))
+            attempt_identifier = uuid.UUID(str(attempt_id))
+            request_identifier = uuid.UUID(str(request_id))
+            statement = statement.strip()
+            if not statement or len(statement) > 1000 or not statement.isprintable():
+                raise ValueError
+        except (ValueError, TypeError, AttributeError):
+            return RecordPaymentAttemptObservationPayload(user_errors=[OrderUserError(code="INVALID", message="Invalid observation details.")])
+        try:
+            with transaction.atomic(), connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT order_id, attempt_id, actor_user_id, statement, preference_id, recorded_at "
+                    "FROM credit_retry_attempt_observation WHERE id = %s", [request_identifier],
+                )
+                existing = cursor.fetchone()
+                if existing is None:
+                    cursor.execute(
+                        "SELECT purchase.user_id FROM purchase_order purchase JOIN credit_retry_attempt attempt "
+                        "ON attempt.order_id = purchase.id AND attempt.user_id = purchase.user_id "
+                        "WHERE purchase.id = %s AND attempt.attempt_id = %s",
+                        [order_identifier, attempt_identifier],
+                    )
+                    owner = cursor.fetchone()
+                    if owner is None:
+                        return RecordPaymentAttemptObservationPayload(user_errors=[OrderUserError(code="NOT_FOUND", message="Payment attempt not found.")])
+                    _lock_credit_account(cursor, owner[0])
+                    cursor.execute("SELECT user_id FROM purchase_order WHERE id = %s FOR UPDATE", [order_identifier])
+                    if cursor.fetchone() != owner:
+                        return RecordPaymentAttemptObservationPayload(user_errors=[OrderUserError(code="NOT_FOUND", message="Payment attempt not found.")])
+                    cursor.execute(
+                        "SELECT preference_id FROM credit_retry_attempt "
+                        "WHERE order_id = %s AND user_id = %s AND attempt_id = %s FOR UPDATE",
+                        [order_identifier, owner[0], attempt_identifier],
+                    )
+                    attempt = cursor.fetchone()
+                    if attempt is None:
+                        return RecordPaymentAttemptObservationPayload(user_errors=[OrderUserError(code="NOT_FOUND", message="Payment attempt not found.")])
+                    cursor.execute(
+                        "INSERT INTO credit_retry_attempt_observation "
+                        "(id, attempt_id, order_id, user_id, preference_id, actor_user_id, statement) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s) ON CONFLICT (id) DO NOTHING",
+                        [request_identifier, attempt_identifier, order_identifier, owner[0], attempt[0], user.pk, statement],
+                    )
+                    cursor.execute(
+                        "SELECT order_id, attempt_id, actor_user_id, statement, preference_id, recorded_at "
+                        "FROM credit_retry_attempt_observation WHERE id = %s", [request_identifier],
+                    )
+                    existing = cursor.fetchone()
+                if existing is None or existing[:4] != (order_identifier, attempt_identifier, user.pk, statement):
+                    return RecordPaymentAttemptObservationPayload(user_errors=[OrderUserError(code="IDEMPOTENCY_CONFLICT", message="Observation request conflicts with an existing record.")])
+                preference_id, recorded_at = existing[4], existing[5]
+            return RecordPaymentAttemptObservationPayload(
+                observation=PaymentAttemptObservation(id=str(request_identifier), attempt_id=str(attempt_identifier),
+                    order_id=str(order_identifier), actor_id=str(user.pk), preference_id=preference_id,
+                    statement=statement, recorded_at=recorded_at.isoformat()), user_errors=[],
+            )
+        except Exception:
+            return RecordPaymentAttemptObservationPayload(user_errors=[OrderUserError(code="SERVER_ERROR", message="Could not record payment attempt observation.")])
+
+
+class ReleasePaymentAttemptMutation(graphene.Mutation):
+    class Arguments:
+        order_id = graphene.ID(required=True)
+        attempt_id = graphene.ID(required=True)
+        observation_id = graphene.ID(required=True)
+        reason = graphene.String(required=True)
+        acknowledge_risk = graphene.Boolean(required=True)
+
+    Output = PaymentAttemptReleasePayload
+
+    @staticmethod
+    def mutate(_root, info, order_id, attempt_id, observation_id, reason, acknowledge_risk):
+        try:
+            user = _authenticated_user(info)
+        except Exception:
+            return PaymentAttemptReleasePayload(user_errors=[OrderUserError(code="SERVER_ERROR", message="Could not release payment attempt.")])
+        if user is None:
+            return PaymentAttemptReleasePayload(user_errors=[OrderUserError(code="UNAUTHENTICATED", message="Authentication required.")])
+        if not (getattr(user, "is_staff", False) or getattr(user, "is_superuser", False)):
+            return PaymentAttemptReleasePayload(user_errors=[OrderUserError(code="FORBIDDEN", message="Administrator permission required.")])
+        try:
+            order_identifier = uuid.UUID(str(order_id))
+            attempt_identifier = uuid.UUID(str(attempt_id))
+            observation_identifier = uuid.UUID(str(observation_id))
+            reason = reason.strip()
+            if acknowledge_risk is not True or not reason or len(reason) > 1000 or not reason.isprintable():
+                raise ValueError
+        except (ValueError, TypeError, AttributeError):
+            return PaymentAttemptReleasePayload(user_errors=[OrderUserError(code="INVALID", message="Invalid release details.")])
+        try:
+            with transaction.atomic(), connection.cursor() as cursor:
+                release_sql = (
+                    "SELECT order_id, observation_id, actor_user_id, reason, preference_id, risk_acknowledged, released_at "
+                    "FROM credit_retry_attempt_release WHERE attempt_id = %s"
+                )
+                cursor.execute(release_sql, [attempt_identifier])
+                existing = cursor.fetchone()
+                if existing is None:
+                    cursor.execute(
+                        "SELECT purchase.user_id FROM purchase_order purchase JOIN credit_retry_attempt attempt "
+                        "ON attempt.order_id = purchase.id AND attempt.user_id = purchase.user_id "
+                        "WHERE purchase.id = %s AND attempt.attempt_id = %s",
+                        [order_identifier, attempt_identifier],
+                    )
+                    owner = cursor.fetchone()
+                    if owner is None:
+                        return PaymentAttemptReleasePayload(user_errors=[OrderUserError(code="NOT_FOUND", message="Payment attempt not found.")])
+                    cursor.execute(
+                        "SELECT 1 FROM credit_retry_attempt_observation WHERE id = %s AND attempt_id = %s "
+                        "AND order_id = %s AND user_id = %s",
+                        [observation_identifier, attempt_identifier, order_identifier, owner[0]],
+                    )
+                    if cursor.fetchone() is None:
+                        return PaymentAttemptReleasePayload(user_errors=[OrderUserError(code="EVIDENCE_REQUIRED", message="An observation for this attempt is required.")])
+                    _lock_credit_account(cursor, owner[0])
+                    cursor.execute("SELECT user_id FROM purchase_order WHERE id = %s FOR UPDATE", [order_identifier])
+                    if cursor.fetchone() != owner:
+                        return PaymentAttemptReleasePayload(user_errors=[OrderUserError(code="NOT_FOUND", message="Payment attempt not found.")])
+                    cursor.execute(release_sql, [attempt_identifier])
+                    existing = cursor.fetchone()
+                    if existing is None:
+                        cursor.execute(
+                            "SELECT preference_id FROM credit_retry_attempt "
+                            "WHERE order_id = %s AND user_id = %s AND attempt_id = %s FOR UPDATE",
+                            [order_identifier, owner[0], attempt_identifier],
+                        )
+                        attempt = cursor.fetchone()
+                        if attempt is None:
+                            return PaymentAttemptReleasePayload(user_errors=[OrderUserError(code="NOT_FOUND", message="Payment attempt not found.")])
+                        cursor.execute(
+                            "SELECT preference_id FROM credit_retry_attempt_observation "
+                            "WHERE id = %s AND attempt_id = %s AND order_id = %s AND user_id = %s",
+                            [observation_identifier, attempt_identifier, order_identifier, owner[0]],
+                        )
+                        observation = cursor.fetchone()
+                        if observation is None:
+                            return PaymentAttemptReleasePayload(user_errors=[OrderUserError(code="EVIDENCE_REQUIRED", message="An observation for this attempt is required.")])
+                        if observation[0] != attempt[0]:
+                            return PaymentAttemptReleasePayload(user_errors=[OrderUserError(code="STALE_EVIDENCE", message="The payment attempt changed after the observation.")])
+                        cursor.execute(
+                            "INSERT INTO credit_retry_attempt_release "
+                            "(attempt_id, order_id, user_id, observation_id, actor_user_id, preference_id, reason, risk_acknowledged) "
+                            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING released_at",
+                            [attempt_identifier, order_identifier, owner[0], observation_identifier, user.pk, attempt[0], reason, True],
+                        )
+                        released_at = cursor.fetchone()[0]
+                        cursor.execute(
+                            "DELETE FROM credit_retry_attempt WHERE order_id = %s AND user_id = %s AND attempt_id = %s",
+                            [order_identifier, owner[0], attempt_identifier],
+                        )
+                        if cursor.rowcount != 1:
+                            raise ValueError
+                        existing = (order_identifier, observation_identifier, user.pk, reason, attempt[0], True, released_at)
+                if existing[:4] != (order_identifier, observation_identifier, user.pk, reason):
+                    return PaymentAttemptReleasePayload(user_errors=[OrderUserError(code="ALREADY_RELEASED", message="Payment attempt is already released.")])
+            return _payment_attempt_release(attempt_identifier, existing)
+        except Exception:
+            return PaymentAttemptReleasePayload(user_errors=[OrderUserError(code="SERVER_ERROR", message="Could not release payment attempt.")])
+
+
 class Mutation(graphene.ObjectType):
     register = RegisterMutation.Field(required=True)
     login = LoginMutation.Field(required=True)
@@ -1245,9 +1900,33 @@ class Mutation(graphene.ObjectType):
     adjust_variant_stock = AdjustVariantStockMutation.Field(required=True)
     create_promotion = CreatePromotionMutation.Field(required=True)
     update_promotion = UpdatePromotionMutation.Field(required=True)
+    create_gift_card = CreateGiftCardMutation.Field(required=True)
+    redeem_gift_card = RedeemGiftCardMutation.Field(
+        required=True,
+        description=(
+            "Redeems an unused gift card atomically. Successful results do not expire.\n"
+            "Recorded rejections expire after 30 days and their keys can be reused.\n"
+            "While a record exists, a different request with that key conflicts."
+        ),
+    )
+    checkout_with_credit = CheckoutWithCreditMutation.Field(
+        required=True,
+        description=(
+            "Pays the server-calculated order total atomically with account credit.\n"
+            "Insufficient credit or stock rejects the purchase without a partial debit.\n"
+            "A pending Mercado Pago order owned by the buyer blocks a new credit checkout.\n"
+            "Successful results do not expire. Recorded rejections expire after 30 days\n"
+            "and their keys can be reused. While a record exists, a different request\n"
+            "with that key conflicts."
+        ),
+    )
     checkout = CheckoutMutation.Field(required=True)
     retry_payment = RetryPaymentMutation.Field(required=True)
     confirm_payment = ConfirmPaymentMutation.Field(required=True)
+    resolve_payment_review = ResolvePaymentReviewMutation.Field(required=True)
+    release_payment_review = ReleasePaymentReviewMutation.Field(required=True)
+    record_payment_attempt_observation = RecordPaymentAttemptObservationMutation.Field(required=True)
+    release_payment_attempt = ReleasePaymentAttemptMutation.Field(required=True)
 
 
 schema = graphene.Schema(query=Query, mutation=Mutation)
