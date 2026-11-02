@@ -2,13 +2,16 @@
 
 import hashlib
 import importlib
+import json
 import os
 import re
 import secrets
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from decimal import Decimal
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.parse import unquote, urlsplit
@@ -23,7 +26,7 @@ from django.db import connections, transaction
 from psycopg2 import sql
 
 from saleor.graphql.api import schema
-from saleor.graphql import credit, orders
+from saleor.graphql import api, credit, orders
 from saleor.graphql.payments import verified_preference
 
 
@@ -55,7 +58,7 @@ CREATE TABLE shopping_cart (
     cart_id uuid PRIMARY KEY, user_id integer UNIQUE REFERENCES auth_user(id)
 );
 CREATE TABLE shopping_cart_line (
-    cart_id uuid REFERENCES shopping_cart(cart_id), bgg_id integer REFERENCES product_boardgame(bgg_id),
+    cart_id uuid REFERENCES shopping_cart(cart_id) ON DELETE CASCADE, bgg_id integer REFERENCES product_boardgame(bgg_id),
     quantity integer NOT NULL CHECK (quantity > 0), PRIMARY KEY (cart_id, bgg_id)
 );
 CREATE TABLE wishlist_entry (user_id integer REFERENCES auth_user(id), bgg_id integer REFERENCES product_boardgame(bgg_id));
@@ -169,6 +172,34 @@ def apply_migrations(db):
 @pytest.fixture
 def migrated(database):
     apply_migrations(database)
+    with database.cursor() as cursor:
+        cursor.execute(
+            "CREATE TABLE promotion (id integer PRIMARY KEY, name varchar(250) NOT NULL, "
+            "product_bgg_id integer, stackable boolean NOT NULL DEFAULT false, "
+            "discount_pct numeric(5, 2) NOT NULL, active boolean NOT NULL, "
+            "starts_at timestamptz, ends_at timestamptz)"
+        )
+        cursor.execute(
+            "CREATE TABLE coupon (id integer PRIMARY KEY, code varchar(64) NOT NULL UNIQUE, "
+            "promotion_id integer NOT NULL REFERENCES promotion(id), remaining bigint NOT NULL, "
+            "active boolean NOT NULL, starts_at timestamptz, ends_at timestamptz)"
+        )
+        cursor.execute(
+            "CREATE TABLE coupon_checkout_reservation (order_id uuid PRIMARY KEY "
+            "REFERENCES purchase_order(id) ON DELETE RESTRICT, coupon_id integer NOT NULL "
+            "REFERENCES coupon(id) ON DELETE RESTRICT, operation_key_hash char(64) NOT NULL UNIQUE, "
+            "request_hash char(64) NOT NULL, state varchar(16) NOT NULL CHECK "
+            "(state IN ('RESERVED', 'CONSUMED', 'RELEASED', 'NOT_APPLIED', 'REVIEW')), "
+            "init_point text, created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+            "updated_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+        )
+        cursor.execute(
+            "CREATE TABLE catalog_event_outbox (event_id uuid PRIMARY KEY, "
+            "event_type varchar(32) NOT NULL, occurred_at timestamptz NOT NULL, "
+            "aggregate_type varchar(32) NOT NULL, aggregate_id varchar(128) NOT NULL, "
+            "attempts integer NOT NULL DEFAULT 0, next_attempt_at timestamptz NOT NULL, "
+            "delivered_at timestamptz)"
+        )
     return database
 
 
@@ -190,6 +221,26 @@ def concurrent(*operations):
                     backend = cursor.fetchone()[0]
                 barrier.wait()
                 return backend, operation()
+        finally:
+            connections.close_all()
+
+    with ThreadPoolExecutor(max_workers=len(operations)) as pool:
+        futures = [pool.submit(run, operation) for operation in operations]
+        results = [future.result(timeout=20) for future in futures]
+    assert len({backend for backend, _ in results}) == len(operations)
+    return [result for _, result in results]
+
+
+def concurrent_independent(*operations):
+    barrier = threading.Barrier(len(operations), timeout=10)
+
+    def run(operation):
+        try:
+            barrier.wait()
+            with connections["default"].cursor() as cursor:
+                cursor.execute("SELECT pg_backend_pid()")
+                backend = cursor.fetchone()[0]
+            return backend, operation()
         finally:
             connections.close_all()
 
@@ -228,6 +279,47 @@ def seed_cart(db, user_id, balance, quantity=1):
         cart = str(uuid.uuid4())
         cursor.execute("INSERT INTO shopping_cart (cart_id, user_id) VALUES (%s, %s)", [cart, user_id])
         cursor.execute("INSERT INTO shopping_cart_line VALUES (%s, 7, %s)", [cart, quantity])
+
+
+def test_guest_cart_merge_and_simulated_purchase_preserve_other_wishlist_entries(migrated):
+    seed_cart(migrated, 1, 25)
+    guest_cart = uuid.uuid4()
+    with migrated.cursor() as cursor:
+        cursor.execute("INSERT INTO product_boardgame VALUES (8, 'Other game', 9.50, 4)")
+        cursor.execute("INSERT INTO shopping_cart (cart_id) VALUES (%s)", [guest_cart])
+        cursor.execute("INSERT INTO shopping_cart_line VALUES (%s, 7, 1)", [guest_cart])
+        cursor.execute("INSERT INTO wishlist_entry VALUES (1, 7), (1, 8), (2, 7)")
+
+    user = SimpleNamespace(pk=1)
+    info = SimpleNamespace(context=SimpleNamespace(user=user))
+    api._merge_guest_cart(str(guest_cart), user)
+    assert scalar(migrated, "SELECT count(*) FROM shopping_cart WHERE cart_id = %s", [guest_cart]) == 0
+    assert scalar(migrated, "SELECT quantity FROM shopping_cart_line WHERE cart_id = (SELECT cart_id FROM shopping_cart WHERE user_id = 1) AND bgg_id = 7") == 2
+    assert scalar(migrated, "SELECT count(*) FROM wishlist_entry") == 3
+
+    with patch.object(orders.payments, "configuration_error", return_value=None), \
+            patch.object(orders.payments, "currency_id", return_value="ARS"), \
+            patch.object(orders, "_preference", return_value=("synthetic-preference", "https://example.test/pay")):
+        pending = orders.checkout(info, "pickup")
+    assert pending.user_errors == []
+    assert pending.order.status == "pending_payment"
+    assert scalar(migrated, "SELECT count(*) FROM wishlist_entry") == 3
+
+    payment = {"status": 200, "response": {
+        "id": "synthetic-payment", "live_mode": False,
+        "external_reference": str(pending.order.id), "transaction_amount": 25,
+        "currency_id": "ARS", "status": "approved", "status_detail": "accredited",
+    }}
+    with patch.object(orders.payments, "fetch_payment", return_value=payment), \
+            patch.object(orders.payments, "verified_preference", return_value="synthetic-preference"):
+        paid = orders.confirm_payment(info, str(pending.order.id), "synthetic-payment")
+    assert paid.user_errors == []
+    assert paid.order.status == "paid"
+    assert scalar(migrated, "SELECT quantity FROM product_boardgame WHERE bgg_id = 7") == 3
+    assert scalar(migrated, "SELECT count(*) FROM invoice WHERE order_id = %s", [str(pending.order.id)]) == 1
+    assert scalar(migrated, "SELECT count(*) FROM shopping_cart_line WHERE cart_id = (SELECT cart_id FROM shopping_cart WHERE user_id = 1)") == 0
+    assert scalar(migrated, "SELECT count(*) FROM wishlist_entry WHERE user_id = 1 AND bgg_id = 7") == 0
+    assert scalar(migrated, "SELECT count(*) FROM wishlist_entry WHERE (user_id = 1 AND bgg_id = 8) OR (user_id = 2 AND bgg_id = 7)") == 2
 
 
 @pytest.mark.parametrize("operation", ["REDEEM", "CHECKOUT"])
@@ -767,6 +859,65 @@ def seed_rejected(db, user_id=1):
             [order_id],
         )
     return order_id
+
+
+@pytest.mark.parametrize(
+    ("provider_status", "initial_stock", "expected_status", "expected_stock", "expected_invoice", "expected_cart"),
+    [
+        ("rejected", 5, "rejected", 5, 0, 1),
+        ("pending", 5, "pending_payment", 5, 0, 1),
+        ("approved", 0, "paid_stock_conflict", 0, 0, 1),
+        ("approved", 5, "paid", 4, 1, 0),
+    ],
+)
+def test_repeated_simulated_confirmation_preserves_order_effects(
+        migrated, provider_status, initial_stock, expected_status,
+        expected_stock, expected_invoice, expected_cart):
+    seed_cart(migrated, 1, 25)
+    order_id = seed_rejected(migrated)
+    with migrated.cursor() as cursor:
+        cursor.execute("UPDATE purchase_order SET status = 'pending_payment', mp_preference_id = 'synthetic-preference' WHERE id = %s", [order_id])
+        cursor.execute("UPDATE product_boardgame SET quantity = %s WHERE bgg_id = 7", [initial_stock])
+        cursor.execute("INSERT INTO wishlist_entry VALUES (1, 7), (2, 7)")
+    payment = {"status": 200, "response": {
+        "id": "synthetic-payment", "live_mode": False, "external_reference": order_id,
+        "transaction_amount": 12.50, "currency_id": "ARS", "status": provider_status,
+        "status_detail": "synthetic",
+    }}
+    info = SimpleNamespace(context=SimpleNamespace(user=SimpleNamespace(pk=1)))
+    with patch.object(orders.payments, "fetch_payment", return_value=payment), \
+            patch.object(orders.payments, "verified_preference", return_value="synthetic-preference"):
+        first = orders.confirm_payment(info, order_id, "synthetic-payment")
+        repeated = orders.confirm_payment(info, order_id, "synthetic-payment")
+    assert first.user_errors == repeated.user_errors == []
+    assert first.order.status == repeated.order.status == expected_status
+    assert scalar(migrated, "SELECT quantity FROM product_boardgame WHERE bgg_id = 7") == expected_stock
+    assert scalar(migrated, "SELECT count(*) FROM invoice WHERE order_id = %s", [order_id]) == expected_invoice
+    assert scalar(migrated, "SELECT count(*) FROM shopping_cart_line WHERE cart_id = (SELECT cart_id FROM shopping_cart WHERE user_id = 1)") == expected_cart
+    assert scalar(migrated, "SELECT count(*) FROM wishlist_entry WHERE user_id = 1 AND bgg_id = 7") == expected_cart
+    assert scalar(migrated, "SELECT count(*) FROM wishlist_entry WHERE user_id = 2 AND bgg_id = 7") == 1
+
+
+@pytest.mark.xfail(strict=True, reason="A second approved payment for the same preference is not flagged for review")
+def test_second_approved_payment_for_same_preference_requires_review(migrated):
+    seed_cart(migrated, 1, 25)
+    order_id = seed_rejected(migrated)
+    with migrated.cursor() as cursor:
+        cursor.execute("UPDATE purchase_order SET status = 'pending_payment', mp_preference_id = 'synthetic-preference' WHERE id = %s", [order_id])
+    payment = {"status": 200, "response": {
+        "live_mode": False, "external_reference": order_id, "transaction_amount": 12.50,
+        "currency_id": "ARS", "status": "approved", "status_detail": "accredited",
+    }}
+    info = SimpleNamespace(context=SimpleNamespace(user=SimpleNamespace(pk=1)))
+    with patch.object(orders.payments, "fetch_payment", side_effect=lambda payment_id: confirmed_payment_response(payment, payment_id)), \
+            patch.object(orders.payments, "verified_preference", return_value="synthetic-preference"):
+        first = orders.confirm_payment(info, order_id, "first-payment")
+        second = orders.confirm_payment(info, order_id, "second-payment")
+    assert first.user_errors == []
+    assert first.order.status == "paid"
+    assert scalar(migrated, "SELECT quantity FROM product_boardgame WHERE bgg_id = 7") == 4
+    assert scalar(migrated, "SELECT count(*) FROM invoice WHERE order_id = %s", [order_id]) == 1
+    assert [error.code for error in second.user_errors] == ["PAYMENT_REQUIRES_REVIEW"]
 
 
 def test_admin_releases_observed_attempt_with_audit_without_financial_changes(migrated):
@@ -2518,3 +2669,965 @@ def test_invoice_failure_rolls_back_all_changes(migrated):
     with migrated.cursor() as cursor:
         cursor.execute("ALTER TABLE invoice DROP CONSTRAINT reject_invoice")
     assert checkout(1, key)["userErrors"] == []
+
+
+PROMOTION_DDL = """
+CREATE TABLE promotion (
+    id SERIAL PRIMARY KEY, name varchar(250) NOT NULL,
+    stackable boolean NOT NULL DEFAULT false, discount_pct numeric(5, 2) NOT NULL DEFAULT 0,
+    starts_at timestamptz, ends_at timestamptz,
+    created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP
+)
+"""
+
+
+def test_migration_chain_preserves_existing_promotions_and_coupons(database):
+    from django.db.migrations.executor import MigrationExecutor
+    from django.db.migrations.recorder import MigrationRecorder
+
+    with database.cursor() as cursor:
+        cursor.execute(GIFT_DDL)
+        cursor.execute(PROMOTION_DDL)
+        cursor.execute("CREATE TABLE coupon (id SERIAL PRIMARY KEY, code varchar(64) NOT NULL UNIQUE, promotion_id integer REFERENCES promotion(id), remaining bigint NOT NULL, created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+        cursor.execute("CREATE TABLE coupon_counter (coupon_id integer PRIMARY KEY REFERENCES coupon(id) ON DELETE CASCADE, counter bigint NOT NULL DEFAULT 0)")
+        cursor.execute("CREATE TABLE audit_log (id BIGSERIAL PRIMARY KEY, actor varchar(150), action varchar(100) NOT NULL, target_table varchar(150), target_id varchar(64), diff jsonb, created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+        cursor.execute("CREATE TABLE stock_reservation (id BIGSERIAL PRIMARY KEY, bgg_id integer NOT NULL REFERENCES product_boardgame(bgg_id), reserved_qty integer NOT NULL CHECK (reserved_qty >= 0), reason varchar(250), expires_at timestamptz, created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+        cursor.execute("INSERT INTO promotion (name, discount_pct) VALUES ('Legacy promotion', 25)")
+        cursor.execute("INSERT INTO coupon (code, promotion_id, remaining) SELECT 'LEGACY', id, 3 FROM promotion")
+        cursor.execute("INSERT INTO stock_reservation (bgg_id, reserved_qty) VALUES (7, 2)")
+    recorder = MigrationRecorder(database)
+    recorder.record_applied("contenttypes", "0001_initial")
+    recorder.record_applied("auth", "0001_initial")
+    recorder.record_applied("promotions", "0001_initial")
+    target = [("promotions", "0003_stock_reservation_constraints")]
+    MigrationExecutor(database).migrate(target)
+    assert MigrationExecutor(database).migration_plan(target) == []
+    assert all(migration in recorder.applied_migrations() for migration in (
+        ("graphql", "0017_007_contract_data_dependencies"),
+        ("promotions", "0002_007_state_sync"),
+        ("promotions", "0003_stock_reservation_constraints"),
+    ))
+    with database.cursor() as cursor:
+        cursor.execute("SELECT p.name, p.discount_pct, p.active, c.code, c.remaining, c.active, c.starts_at, c.ends_at FROM promotion p JOIN coupon c ON c.promotion_id = p.id")
+        assert cursor.fetchone() == ("Legacy promotion", Decimal("25"), False, "LEGACY", 3, False, None, None)
+    assert scalar(database, "SELECT quantity FROM product_boardgame WHERE bgg_id = 7") == 5
+    assert scalar(database, "SELECT count(*) FROM purchase_order") == 1
+    assert scalar(database, "SELECT reserved_qty FROM stock_reservation WHERE bgg_id = 7") == 2
+    assert scalar(database, "SELECT count(*) FROM pg_constraint WHERE conrelid = 'stock_reservation'::regclass AND conname IN ('stock_reservation_bgg_id_fkey', 'stock_reservation_reserved_qty_check')") == 2
+
+
+def test_fresh_migration_chain_adds_stock_reservation_constraints(database):
+    from django.db import IntegrityError
+    from django.db.migrations.executor import MigrationExecutor
+    from django.db.migrations.recorder import MigrationRecorder
+
+    with database.cursor() as cursor:
+        cursor.execute(GIFT_DDL)
+    recorder = MigrationRecorder(database)
+    recorder.record_applied("contenttypes", "0001_initial")
+    recorder.record_applied("auth", "0001_initial")
+    target = [("promotions", "0003_stock_reservation_constraints")]
+    MigrationExecutor(database).migrate(target)
+    assert MigrationExecutor(database).migration_plan(target) == []
+    assert ("promotions", "0003_stock_reservation_constraints") in recorder.applied_migrations()
+    assert scalar(database, "SELECT count(*) FROM pg_constraint WHERE conrelid = 'stock_reservation'::regclass AND conname IN ('stock_reservation_bgg_id_fkey', 'stock_reservation_reserved_qty_check')") == 2
+    with pytest.raises(IntegrityError), transaction.atomic(), database.cursor() as cursor:
+        cursor.execute("INSERT INTO stock_reservation (bgg_id, reserved_qty, created_at) VALUES (7, -1, CURRENT_TIMESTAMP)")
+    with pytest.raises(IntegrityError), transaction.atomic(), database.cursor() as cursor:
+        cursor.execute("INSERT INTO stock_reservation (bgg_id, reserved_qty, created_at) VALUES (999, 1, CURRENT_TIMESTAMP)")
+
+
+def test_coupon_constraint_migration_preserves_invalid_legacy_data(database):
+    from django.db import IntegrityError
+    from django.db.migrations.executor import MigrationExecutor
+    from django.db.migrations.recorder import MigrationRecorder
+
+    with database.cursor() as cursor:
+        cursor.execute(GIFT_DDL)
+        cursor.execute(PROMOTION_DDL)
+        cursor.execute("CREATE TABLE coupon (id SERIAL PRIMARY KEY, code varchar(64) NOT NULL UNIQUE, remaining bigint NOT NULL, created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+        cursor.execute("INSERT INTO coupon (code, remaining) VALUES ('INVALID_LEGACY', -1)")
+    recorder = MigrationRecorder(database)
+    recorder.record_applied("contenttypes", "0001_initial")
+    recorder.record_applied("auth", "0001_initial")
+    MigrationExecutor(database).migrate([("graphql", "0015_coupon_availability")])
+    with pytest.raises(IntegrityError):
+        MigrationExecutor(database).migrate([("graphql", "0016_coupon_constraints")])
+    assert ("graphql", "0016_coupon_constraints") not in recorder.applied_migrations()
+    assert scalar(database, "SELECT remaining FROM coupon WHERE code = 'INVALID_LEGACY'") == -1
+    assert scalar(database, "SELECT count(*) FROM pg_constraint WHERE conrelid = 'coupon'::regclass AND conname IN ('coupon_remaining_nonnegative', 'coupon_valid_period')") == 0
+
+
+def test_promotion_activation_migration_preserves_existing_rows_as_inactive(database):
+    from django.db import IntegrityError
+
+    with database.cursor() as cursor:
+        cursor.execute(PROMOTION_DDL)
+        cursor.execute("INSERT INTO promotion (name, discount_pct, starts_at, ends_at) VALUES (%s, %s, %s, %s)", ["Existing sale", "25.00", "2020-01-01T00:00:00Z", "2030-01-01T00:00:00Z"])
+        for statement in migration_sql("0014_promotion_manual_activation"):
+            cursor.execute(statement)
+        cursor.execute("SELECT name, discount_pct, starts_at = %s::timestamptz, ends_at = %s::timestamptz, active FROM promotion", ["2020-01-01T00:00:00Z", "2030-01-01T00:00:00Z"])
+        row = cursor.fetchone()
+        assert row[0] == "Existing sale"
+        assert row[1] == Decimal("25.00")
+        assert row[2] is True
+        assert row[3] is True
+        assert row[4] is False
+        cursor.execute("INSERT INTO promotion (name) VALUES (%s) RETURNING active", ["Default"])
+        assert cursor.fetchone()[0] is False
+        cursor.execute("INSERT INTO promotion (name, active) VALUES (%s, %s) RETURNING active", ["Enabled", True])
+        assert cursor.fetchone()[0] is True
+    with pytest.raises(IntegrityError), transaction.atomic(), database.cursor() as cursor:
+        cursor.execute("INSERT INTO promotion (name, active) VALUES (%s, NULL)", ["Invalid"])
+
+
+@pytest.fixture
+def promotion_activation_database(database):
+    with database.cursor() as cursor:
+        cursor.execute(PROMOTION_DDL)
+        cursor.execute("INSERT INTO promotion (name, discount_pct) VALUES (%s, %s)", ["Legacy sale", "15.00"])
+        for statement in migration_sql("0014_promotion_manual_activation"):
+            cursor.execute(statement)
+    return database
+
+
+@pytest.mark.parametrize("active", [True, False])
+def test_promotion_activation_is_persisted_and_returned(promotion_activation_database, active):
+    user = SimpleNamespace(pk=1, is_active=True, is_staff=True, is_superuser=False)
+    context = SimpleNamespace(user=user)
+    create = "mutation ($input: CreatePromotionInput!) { createPromotion(input: $input) { promotion { id name active discountPct } userErrors { code } } }"
+    update = "mutation ($id: ID!, $input: UpdatePromotionInput!) { updatePromotion(id: $id, input: $input) { promotion { id name active discountPct } userErrors { code } } }"
+    created = schema.execute(create, variable_values={"input": {"name": "Sale", "discountPercent": 20, "active": active}}, context_value=context)
+    assert created.errors is None
+    promotion = created.data["createPromotion"]["promotion"]
+    assert created.data["createPromotion"]["userErrors"] == []
+    assert promotion["active"] is active
+    assert promotion["discountPct"] == 20
+    assert scalar(promotion_activation_database, "SELECT active FROM promotion WHERE id = %s", [promotion["id"]]) is active
+
+    updated = schema.execute(update, variable_values={"id": promotion["id"], "input": {"active": not active}}, context_value=context)
+    assert updated.errors is None
+    updated_promotion = updated.data["updatePromotion"]["promotion"]
+    assert updated.data["updatePromotion"]["userErrors"] == []
+    assert updated_promotion == {**promotion, "active": not active}
+    listing = schema.execute("{ promotions { id name active discountPct } }")
+    assert listing.errors is None
+    by_name = {entry["name"]: entry for entry in listing.data["promotions"]}
+    assert by_name["Legacy sale"]["active"] is False
+    assert by_name["Sale"] == updated_promotion
+
+
+def test_coupon_query_returns_promotion_activation(promotion_activation_database):
+    with promotion_activation_database.cursor() as cursor:
+        cursor.execute("CREATE TABLE coupon (id SERIAL PRIMARY KEY, code varchar(64) NOT NULL UNIQUE, promotion_id integer REFERENCES promotion(id), remaining bigint NOT NULL, created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+        cursor.execute("INSERT INTO coupon (code, promotion_id, remaining) SELECT %s, id, 1 FROM promotion WHERE name = %s", ["SYNTHETIC", "Legacy sale"])
+    result = schema.execute('{ couponByCode(code: "SYNTHETIC") { promotion { name active } } }')
+    assert result.errors is None
+    assert result.data["couponByCode"]["promotion"] == {"name": "Legacy sale", "active": False}
+
+
+def test_available_coupons_migration_and_public_query(database):
+    with database.cursor() as cursor:
+        cursor.execute("CREATE TABLE coupon (id SERIAL PRIMARY KEY, code varchar(64) NOT NULL UNIQUE, promotion_id integer, remaining bigint NOT NULL, created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+        cursor.execute("INSERT INTO coupon (code, remaining) VALUES ('LEGACY', 3)")
+        for statement in migration_sql("0015_coupon_availability"):
+            cursor.execute(statement)
+        cursor.execute("SELECT active, starts_at, ends_at, remaining FROM coupon WHERE code = 'LEGACY'")
+        assert cursor.fetchone() == (False, None, None, 3)
+        cursor.execute("""
+            INSERT INTO coupon (code, remaining, active, starts_at, ends_at) VALUES
+            ('AVAILABLE', 2, true, CURRENT_TIMESTAMP - INTERVAL '1 day', CURRENT_TIMESTAMP + INTERVAL '1 day'),
+            ('INACTIVE', 2, false, CURRENT_TIMESTAMP - INTERVAL '1 day', CURRENT_TIMESTAMP + INTERVAL '1 day'),
+            ('EXPIRED', 2, true, CURRENT_TIMESTAMP - INTERVAL '2 days', CURRENT_TIMESTAMP - INTERVAL '1 day'),
+            ('FUTURE', 2, true, CURRENT_TIMESTAMP + INTERVAL '1 day', CURRENT_TIMESTAMP + INTERVAL '2 days'),
+            ('EXHAUSTED', 0, true, CURRENT_TIMESTAMP - INTERVAL '1 day', CURRENT_TIMESTAMP + INTERVAL '1 day'),
+            ('NO_DATES', 2, true, NULL, NULL)
+        """)
+    result = schema.execute("{ availableCoupons { code startsAt endsAt } }")
+    assert result.errors is None
+    assert [coupon["code"] for coupon in result.data["availableCoupons"]] == ["AVAILABLE"]
+    assert datetime.fromisoformat(result.data["availableCoupons"][0]["startsAt"]).utcoffset() is not None
+    assert datetime.fromisoformat(result.data["availableCoupons"][0]["endsAt"]).utcoffset() is not None
+    assert scalar(database, "SELECT remaining FROM coupon WHERE code = 'AVAILABLE'") == 2
+
+
+def test_coupon_constraints_reject_negative_uses_and_inverted_dates(database):
+    from django.db import IntegrityError
+
+    with database.cursor() as cursor:
+        cursor.execute("CREATE TABLE coupon (id SERIAL PRIMARY KEY, code varchar(64) NOT NULL UNIQUE, remaining bigint NOT NULL, active boolean NOT NULL DEFAULT false, starts_at timestamptz, ends_at timestamptz)")
+        for statement in migration_sql("0016_coupon_constraints"):
+            cursor.execute(statement)
+        cursor.execute("INSERT INTO coupon (code, remaining) VALUES ('UNCONFIGURED', 0)")
+    for values in [
+        ("NEGATIVE", -1, None, None),
+        ("REVERSED", 1, "2030-01-02T00:00:00Z", "2030-01-01T00:00:00Z"),
+        ("EQUAL", 1, "2030-01-01T00:00:00Z", "2030-01-01T00:00:00Z"),
+    ]:
+        with pytest.raises(IntegrityError), transaction.atomic(using=database.alias), database.cursor() as cursor:
+            cursor.execute("INSERT INTO coupon (code, remaining, starts_at, ends_at) VALUES (%s, %s, %s, %s)", values)
+    assert scalar(database, "SELECT count(*) FROM coupon") == 1
+
+
+@pytest.mark.parametrize(
+    (
+        "coupon_remaining", "coupon_active", "coupon_ends_at", "expected_error",
+        "expected_order_status", "expected_reservation", "expected_remaining",
+    ),
+    [
+        (0, True, None, "PAYMENT_REQUIRES_REVIEW", "rejected", "RELEASED", 0),
+        (1, False, None, "PAYMENT_REQUIRES_REVIEW", "rejected", "RELEASED", 1),
+        (1, True, "2000-01-01T00:00:00Z", "PAYMENT_REQUIRES_REVIEW", "rejected", "RELEASED", 1),
+        (1, True, None, None, "paid", "CONSUMED", 0),
+    ],
+)
+def test_late_approved_payment_reacquires_released_coupon_use(
+    migrated, coupon_remaining, coupon_active, coupon_ends_at, expected_error,
+    expected_order_status, expected_reservation, expected_remaining
+):
+    seed_cart(migrated, 1, 25)
+    order_id = str(uuid.uuid4())
+    with migrated.cursor() as cursor:
+        cursor.execute(
+            "INSERT INTO promotion (id, name, discount_pct, active) "
+            "VALUES (1, 'Late approval', 10, true)"
+        )
+        cursor.execute(
+            "INSERT INTO coupon VALUES (1, 'LATE-APPROVAL', 1, %s, %s, NULL, %s)",
+            [coupon_remaining, coupon_active, coupon_ends_at],
+        )
+        cursor.execute(
+            "INSERT INTO purchase_order "
+            "(id, user_id, status, total, currency, shipping_mode, mp_preference_id) "
+            "VALUES (%s, 1, 'rejected', 12.50, 'ARS', 'pickup', 'new-preference')",
+            [order_id],
+        )
+        cursor.execute(
+            "INSERT INTO purchase_order_line VALUES "
+            "(%s, 7, 'Existing game', 12.50, 1, 12.50)",
+            [order_id],
+        )
+        cursor.execute(
+            "INSERT INTO coupon_checkout_reservation "
+            "(order_id, coupon_id, operation_key_hash, request_hash, state, init_point) "
+            "VALUES (%s, 1, %s, %s, 'RELEASED', 'https://example.test/pay')",
+            [order_id, "a" * 64, "b" * 64],
+        )
+    info = SimpleNamespace(context=SimpleNamespace(user=SimpleNamespace(pk=1)))
+    payment = {"status": 200, "response": {
+        "id": "late-approved-payment", "live_mode": False,
+        "external_reference": order_id, "transaction_amount": "12.50",
+        "currency_id": "ARS", "status": "approved", "status_detail": "accredited",
+    }}
+
+    with patch.object(orders.payments, "fetch_payment", return_value=payment):
+        result = orders.confirm_payment(info, order_id, "late-approved-payment")
+
+    if expected_error:
+        assert result.user_errors[0].code == expected_error
+        assert scalar(migrated, "SELECT quantity FROM product_boardgame WHERE bgg_id = 7") == 5
+        assert scalar(migrated, "SELECT count(*) FROM invoice WHERE order_id = %s", [order_id]) == 0
+        assert scalar(
+            migrated,
+            "SELECT count(*) FROM credit_payment_review WHERE order_id = %s AND payment_id = %s",
+            [order_id, "late-approved-payment"],
+        ) == 1
+        with migrated.cursor() as cursor:
+            cursor.execute(
+                "SELECT mp_payment_id, payment_status, paid_at "
+                "FROM purchase_order WHERE id = %s",
+                [order_id],
+            )
+            assert cursor.fetchone() == (None, None, None)
+    else:
+        assert result.user_errors == []
+        assert scalar(migrated, "SELECT quantity FROM product_boardgame WHERE bgg_id = 7") == 4
+        assert scalar(migrated, "SELECT count(*) FROM invoice WHERE order_id = %s", [order_id]) == 1
+        assert scalar(
+            migrated,
+            "SELECT mp_payment_id = %s AND payment_status = %s AND paid_at IS NOT NULL "
+            "FROM purchase_order WHERE id = %s",
+            ["late-approved-payment", "approved", order_id],
+        ) is True
+        assert result.order.paid_at is not None
+    assert scalar(migrated, "SELECT remaining FROM coupon WHERE id = 1") == expected_remaining
+    assert scalar(
+        migrated, "SELECT state FROM coupon_checkout_reservation WHERE order_id = %s", [order_id]
+    ) == expected_reservation
+    assert scalar(migrated, "SELECT status FROM purchase_order WHERE id = %s", [order_id]) == expected_order_status
+
+
+def seed_coupon(db, remaining=1):
+    with db.cursor() as cursor:
+        cursor.execute(
+            "INSERT INTO promotion (id, name, discount_pct, active) "
+            "VALUES (1, 'Coupon promotion', 10, true)"
+        )
+        cursor.execute(
+            "INSERT INTO coupon VALUES (1, 'CONCURRENT-COUPON', 1, %s, true, NULL, NULL)",
+            [remaining],
+        )
+
+
+def test_checkout_store_promotions_select_specific_and_highest_global_but_exclude_coupon_rows(migrated):
+    with migrated.cursor() as cursor:
+        cursor.execute(
+            "INSERT INTO promotion "
+            "(id, name, product_bgg_id, discount_pct, active) VALUES "
+            "(10, 'Global 20', NULL, 20, true), "
+            "(11, 'Global 35', NULL, 35, true), "
+            "(12, 'Specific 10', 7, 10, true), "
+            "(13, 'Coupon global 50', NULL, 50, true), "
+            "(14, 'Coupon specific 50', 7, 50, true)"
+        )
+        cursor.execute(
+            "INSERT INTO coupon (id, code, promotion_id, remaining, active) VALUES "
+            "(10, 'GLOBAL-COUPON', 13, 1, true), "
+            "(11, 'SPECIFIC-COUPON', 14, 1, true)"
+        )
+        selected = orders._promotion_rows(
+            cursor, [7], datetime(2026, 1, 1, tzinfo=timezone.utc)
+        )
+
+    assert set(selected) == {
+        (None, Decimal("20.00")),
+        (None, Decimal("35.00")),
+        (7, Decimal("10.00")),
+    }
+
+
+def test_checkout_total_uses_specific_and_highest_global_store_promotions(migrated):
+    seed_cart(migrated, 1, 25)
+    with migrated.cursor() as cursor:
+        cursor.execute("INSERT INTO product_boardgame VALUES (8, 'Second game', 20.00, 5)")
+        cart_id = scalar(
+            migrated, "SELECT cart_id FROM shopping_cart WHERE user_id = 1"
+        )
+        cursor.execute(
+            "INSERT INTO shopping_cart_line VALUES (%s, 8, 1)",
+            [cart_id],
+        )
+        cursor.execute(
+            "INSERT INTO promotion "
+            "(id, name, product_bgg_id, discount_pct, active) VALUES "
+            "(10, 'Global 20', NULL, 20, true), "
+            "(11, 'Global 35', NULL, 35, true), "
+            "(12, 'Specific 10', 7, 10, true), "
+            "(14, 'Coupon global 50', NULL, 50, true), "
+            "(15, 'Coupon specific 50', 7, 50, true)"
+        )
+        cursor.execute(
+            "INSERT INTO coupon (id, code, promotion_id, remaining, active) VALUES "
+            "(10, 'GLOBAL-COUPON', 14, 1, true), "
+            "(11, 'SPECIFIC-COUPON', 15, 1, true)"
+        )
+
+    info = SimpleNamespace(context=SimpleNamespace(user=SimpleNamespace(pk=1)))
+    with patch.object(orders.payments, "configuration_error", return_value=None), \
+            patch.object(orders.payments, "currency_id", return_value="ARS"), \
+            patch.object(
+                orders,
+                "_preference",
+                return_value=("synthetic-preference", "https://example.test/pay"),
+            ) as preference:
+        result = orders.checkout(info, "pickup")
+
+    assert result.user_errors == []
+    assert scalar(
+        migrated,
+        "SELECT total FROM purchase_order WHERE id = %s",
+        [result.order.id],
+    ) == Decimal("23.50")
+    payment_lines = preference.call_args.args[1]
+    assert sum(
+        Decimal(str(line["unit_price"])) * line["quantity"]
+        for line in payment_lines
+    ) == Decimal("23.50")
+
+
+def coupon_checkout(user_id, checkout_key, code="CONCURRENT-COUPON"):
+    info = SimpleNamespace(context=SimpleNamespace(user=SimpleNamespace(pk=user_id)))
+    return orders.checkout(
+        info, "pickup", coupon_code=code, checkout_key=str(checkout_key)
+    )
+
+
+def test_parallel_coupon_checkouts_reserve_the_last_use_once(migrated):
+    seed_cart(migrated, 1, 0)
+    seed_cart(migrated, 2, 0)
+    seed_coupon(migrated)
+    with patch.object(orders.payments, "configuration_error", return_value=None), \
+            patch.object(orders.payments, "currency_id", return_value="ARS"), \
+            patch.object(
+                orders,
+                "_preference",
+                side_effect=lambda order_id, _lines: (
+                    str(order_id), f"https://example.invalid/{order_id}"
+                ),
+            ):
+        results = concurrent_independent(
+            lambda: coupon_checkout(1, uuid.uuid4()),
+            lambda: coupon_checkout(2, uuid.uuid4()),
+        )
+
+    assert sorted(result.user_errors[0].code if result.user_errors else "OK" for result in results) == [
+        "EXHAUSTED", "OK"
+    ]
+    assert scalar(migrated, "SELECT remaining FROM coupon WHERE id = 1") == 0
+    assert scalar(
+        migrated,
+        "SELECT count(*) FROM coupon_checkout_reservation WHERE coupon_id = 1 AND state = 'RESERVED'",
+    ) == 1
+    assert scalar(
+        migrated,
+        "SELECT count(*) FROM purchase_order WHERE status = 'pending_payment'",
+    ) == 1
+
+
+def test_parallel_coupon_checkout_same_key_replays_without_second_reservation(migrated):
+    seed_cart(migrated, 1, 0)
+    seed_coupon(migrated)
+    checkout_key = uuid.uuid4()
+    with patch.object(orders.payments, "configuration_error", return_value=None), \
+            patch.object(orders.payments, "currency_id", return_value="ARS"), \
+            patch.object(
+                orders,
+                "_preference",
+                side_effect=lambda order_id, _lines: (
+                    str(order_id), f"https://example.invalid/{order_id}"
+                ),
+            ):
+        results = concurrent_independent(
+            lambda: coupon_checkout(1, checkout_key),
+            lambda: coupon_checkout(1, checkout_key),
+        )
+
+    successes = [result for result in results if not result.user_errors]
+    assert len(successes) in (1, 2)
+    assert all(
+        result.user_errors[0].code == "PENDING_PAYMENT"
+        for result in results
+        if result.user_errors
+    )
+    assert len({result.order.id for result in successes}) == 1
+    assert len({result.init_point for result in successes}) == 1
+    with patch.object(orders.payments, "configuration_error", return_value=None):
+        replay = coupon_checkout(1, checkout_key)
+    assert replay.user_errors == []
+    assert replay.order.id == successes[0].order.id
+    assert replay.init_point == successes[0].init_point
+    assert scalar(migrated, "SELECT remaining FROM coupon WHERE id = 1") == 0
+    assert scalar(
+        migrated,
+        "SELECT count(*) FROM coupon_checkout_reservation WHERE coupon_id = 1",
+    ) == 1
+    assert scalar(
+        migrated,
+        "SELECT count(*) FROM purchase_order WHERE status = 'pending_payment'",
+    ) == 1
+
+
+@pytest.mark.parametrize(
+    ("confirmed_status", "expected_order_status"),
+    [("rejected", "rejected"), ("cancelled", "cancelled")],
+)
+def test_uncertain_coupon_payment_stays_reserved_until_confirmed_failure(
+    migrated, confirmed_status, expected_order_status
+):
+    seed_cart(migrated, 1, 0)
+    seed_coupon(migrated)
+    info = SimpleNamespace(context=SimpleNamespace(user=SimpleNamespace(pk=1)))
+    checkout_key = uuid.uuid4()
+    with patch.object(orders.payments, "configuration_error", return_value=None), \
+            patch.object(orders.payments, "currency_id", return_value="ARS"), \
+            patch.object(orders, "_preference", return_value=(None, None)) as preference:
+        result = orders.checkout(
+            info, "pickup", coupon_code="CONCURRENT-COUPON",
+            checkout_key=str(checkout_key),
+        )
+        order_id = scalar(
+            migrated,
+            "SELECT id FROM purchase_order WHERE user_id = 1 AND status = 'pending_payment'",
+        )
+        assert result.user_errors[0].code == "PAYMENT_INITIALIZATION_FAILED"
+        assert scalar(
+            migrated,
+            "SELECT state FROM coupon_checkout_reservation WHERE order_id = %s",
+            [order_id],
+        ) == "REVIEW"
+        assert scalar(migrated, "SELECT remaining FROM coupon WHERE id = 1") == 0
+
+        assert retry(str(order_id)).user_errors[0].code == "PENDING_PAYMENT"
+        assert preference.call_count == 1
+
+        payment = {
+            "status": 200,
+            "response": {
+                "live_mode": False,
+                "external_reference": str(order_id),
+                "transaction_amount": "10.50",
+                "currency_id": "ARS",
+                "status": "pending",
+                "status_detail": "in_process",
+            },
+        }
+        with patch.object(
+            orders.payments,
+            "fetch_payment",
+            side_effect=lambda payment_id: confirmed_payment_response(payment, payment_id),
+        ):
+            pending = orders.confirm_payment(info, order_id, "uncertain-payment")
+        assert pending.user_errors == []
+        assert pending.order.status == "pending_payment"
+        assert scalar(
+            migrated,
+            "SELECT state FROM coupon_checkout_reservation WHERE order_id = %s",
+            [order_id],
+        ) == "REVIEW"
+        assert scalar(migrated, "SELECT remaining FROM coupon WHERE id = 1") == 0
+
+        payment["response"]["status"] = confirmed_status
+        payment["response"]["status_detail"] = confirmed_status
+        with patch.object(
+            orders.payments,
+            "fetch_payment",
+            side_effect=lambda payment_id: confirmed_payment_response(payment, payment_id),
+        ):
+            terminal_result = orders.confirm_payment(
+                info, order_id, "confirmed-terminal-failure"
+            )
+
+    assert terminal_result.user_errors == []
+    assert terminal_result.order.status == expected_order_status
+    assert scalar(
+        migrated,
+        "SELECT state FROM coupon_checkout_reservation WHERE order_id = %s",
+        [order_id],
+    ) == "RELEASED"
+    assert scalar(migrated, "SELECT remaining FROM coupon WHERE id = 1") == 1
+
+
+STOCK_MOVEMENT = """
+mutation StockMovement($productId: ID!, $movementId: ID!, $direction: StockMovementDirection!, $quantity: Int!) {
+  adjustProductStock(productId: $productId, movementId: $movementId, direction: $direction, quantity: $quantity) {
+    movementId status requestedQuantity appliedQuantity quantityBefore quantityAfter errors { code }
+  }
+}
+"""
+
+
+@pytest.fixture
+def stock_movement_database(database):
+    with database.cursor() as cursor:
+        cursor.execute("CREATE TABLE audit_log (id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, actor varchar(150), action varchar(100) NOT NULL, target_table varchar(150), target_id varchar(64), diff jsonb, created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+        cursor.execute("CREATE TABLE catalog_event_outbox (event_id uuid PRIMARY KEY, event_type varchar(32) NOT NULL, occurred_at timestamptz NOT NULL, aggregate_type varchar(32) NOT NULL, aggregate_id varchar(128) NOT NULL, attempts integer NOT NULL DEFAULT 0, next_attempt_at timestamptz NOT NULL, delivered_at timestamptz)")
+        for name in ("0012_stock_movement_status", "0013_stock_movement_details"):
+            for statement in migration_sql(name):
+                cursor.execute(statement)
+    return database
+
+
+def stock_movement(movement_id, direction="IN", quantity=3, product_id="7"):
+    user = SimpleNamespace(pk=1, is_active=True, is_staff=True, is_superuser=False)
+    result = schema.execute(
+        STOCK_MOVEMENT,
+        variable_values={"productId": product_id, "movementId": str(movement_id), "direction": direction, "quantity": quantity},
+        context_value=SimpleNamespace(user=user, headers={}),
+    )
+    assert result.errors is None, result.errors
+    return result.data["adjustProductStock"]
+
+
+@pytest.mark.parametrize("direction,quantity,applied,after", [("IN", 3, 3, 8), ("OUT", 9, 5, 0)])
+def test_stock_movement_commits_result_and_replays(stock_movement_database, direction, quantity, applied, after):
+    movement_id = uuid.uuid4()
+    first = stock_movement(movement_id, direction, quantity)
+    assert first == {"movementId": str(movement_id), "status": "APPLIED", "requestedQuantity": quantity,
+                     "appliedQuantity": applied, "quantityBefore": 5, "quantityAfter": after, "errors": []}
+    assert stock_movement(movement_id, direction, quantity) == first
+    assert scalar(stock_movement_database, "SELECT quantity FROM product_boardgame WHERE bgg_id = 7") == after
+    assert scalar(stock_movement_database, "SELECT count(*) FROM audit_log") == 1
+    with stock_movement_database.cursor() as cursor:
+        cursor.execute("SELECT actor, action, target_id, diff FROM audit_log")
+        actor, action, target_id, diff = cursor.fetchone()
+    if isinstance(diff, str):
+        diff = json.loads(diff)
+    assert (actor, action, target_id) == ("1", "stock_" + direction.lower(), "7")
+    assert diff == {"movement_id": str(movement_id), "direction": direction, "requested_quantity": quantity,
+                    "applied_quantity": applied, "old": 5, "new": after}
+    assert scalar(stock_movement_database, "SELECT status FROM stock_movement_status WHERE movement_id = %s", [str(movement_id)]) == "APPLIED"
+
+
+def test_stock_movement_increases_ten_by_twenty(stock_movement_database):
+    with stock_movement_database.cursor() as cursor:
+        cursor.execute("UPDATE product_boardgame SET quantity = 10 WHERE bgg_id = 7")
+    result = stock_movement(uuid.uuid4(), direction="IN", quantity=20)
+    assert result["status"] == "APPLIED"
+    assert (result["quantityBefore"], result["appliedQuantity"], result["quantityAfter"]) == (10, 20, 30)
+    assert scalar(stock_movement_database, "SELECT quantity FROM product_boardgame WHERE bgg_id = 7") == 30
+    assert scalar(stock_movement_database, "SELECT count(*) FROM audit_log") == 1
+
+
+def test_stock_movement_replay_after_later_change_and_new_connection(stock_movement_database):
+    movement_id = uuid.uuid4()
+    original = stock_movement(movement_id, direction="IN", quantity=3)
+    assert original["quantityBefore"] == 5
+    assert original["quantityAfter"] == 8
+
+    subsequent = stock_movement(uuid.uuid4(), direction="OUT", quantity=2)
+    assert subsequent["quantityAfter"] == 6
+    stock_movement_database.close()
+
+    assert stock_movement(movement_id, direction="IN", quantity=3) == original
+    assert stock_movement(movement_id, direction="IN", quantity=4)["errors"][0]["code"] == "IDEMPOTENCY_CONFLICT"
+    assert scalar(stock_movement_database, "SELECT quantity FROM product_boardgame WHERE bgg_id = 7") == 6
+    assert scalar(stock_movement_database, "SELECT count(*) FROM audit_log") == 2
+    assert scalar(stock_movement_database, "SELECT count(*) FROM stock_movement_status WHERE status = 'APPLIED'") == 2
+
+
+def test_stock_movement_late_retry_after_confirmed_no_stock_keeps_identity(stock_movement_database):
+    movement_id = uuid.uuid4()
+    with stock_movement_database.cursor() as cursor:
+        cursor.execute("UPDATE product_boardgame SET quantity = 0 WHERE bgg_id = 7")
+
+    rejected = stock_movement(movement_id, direction="OUT", quantity=3)
+    assert rejected["errors"][0]["code"] == "NO_STOCK"
+    assert scalar(stock_movement_database, "SELECT status FROM stock_movement_status WHERE movement_id = %s", [str(movement_id)]) == "REJECTED"
+    assert scalar(stock_movement_database, "SELECT count(*) FROM audit_log") == 0
+
+    replenishment = stock_movement(uuid.uuid4(), direction="IN", quantity=5)
+    assert replenishment["quantityAfter"] == 5
+    stock_movement_database.close()
+
+    retried = stock_movement(movement_id, direction="OUT", quantity=3)
+    assert retried == {
+        "movementId": str(movement_id),
+        "status": "APPLIED",
+        "requestedQuantity": 3,
+        "appliedQuantity": 3,
+        "quantityBefore": 5,
+        "quantityAfter": 2,
+        "errors": [],
+    }
+    assert stock_movement(movement_id, direction="IN", quantity=3)["errors"][0]["code"] == "IDEMPOTENCY_CONFLICT"
+    assert scalar(stock_movement_database, "SELECT quantity FROM product_boardgame WHERE bgg_id = 7") == 2
+    assert scalar(stock_movement_database, "SELECT count(*) FROM audit_log") == 2
+    assert scalar(stock_movement_database, "SELECT count(*) FROM stock_movement_status") == 2
+
+
+@pytest.mark.parametrize("direction,quantity,product_id", [("OUT", 3, "7"), ("IN", 4, "7"), ("IN", 3, "8")])
+def test_stock_movement_rejects_changed_identity(stock_movement_database, direction, quantity, product_id):
+    movement_id = uuid.uuid4()
+    assert stock_movement(movement_id)["status"] == "APPLIED"
+    conflict = stock_movement(movement_id, direction, quantity, product_id)
+    assert conflict["errors"][0]["code"] == "IDEMPOTENCY_CONFLICT"
+    assert scalar(stock_movement_database, "SELECT quantity FROM product_boardgame WHERE bgg_id = 7") == 8
+    assert scalar(stock_movement_database, "SELECT count(*) FROM audit_log") == 1
+
+
+def test_stock_movement_confirmed_rejection_can_retry(stock_movement_database):
+    movement_id = uuid.uuid4()
+    rejected = stock_movement(movement_id, product_id="8")
+    assert rejected["errors"][0]["code"] == "NOT_FOUND"
+    assert scalar(stock_movement_database, "SELECT status FROM stock_movement_status WHERE movement_id = %s", [str(movement_id)]) == "REJECTED"
+    assert stock_movement(movement_id, product_id="9")["errors"][0]["code"] == "IDEMPOTENCY_CONFLICT"
+    with stock_movement_database.cursor() as cursor:
+        cursor.execute("INSERT INTO product_boardgame VALUES (8, 'New game', 10, 2)")
+    assert stock_movement(movement_id, product_id="8")["quantityAfter"] == 5
+
+
+@pytest.mark.parametrize("direction,initial,quantity,code", [("IN", 2147483647, 1, "INVALID"), ("OUT", 0, 1, "NO_STOCK")])
+def test_stock_movement_rejects_limits_without_changing_stock(stock_movement_database, direction, initial, quantity, code):
+    with stock_movement_database.cursor() as cursor:
+        cursor.execute("UPDATE product_boardgame SET quantity = %s WHERE bgg_id = 7", [initial])
+    movement_id = uuid.uuid4()
+    result = stock_movement(movement_id, direction, quantity)
+    assert result["errors"][0]["code"] == code
+    assert scalar(stock_movement_database, "SELECT quantity FROM product_boardgame WHERE bgg_id = 7") == initial
+    assert scalar(stock_movement_database, "SELECT status FROM stock_movement_status WHERE movement_id = %s", [str(movement_id)]) == "REJECTED"
+    assert scalar(stock_movement_database, "SELECT count(*) FROM audit_log") == 0
+
+
+def test_stock_movement_confirmed_rollback_can_retry(stock_movement_database):
+    movement_id = uuid.uuid4()
+    with stock_movement_database.cursor() as cursor:
+        cursor.execute("DROP TABLE audit_log")
+    result = stock_movement(movement_id)
+    assert result["errors"][0]["code"] == "SERVER_ERROR"
+    assert scalar(stock_movement_database, "SELECT quantity FROM product_boardgame WHERE bgg_id = 7") == 5
+    assert scalar(stock_movement_database, "SELECT status FROM stock_movement_status WHERE movement_id = %s", [str(movement_id)]) == "REJECTED"
+    with stock_movement_database.cursor() as cursor:
+        cursor.execute("CREATE TABLE audit_log (id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, actor varchar(150), action varchar(100) NOT NULL, target_table varchar(150), target_id varchar(64), diff jsonb, created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+    retry = stock_movement(movement_id)
+    assert retry["status"] == "APPLIED"
+    assert retry["quantityAfter"] == 8
+
+
+def test_stock_movement_uncertain_commit_is_not_marked_rejected(stock_movement_database):
+    from django.db.transaction import Atomic
+
+    movement_id = uuid.uuid4()
+    original_exit = Atomic.__exit__
+    committed = 0
+
+    def lose_commit_response(atomic, exception_type, exception, traceback):
+        nonlocal committed
+        result = original_exit(atomic, exception_type, exception, traceback)
+        if atomic.durable and exception_type is None:
+            committed += 1
+            if committed == 2:
+                raise RuntimeError("synthetic lost commit response")
+        return result
+
+    with patch.object(Atomic, "__exit__", lose_commit_response):
+        result = stock_movement(movement_id)
+    assert result["errors"][0]["code"] == "SERVER_ERROR"
+    assert scalar(stock_movement_database, "SELECT status FROM stock_movement_status WHERE movement_id = %s", [str(movement_id)]) == "APPLIED"
+    replay = stock_movement(movement_id)
+    assert replay["status"] == "APPLIED"
+    assert replay["quantityAfter"] == 8
+    assert scalar(stock_movement_database, "SELECT count(*) FROM audit_log") == 1
+
+
+def test_stock_movement_existing_in_progress_is_resumed(stock_movement_database):
+    movement_id = uuid.uuid4()
+    with stock_movement_database.cursor() as cursor:
+        cursor.execute("INSERT INTO stock_movement_status VALUES (%s, 'IN_PROGRESS')", [str(movement_id)])
+        cursor.execute("INSERT INTO stock_movement_details (movement_id, product_id, direction, requested_quantity, actor_id) VALUES (%s, 7, 'IN', 3, 1)", [str(movement_id)])
+    assert stock_movement(movement_id, quantity=4)["errors"][0]["code"] == "IDEMPOTENCY_CONFLICT"
+    assert scalar(stock_movement_database, "SELECT quantity FROM product_boardgame WHERE bgg_id = 7") == 5
+    result = stock_movement(movement_id)
+    assert result["status"] == "APPLIED"
+    assert result["quantityAfter"] == 8
+    assert stock_movement(movement_id) == result
+    assert scalar(stock_movement_database, "SELECT quantity FROM product_boardgame WHERE bgg_id = 7") == 8
+    assert scalar(stock_movement_database, "SELECT count(*) FROM audit_log") == 1
+
+
+def test_stock_movement_retry_races_original_after_provisional_commit(stock_movement_database):
+    from django.db.transaction import Atomic
+
+    movement_id = uuid.uuid4()
+    provisional_committed = threading.Event()
+    resume_original = threading.Event()
+    original_exit = Atomic.__exit__
+    original_thread = None
+    commits = 0
+
+    def pause_after_provisional(atomic, exception_type, exception, traceback):
+        nonlocal commits
+        result = original_exit(atomic, exception_type, exception, traceback)
+        if threading.current_thread() is original_thread and atomic.durable and exception_type is None:
+            commits += 1
+            if commits == 1:
+                provisional_committed.set()
+                assert resume_original.wait(timeout=10)
+        return result
+
+    def run_original():
+        nonlocal original_thread
+        original_thread = threading.current_thread()
+        try:
+            return stock_movement(movement_id)
+        finally:
+            connections.close_all()
+
+    with ThreadPoolExecutor(max_workers=1) as pool, patch.object(Atomic, "__exit__", pause_after_provisional):
+        future = pool.submit(run_original)
+        try:
+            assert provisional_committed.wait(timeout=10)
+            retry = stock_movement(movement_id)
+            assert retry["status"] == "APPLIED"
+        finally:
+            resume_original.set()
+        assert future.result(timeout=10) == retry
+    assert scalar(stock_movement_database, "SELECT quantity FROM product_boardgame WHERE bgg_id = 7") == 8
+    assert scalar(stock_movement_database, "SELECT count(*) FROM audit_log") == 1
+
+
+def test_stock_movement_status_visible_while_product_is_locked(stock_movement_database):
+    from django.db.backends.utils import CursorWrapper
+
+    movement_id = uuid.uuid4()
+    entering_update = threading.Event()
+    original_execute = CursorWrapper.execute
+
+    def watched_execute(cursor, sql_statement, parameters=None):
+        if isinstance(sql_statement, str) and sql_statement.startswith("SELECT quantity FROM product_boardgame") and "FOR UPDATE" in sql_statement:
+            entering_update.set()
+        return original_execute(cursor, sql_statement, parameters)
+
+    def run_movement():
+        try:
+            return stock_movement(movement_id)
+        finally:
+            connections.close_all()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        with transaction.atomic(), stock_movement_database.cursor() as cursor:
+            cursor.execute("SELECT quantity FROM product_boardgame WHERE bgg_id = 7 FOR UPDATE")
+            with patch.object(CursorWrapper, "execute", watched_execute):
+                future = pool.submit(run_movement)
+                assert entering_update.wait(timeout=10)
+                assert scalar(stock_movement_database, "SELECT status FROM stock_movement_status WHERE movement_id = %s", [str(movement_id)]) == "IN_PROGRESS"
+                assert scalar(stock_movement_database, "SELECT quantity FROM product_boardgame WHERE bgg_id = 7") == 5
+                retry = pool.submit(run_movement).result(timeout=3)
+                assert retry["status"] == "IN_PROGRESS"
+                assert retry["errors"] == []
+        assert future.result(timeout=10)["status"] == "APPLIED"
+    assert scalar(stock_movement_database, "SELECT quantity FROM product_boardgame WHERE bgg_id = 7") == 8
+
+
+@pytest.mark.parametrize("same_id,expected_stock,expected_audits", [(True, 8, 1), (False, 11, 2)])
+def test_stock_movement_concurrency(stock_movement_database, same_id, expected_stock, expected_audits):
+    first_id = uuid.uuid4()
+    second_id = first_id if same_id else uuid.uuid4()
+    barrier = threading.Barrier(2, timeout=10)
+
+    def run(movement_id):
+        try:
+            barrier.wait()
+            return stock_movement(movement_id)
+        finally:
+            connections.close_all()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(run, [first_id, second_id]))
+    assert all(result["errors"] == [] for result in results)
+    assert all(result["status"] in ("IN_PROGRESS", "APPLIED") for result in results)
+    assert scalar(stock_movement_database, "SELECT quantity FROM product_boardgame WHERE bgg_id = 7") == expected_stock
+    assert scalar(stock_movement_database, "SELECT count(*) FROM audit_log") == expected_audits
+    assert stock_movement(first_id)["status"] == "APPLIED"
+
+
+def test_stock_movement_bff_core_postgres_flow(stock_movement_database, monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "bgg-shop-bff"))
+    from app import app as bff_app
+
+    user = SimpleNamespace(pk=1, is_active=True, is_staff=True, is_superuser=False)
+
+    def graphql_transport(query, variables, token=None, **kwargs):
+        result = schema.execute(query, variable_values=variables, context_value=SimpleNamespace(user=user, headers={}))
+        assert result.errors is None, result.errors
+        return {"data": result.data}
+
+    headers = {"Authorization": "Bearer synthetic-test"}
+    with patch("src.proxy.check_admin", return_value=True), patch("src.proxy._graphql_request", side_effect=graphql_transport):
+        client = bff_app.test_client()
+        movement_id = client.post("/api/v1/admin/stock-movement-ids", headers=headers).get_json()["movement_id"]
+        payload = {"movement_id": movement_id, "direction": "IN", "quantity": 3}
+        first = client.post("/api/v1/admin/products/7/stock", json=payload, headers=headers)
+        replay = client.post("/api/v1/admin/products/7/stock", json=payload, headers=headers)
+        status = client.get(f"/api/v1/admin/stock-movements/{movement_id}", headers=headers)
+        conflict = client.post("/api/v1/admin/products/7/stock", json={**payload, "quantity": 4}, headers=headers)
+    assert first.status_code == replay.status_code == status.status_code == 200
+    assert first.get_json() == replay.get_json()
+    assert first.get_json()["quantity_after"] == 8
+    assert status.get_json() == {"movement_id": movement_id, "status": "APPLIED"}
+    assert conflict.status_code == 409
+    assert scalar(stock_movement_database, "SELECT quantity FROM product_boardgame WHERE bgg_id = 7") == 8
+    assert scalar(stock_movement_database, "SELECT count(*) FROM audit_log") == 1
+
+
+def test_stock_movement_bff_resumes_existing_in_progress(stock_movement_database, monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "bgg-shop-bff"))
+    from app import app as bff_app
+
+    movement_id = uuid.uuid4()
+    with stock_movement_database.cursor() as cursor:
+        cursor.execute("INSERT INTO stock_movement_status VALUES (%s, 'IN_PROGRESS')", [str(movement_id)])
+        cursor.execute("INSERT INTO stock_movement_details (movement_id, product_id, direction, requested_quantity, actor_id) VALUES (%s, 7, 'IN', 3, 1)", [str(movement_id)])
+    user = SimpleNamespace(pk=1, is_active=True, is_staff=True, is_superuser=False)
+
+    def graphql_transport(query, variables, token=None, **kwargs):
+        result = schema.execute(query, variable_values=variables, context_value=SimpleNamespace(user=user, headers={}))
+        assert result.errors is None, result.errors
+        return {"data": result.data}
+
+    headers = {"Authorization": "Bearer synthetic-test"}
+    payload = {"movement_id": str(movement_id), "direction": "IN", "quantity": 3}
+    with patch("src.proxy.check_admin", return_value=True), patch("src.proxy._graphql_request", side_effect=graphql_transport):
+        client = bff_app.test_client()
+        resumed = client.post("/api/v1/admin/products/7/stock", json=payload, headers=headers)
+        replay = client.post("/api/v1/admin/products/7/stock", json=payload, headers=headers)
+        status = client.get(f"/api/v1/admin/stock-movements/{movement_id}", headers=headers)
+    assert resumed.status_code == replay.status_code == status.status_code == 200
+    assert resumed.get_json() == replay.get_json()
+    assert resumed.get_json()["quantity_after"] == 8
+    assert status.get_json()["status"] == "APPLIED"
+    assert scalar(stock_movement_database, "SELECT count(*) FROM audit_log") == 1
+
+
+def test_stock_movement_lost_response_can_be_queried_and_replayed(stock_movement_database, monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "bgg-shop-bff"))
+    from app import app as bff_app
+    from src.proxy import UpstreamError
+
+    user = SimpleNamespace(pk=1, is_active=True, is_staff=True, is_superuser=False)
+    lost = False
+
+    def graphql_transport(query, variables, token=None, **kwargs):
+        nonlocal lost
+        result = schema.execute(query, variable_values=variables, context_value=SimpleNamespace(user=user, headers={}))
+        assert result.errors is None, result.errors
+        if "mutation AdjustProductStock" in query and not lost:
+            lost = True
+            raise UpstreamError("synthetic private transport failure")
+        return {"data": result.data}
+
+    headers = {"Authorization": "Bearer synthetic-test"}
+    with patch("src.proxy.check_admin", return_value=True), patch("src.proxy._graphql_request", side_effect=graphql_transport):
+        client = bff_app.test_client()
+        movement_id = client.post("/api/v1/admin/stock-movement-ids", headers=headers).get_json()["movement_id"]
+        payload = {"movement_id": movement_id, "direction": "IN", "quantity": 3}
+        lost_response = client.post("/api/v1/admin/products/7/stock", json=payload, headers=headers)
+        status = client.get(f"/api/v1/admin/stock-movements/{movement_id}", headers=headers)
+        replay = client.post("/api/v1/admin/products/7/stock", json=payload, headers=headers)
+    assert lost_response.status_code == 502
+    assert lost_response.get_json()["movement_id"] == movement_id
+    assert "synthetic private transport failure" not in lost_response.get_data(as_text=True)
+    assert status.get_json() == {"movement_id": movement_id, "status": "APPLIED"}
+    assert replay.status_code == 200
+    assert replay.get_json()["quantity_after"] == 8
+    assert scalar(stock_movement_database, "SELECT quantity FROM product_boardgame WHERE bgg_id = 7") == 8
+    assert scalar(stock_movement_database, "SELECT count(*) FROM audit_log") == 1
+
+
+def test_stock_movement_bff_opkey_core_postgres_flow(stock_movement_database, monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "bgg-shop-bff"))
+    monkeypatch.setenv("OPKEY_INTERNAL_SECRET", "synthetic-internal-secret-0123456789-abcdef")
+    from app import app as bff_app
+    from django.contrib.auth.models import AnonymousUser
+    from django.test import RequestFactory, override_settings
+    from opkeys.middleware import OpKeyAuthMiddleware
+
+    user = SimpleNamespace(pk=1, is_active=True, is_staff=True, is_superuser=False)
+    session = SimpleNamespace(user_id=1, ops=["POST:/api/v1/admin/*", "GET:/api/v1/admin/*"], is_valid=lambda: True, touch=lambda: None)
+
+    def graphql_transport(url, headers, **kwargs):
+        metadata = {"HTTP_" + key.upper().replace("-", "_"): value for key, value in headers.items()}
+        payload = kwargs["json"]
+        request = RequestFactory().post("/graphql/", data=json.dumps(payload), content_type="application/json", **metadata)
+        request.user = AnonymousUser()
+        assert OpKeyAuthMiddleware(lambda value: None).process_request(request) is None
+        result = schema.execute(payload["query"], variable_values=payload["variables"], context_value=request)
+        assert result.errors is None, result.errors
+        return SimpleNamespace(status_code=200, raise_for_status=lambda: None, json=lambda: {"data": result.data})
+
+    headers = {"X-Op-Key": "synthetic-op-key"}
+    with override_settings(OPKEY_INTERNAL_SECRET="synthetic-internal-secret-0123456789-abcdef"), \
+            patch("src.opkey_middleware.validate_op_key_with_core", return_value={"valid": True}), \
+            patch("src.proxy.requests.post", side_effect=graphql_transport), \
+            patch("opkeys.middleware.OpSession.objects.filter") as sessions, \
+            patch("opkeys.middleware.get_user_model") as users:
+        sessions.return_value.first.return_value = session
+        users.return_value.objects.filter.return_value.first.return_value = user
+        client = bff_app.test_client()
+        movement_id = client.post("/api/v1/admin/stock-movement-ids", headers=headers).get_json()["movement_id"]
+        response = client.post("/api/v1/admin/products/7/stock", json={"movement_id": movement_id, "direction": "OUT", "quantity": 9}, headers=headers)
+        status = client.get(f"/api/v1/admin/stock-movements/{movement_id}", headers=headers)
+    assert response.status_code == status.status_code == 200
+    assert response.get_json()["quantity_after"] == 0
+    assert "warning" in response.get_json()
+    assert status.get_json() == {"movement_id": movement_id, "status": "APPLIED"}
+    assert scalar(stock_movement_database, "SELECT count(*) FROM audit_log") == 1

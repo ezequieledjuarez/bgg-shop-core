@@ -1,17 +1,319 @@
 """Purchase order GraphQL types and operations."""
 
+import hashlib
+import json
 import re
 import uuid
-from decimal import Decimal
+from decimal import Decimal, ROUND_CEILING
 
 import graphene
 from django.db import connection, transaction
 from django.utils import timezone
+from graphql import GraphQLError
 
+from saleor.catalog_events import record_catalog_event
 from . import payments
 
 
 _ADDRESS_LIMITS = {"recipient": 250, "street": 500, "city": 150, "postal_code": 32, "phone": 50}
+
+
+def _peso_savings(amount):
+    return Decimal(amount).quantize(Decimal("1"), rounding=ROUND_CEILING)
+
+
+def _select_savings(promotion_savings, coupon_savings):
+    promotions = _peso_savings(sum(promotion_savings, Decimal("0")))
+    coupon = _peso_savings(coupon_savings)
+    if promotions >= coupon:
+        return promotions, False
+    return coupon, True
+
+
+def _calculate_savings(cart_lines, promotions, coupon_discount_pct):
+    subtotal = sum(
+        (Decimal(str(line[1])) * int(line[2]) for line in cart_lines), Decimal("0")
+    )
+    global_rate = Decimal("0")
+    promotion_rates = {}
+    for product_id, discount_pct in promotions:
+        rate = Decimal(str(discount_pct))
+        if product_id is None:
+            global_rate = max(global_rate, rate)
+        else:
+            product_id = int(product_id)
+            promotion_rates[product_id] = max(promotion_rates.get(product_id, Decimal("0")), rate)
+    promotion_savings = [
+        Decimal(str(price)) * int(quantity)
+        * promotion_rates.get(int(product_id), global_rate) / 100
+        for product_id, price, quantity in cart_lines
+    ]
+    coupon_percent = Decimal(str(coupon_discount_pct))
+    if coupon_percent > 50:
+        raise ValueError("DISCOUNT_LIMIT_EXCEEDED")
+    coupon_saving = subtotal * coupon_percent / 100
+    return subtotal, *_select_savings(promotion_savings, coupon_saving)
+
+
+def _coupon_row(cursor, code, lock=False):
+    sql = (
+        "SELECT c.id, c.active, c.starts_at, c.ends_at, c.remaining, "
+        "p.discount_pct, p.active, p.starts_at, p.ends_at "
+        "FROM coupon c LEFT JOIN promotion p ON p.id = c.promotion_id "
+        "WHERE c.code = %s"
+    )
+    if lock:
+        sql += " FOR UPDATE OF c"
+    cursor.execute(sql, [code])
+    return cursor.fetchone()
+
+
+def _coupon_eligibility(coupon, now):
+    coupon_id, active, starts_at, ends_at, remaining, discount, promo_active, promo_start, promo_end = coupon
+    if not active or not promo_active or discount is None:
+        return "INACTIVE"
+    if starts_at and now < starts_at:
+        return "NOT_YET_VALID"
+    if promo_start and now < promo_start:
+        return "NOT_YET_VALID"
+    if ends_at and now >= ends_at:
+        return "EXPIRED"
+    if promo_end and now >= promo_end:
+        return "EXPIRED"
+    if remaining <= 0:
+        return "EXHAUSTED"
+    if Decimal(str(discount)) > 50:
+        return "DISCOUNT_LIMIT_EXCEEDED"
+    return None
+
+
+def _promotion_rows(cursor, bgg_ids, now):
+    if not bgg_ids:
+        return []
+    cursor.execute(
+        "SELECT p.product_bgg_id, p.discount_pct FROM promotion p "
+        "WHERE p.active = TRUE "
+        "AND (p.product_bgg_id = ANY(%s) OR p.product_bgg_id IS NULL) "
+        "AND (p.starts_at IS NULL OR p.starts_at <= %s) "
+        "AND (p.ends_at IS NULL OR p.ends_at > %s) "
+        "AND NOT EXISTS (SELECT 1 FROM coupon c WHERE c.promotion_id = p.id)",
+        [list(bgg_ids), now, now],
+    )
+    return cursor.fetchall()
+
+
+def _discounted_payment_lines(cart_lines, savings):
+    gross = [Decimal(str(line[2])) * int(line[3]) for line in cart_lines]
+    savings_cents = int((Decimal(savings) * 100).to_integral_value())
+    gross_cents = [int((amount * 100).to_integral_value()) for amount in gross]
+    gross_total = sum(gross_cents)
+    if not gross_total or not savings_cents:
+        return [
+            {"bgg_id": bgg_id, "name": name, "unit_price": price, "quantity": quantity}
+            for bgg_id, name, price, quantity in cart_lines
+        ]
+    allocations = [savings_cents * amount // gross_total for amount in gross_cents]
+    for index in range(savings_cents - sum(allocations)):
+        allocations[index % len(allocations)] += 1
+    result = []
+    for (bgg_id, name, _price, quantity), amount, discount in zip(
+        cart_lines, gross_cents, allocations
+    ):
+        adjusted = max(0, amount - discount)
+        if adjusted:
+            result.append({
+                "bgg_id": bgg_id,
+                "name": f"{name} (quantity {quantity})",
+                "unit_price": Decimal(adjusted) / 100,
+                "quantity": 1,
+            })
+    return result
+
+
+def _coupon_operation_hash(user_id, checkout_key):
+    return hashlib.sha256(f"{user_id}:{checkout_key}".encode("utf-8")).hexdigest()
+
+
+def _checkout_payload_hash(user_id, mode, address, coupon_code):
+    encoded = json.dumps(
+        {
+            "user_id": user_id,
+            "shipping_mode": mode,
+            "address": address,
+            "coupon_code": coupon_code,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _checkout_replay_error(prior, payload_hash):
+    if prior[0] != payload_hash:
+        return _error(
+            "IDEMPOTENCY_CONFLICT",
+            "X-Op-Key was already used for a different checkout.",
+            ["checkoutKey"],
+        )
+    if prior[1] is None:
+        return _error(
+            "PENDING_PAYMENT",
+            "The original checkout is still being reconciled.",
+        )
+    return None
+
+
+def _reserve_coupon(cursor, coupon_id, order_id, operation_hash, payload_hash, use_coupon):
+    if use_coupon:
+        cursor.execute(
+            "UPDATE coupon SET remaining = remaining - 1 "
+            "WHERE id = %s AND remaining > 0 RETURNING remaining",
+            [coupon_id],
+        )
+        if cursor.fetchone() is None:
+            raise ValueError("EXHAUSTED")
+    cursor.execute(
+        "INSERT INTO coupon_checkout_reservation "
+        "(order_id, coupon_id, operation_key_hash, request_hash, state) "
+        "VALUES (%s, %s, %s, %s, %s)",
+        [
+            order_id,
+            coupon_id,
+            operation_hash,
+            payload_hash,
+            "RESERVED" if use_coupon else "NOT_APPLIED",
+        ],
+    )
+
+
+def _release_coupon_reservation(cursor, order_id):
+    cursor.execute(
+        "UPDATE coupon_checkout_reservation SET state = 'RELEASED', updated_at = CURRENT_TIMESTAMP "
+        "WHERE order_id = %s AND state IN ('RESERVED', 'REVIEW') RETURNING coupon_id",
+        [order_id],
+    )
+    row = cursor.fetchone()
+    if row:
+        cursor.execute(
+            "UPDATE coupon SET remaining = remaining + 1 WHERE id = %s",
+            [row[0]],
+        )
+
+
+def _set_coupon_reservation_state(cursor, order_id, state):
+    cursor.execute(
+        "UPDATE coupon_checkout_reservation SET state = %s, updated_at = CURRENT_TIMESTAMP "
+        "WHERE order_id = %s AND state IN ('RESERVED', 'REVIEW')",
+        [state, order_id],
+    )
+
+
+def _rereserve_released_coupon(cursor, order_id, now):
+    cursor.execute(
+        "SELECT coupon_id, state FROM coupon_checkout_reservation "
+        "WHERE order_id = %s FOR UPDATE",
+        [order_id],
+    )
+    reservation = cursor.fetchone()
+    if not reservation or reservation[1] != "RELEASED":
+        return None
+    cursor.execute(
+        "SELECT code FROM coupon WHERE id = %s",
+        [reservation[0]],
+    )
+    row = cursor.fetchone()
+    coupon = _coupon_row(cursor, row[0], lock=True) if row else None
+    if coupon is None:
+        return "COUPON_NOT_FOUND"
+    reason = _coupon_eligibility(coupon, now)
+    if reason:
+        return reason
+    cursor.execute(
+        "UPDATE coupon SET remaining = remaining - 1 "
+        "WHERE id = %s AND remaining > 0 RETURNING remaining",
+        [coupon[0]],
+    )
+    if cursor.fetchone() is None:
+        return "EXHAUSTED"
+    cursor.execute(
+        "UPDATE coupon_checkout_reservation SET state = 'RESERVED', "
+        "updated_at = CURRENT_TIMESTAMP WHERE order_id = %s AND state = 'RELEASED'",
+        [order_id],
+    )
+    return None
+
+
+def preview_coupon(info, code):
+    from .api import _authenticated_user
+
+    user = _authenticated_user(info)
+    if user is None:
+        raise GraphQLError(
+            "Authentication is required.",
+            extensions={"code": "UNAUTHENTICATED"},
+        )
+    try:
+        now = timezone.now()
+        with connection.cursor() as cursor:
+            coupon = _coupon_row(cursor, code)
+            if coupon is None:
+                raise GraphQLError(
+                    "Coupon not found.",
+                    extensions={"code": "NOT_FOUND"},
+                )
+            cursor.execute(
+                "SELECT cart_id FROM shopping_cart WHERE user_id = %s",
+                [user.pk],
+            )
+            cart = cursor.fetchone()
+            if cart is None:
+                return CouponPreview(
+                    valid=False, coupon_code=code, discount_amount=0,
+                    new_total=0, reason="EMPTY_CART",
+                )
+            cursor.execute(
+                "SELECT p.bgg_id, p.price_amount, line.quantity "
+                "FROM shopping_cart_line line "
+                "JOIN product_boardgame p ON p.bgg_id = line.bgg_id "
+                "WHERE line.cart_id = %s ORDER BY p.bgg_id",
+                [cart[0]],
+            )
+            cart_lines = cursor.fetchall()
+            if not cart_lines:
+                return CouponPreview(
+                    valid=False, coupon_code=code, discount_amount=0,
+                    new_total=0, reason="EMPTY_CART",
+                )
+            subtotal = sum(
+                (Decimal(str(row[1])) * row[2] for row in cart_lines),
+                Decimal("0"),
+            )
+            reason = _coupon_eligibility(coupon, now)
+            if reason:
+                return CouponPreview(
+                    valid=False, coupon_code=code, discount_amount=0,
+                    new_total=float(subtotal), reason=reason,
+                )
+            promotions = _promotion_rows(
+                cursor, (row[0] for row in cart_lines), now
+            )
+            subtotal, savings, _coupon_wins = _calculate_savings(
+                cart_lines, promotions, coupon[5]
+            )
+        return CouponPreview(
+            valid=True,
+            coupon_code=code,
+            discount_amount=float(savings),
+            new_total=float(max(Decimal("0"), subtotal - savings)),
+            reason=None,
+        )
+    except GraphQLError:
+        raise
+    except Exception:
+        raise GraphQLError(
+            "Coupon preview could not be completed.",
+            extensions={"code": "SERVER_ERROR"},
+        ) from None
 
 
 class ShippingMode(graphene.Enum):
@@ -70,6 +372,14 @@ class CheckoutPayload(graphene.ObjectType):
     order = graphene.Field(PurchaseOrder)
     init_point = graphene.String()
     user_errors = graphene.List(graphene.NonNull(OrderUserError), required=True)
+
+
+class CouponPreview(graphene.ObjectType):
+    valid = graphene.Boolean(required=True)
+    coupon_code = graphene.String(required=True)
+    discount_amount = graphene.Float(required=True)
+    new_total = graphene.Float(required=True)
+    reason = graphene.String()
 
 
 class ConfirmPaymentPayload(graphene.ObjectType):
@@ -200,13 +510,31 @@ def _lock_credit_account(cursor, user_id):
     )
 
 
-def checkout(info, shipping_mode, address=None, cart_id=None):
+def checkout(info, shipping_mode, address=None, cart_id=None, coupon_code=None, checkout_key=None):
     from .api import _authenticated_user, _get_cart_id
 
     user = _authenticated_user(info)
     if user is None:
         return CheckoutPayload(
             user_errors=[_error("UNAUTHENTICATED", "Authentication is required.")]
+        )
+    if coupon_code is not None and (
+        not isinstance(coupon_code, str) or not coupon_code
+    ):
+        return CheckoutPayload(
+            user_errors=[_error("INVALID", "Invalid coupon code.", ["couponCode"])]
+        )
+    if coupon_code is not None and (
+        not isinstance(checkout_key, str) or not checkout_key or len(checkout_key) > 512
+    ):
+        return CheckoutPayload(
+            user_errors=[
+                _error(
+                    "INVALID",
+                    "X-Op-Key is required for coupon checkout.",
+                    ["checkoutKey"],
+                )
+            ]
         )
     issue = payments.configuration_error()
     if issue:
@@ -245,8 +573,44 @@ def checkout(info, shipping_mode, address=None, cart_id=None):
                 )
             ]
         )
+    operation_hash = (
+        _coupon_operation_hash(user.pk, checkout_key)
+        if coupon_code is not None else None
+    )
+    payload_hash = (
+        _checkout_payload_hash(user.pk, mode, values, coupon_code)
+        if coupon_code is not None else None
+    )
     with transaction.atomic(durable=True):
         with connection.cursor() as cursor:
+            if operation_hash:
+                lock_number = int.from_bytes(
+                    bytes.fromhex(operation_hash[:16]), "big", signed=True
+                )
+                cursor.execute(
+                    "SELECT pg_advisory_xact_lock(%s::bigint)",
+                    [lock_number],
+                )
+                cursor.execute(
+                    # Read-only replay lookup avoids reversing preference-completion lock order.
+                    "SELECT reservation.request_hash, reservation.init_point, order_row.id "
+                    "FROM coupon_checkout_reservation reservation "
+                    "JOIN purchase_order order_row ON order_row.id = reservation.order_id "
+                    "WHERE reservation.operation_key_hash = %s "
+                    "AND order_row.user_id = %s",
+                    [operation_hash, user.pk],
+                )
+                prior = cursor.fetchone()
+                if prior:
+                    replay_error = _checkout_replay_error(prior, payload_hash)
+                    if replay_error:
+                        return CheckoutPayload(user_errors=[replay_error])
+                    order = _load_order(cursor, prior[2], user.pk)
+                    return CheckoutPayload(
+                        order=_order_payload(cursor, order),
+                        init_point=prior[1],
+                        user_errors=[],
+                    )
             _lock_credit_account(cursor, user.pk)
             cart_identifier = _get_cart_id(cursor, user, cart_id)
             cursor.execute(
@@ -271,9 +635,54 @@ def checkout(info, shipping_mode, address=None, cart_id=None):
                         )
                     ]
                 )
-            total = sum(
+            subtotal = sum(
                 (Decimal(str(row[2])) * row[3] for row in cart_lines), Decimal("0")
             )
+            now = timezone.now()
+            coupon = None
+            if coupon_code is not None:
+                coupon = _coupon_row(cursor, coupon_code, lock=True)
+                if coupon is None:
+                    return CheckoutPayload(
+                        user_errors=[
+                            _error(
+                                "COUPON_NOT_FOUND",
+                                "Coupon not found.",
+                                ["couponCode"],
+                            )
+                        ]
+                    )
+                reason = _coupon_eligibility(coupon, now)
+                if reason:
+                    return CheckoutPayload(
+                        user_errors=[
+                            _error(
+                                reason,
+                                "Coupon is not eligible for this checkout.",
+                                ["couponCode"],
+                            )
+                        ]
+                    )
+            promotions = _promotion_rows(
+                cursor, (row[0] for row in cart_lines), now
+            )
+            try:
+                subtotal, savings, coupon_wins = _calculate_savings(
+                    [(row[0], row[2], row[3]) for row in cart_lines],
+                    promotions,
+                    coupon[5] if coupon else Decimal("0"),
+                )
+            except ValueError:
+                return CheckoutPayload(
+                    user_errors=[
+                        _error(
+                            "DISCOUNT_LIMIT_EXCEEDED",
+                            "Coupon discount exceeds the 50% limit.",
+                            ["couponCode"],
+                        )
+                    ]
+                )
+            total = max(Decimal("0"), subtotal - savings)
             order_id = uuid.uuid4()
             cursor.execute(
                 "INSERT INTO purchase_order (id, user_id, status, total, currency, "
@@ -312,13 +721,39 @@ def checkout(info, shipping_mode, address=None, cart_id=None):
                         "quantity": quantity,
                     }
                 )
+            if coupon is not None:
+                try:
+                    _reserve_coupon(
+                        cursor,
+                        coupon[0],
+                        order_id,
+                        operation_hash,
+                        payload_hash,
+                        coupon_wins,
+                    )
+                except ValueError:
+                    return CheckoutPayload(
+                        user_errors=[
+                            _error(
+                                "COUPON_EXHAUSTED",
+                                "Coupon has no remaining uses.",
+                                ["couponCode"],
+                            )
+                        ]
+                    )
             cursor.execute(
                 "INSERT INTO credit_retry_attempt (order_id, user_id) VALUES (%s, %s) "
                 "RETURNING attempt_id", [order_id, user.pk]
             )
             attempt_id = cursor.fetchone()[0]
-    preference_id, init_point = _preference(order_id, lines)
+            provider_lines = _discounted_payment_lines(
+                [(row[0], row[1], row[2], row[3]) for row in cart_lines],
+                savings,
+            )
+    preference_id, init_point = _preference(order_id, provider_lines)
     if not preference_id:
+        with transaction.atomic(), connection.cursor() as cursor:
+            _set_coupon_reservation_state(cursor, order_id, "REVIEW")
         return CheckoutPayload(
             user_errors=[
                 _error(
@@ -327,7 +762,9 @@ def checkout(info, shipping_mode, address=None, cart_id=None):
                 )
             ]
         )
-    return _complete_preference_attempt(user, order_id, attempt_id, preference_id, init_point)
+    return _complete_preference_attempt(
+        user, order_id, attempt_id, preference_id, init_point
+    )
 
 
 def retry_payment(info, order_id):
@@ -378,6 +815,17 @@ def retry_payment(info, order_id):
             return CheckoutPayload(
                 user_errors=[_error("PAYMENT_REQUIRES_REVIEW", "Payment requires manual review.")]
             )
+        coupon_retry_error = _rereserve_released_coupon(cursor, identifier, timezone.now())
+        if coupon_retry_error:
+            return CheckoutPayload(
+                user_errors=[
+                    _error(
+                        f"COUPON_{coupon_retry_error}",
+                        "Coupon is no longer eligible for this checkout.",
+                        ["couponCode"],
+                    )
+                ]
+            )
         cursor.execute(
             "INSERT INTO credit_retry_attempt (order_id, user_id) VALUES (%s, %s) "
             "ON CONFLICT (order_id) DO NOTHING RETURNING attempt_id", [identifier, user.pk]
@@ -406,7 +854,19 @@ def retry_payment(info, order_id):
             {"bgg_id": row[0], "name": row[1], "unit_price": row[2], "quantity": row[3]}
             for row in cursor.fetchall()
         ]
-    preference_id, init_point = _preference(identifier, lines)
+        subtotal = sum(
+            (Decimal(str(line["unit_price"])) * line["quantity"] for line in lines),
+            Decimal("0"),
+        )
+        savings = max(Decimal("0"), subtotal - Decimal(str(order["total"])))
+        provider_lines = _discounted_payment_lines(
+            [
+                (line["bgg_id"], line["name"], line["unit_price"], line["quantity"])
+                for line in lines
+            ],
+            savings,
+        )
+    preference_id, init_point = _preference(identifier, provider_lines)
     if not preference_id:
         return CheckoutPayload(
             user_errors=[
@@ -453,6 +913,11 @@ def _complete_preference_attempt(user, identifier, attempt_id, preference_id, in
         cursor.execute(
             "UPDATE credit_retry_attempt SET preference_id = %s WHERE order_id = %s AND attempt_id = %s",
             [preference_id, identifier, attempt_id],
+        )
+        cursor.execute(
+            "UPDATE coupon_checkout_reservation SET init_point = %s, "
+            "updated_at = CURRENT_TIMESTAMP WHERE order_id = %s",
+            [init_point, identifier],
         )
         if not order_updated:
             return CheckoutPayload(
@@ -599,6 +1064,23 @@ def confirm_payment(info, order_id, payment_id):
                         [identifier],
                     )
                     stocks = dict(cursor.fetchall())
+                    coupon_retry_error = _rereserve_released_coupon(
+                        cursor, identifier, timezone.now()
+                    )
+                    if coupon_retry_error:
+                        cursor.execute(
+                            "INSERT INTO credit_payment_review (order_id, payment_id) "
+                            "VALUES (%s, %s) ON CONFLICT (order_id, payment_id) DO NOTHING",
+                            [identifier, str(payment_id)],
+                        )
+                        return ConfirmPaymentPayload(
+                            user_errors=[
+                                _error(
+                                    "PAYMENT_REQUIRES_REVIEW",
+                                    "Approved payment requires manual review.",
+                                )
+                            ]
+                        )
                     if any(
                         stocks.get(bgg_id, -1) < quantity for bgg_id, quantity in lines
                     ):
@@ -620,6 +1102,7 @@ def confirm_payment(info, order_id, payment_id):
                                 "WHERE bgg_id = %s",
                                 [quantity, bgg_id],
                             )
+                            record_catalog_event(cursor, "stock.changed", bgg_id)
                         now = timezone.now()
                         cursor.execute(
                             "UPDATE purchase_order SET status = %s, mp_payment_id = %s, "
@@ -666,12 +1149,22 @@ def confirm_payment(info, order_id, payment_id):
                             identifier,
                         ],
                     )
+                    _release_coupon_reservation(cursor, identifier)
+                elif status in ("cancelled", "canceled"):
+                    cursor.execute(
+                        "UPDATE purchase_order SET status = %s, mp_payment_id = %s, "
+                        "payment_status = %s, payment_status_detail = %s WHERE id = %s",
+                        ["cancelled", str(payment_id), status, detail or status, identifier],
+                    )
+                    _release_coupon_reservation(cursor, identifier)
                 else:
                     cursor.execute(
                         "UPDATE purchase_order SET payment_status = %s, "
                         "payment_status_detail = %s, mp_payment_id = %s WHERE id = %s",
                         [status, detail, str(payment_id), identifier],
                     )
+            if status == "approved":
+                _set_coupon_reservation_state(cursor, identifier, "CONSUMED")
             if status == "approved" and preference_id == order["mp_preference_id"]:
                 cursor.execute(
                     "DELETE FROM credit_retry_attempt WHERE order_id = %s AND preference_id = %s",
@@ -687,12 +1180,19 @@ class CheckoutMutation(graphene.Mutation):
         shipping_mode = ShippingMode(required=True)
         address = ShippingAddressInput()
         cart_id = graphene.ID()
+        coupon_code = graphene.String()
+        checkout_key = graphene.String()
 
     Output = CheckoutPayload
 
     @staticmethod
-    def mutate(_root, info, shipping_mode, address=None, cart_id=None):
-        return checkout(info, shipping_mode, address, cart_id)
+    def mutate(
+        _root, info, shipping_mode, address=None, cart_id=None,
+        coupon_code=None, checkout_key=None,
+    ):
+        return checkout(
+            info, shipping_mode, address, cart_id, coupon_code, checkout_key
+        )
 
 
 class RetryPaymentMutation(graphene.Mutation):

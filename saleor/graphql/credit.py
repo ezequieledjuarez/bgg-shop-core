@@ -13,6 +13,7 @@ from django.conf import settings
 from django.db import connection, transaction
 from django.utils import timezone
 
+from saleor.catalog_events import record_catalog_event
 from .orders import (
     OrderUserError, PurchaseOrder, ShippingAddressInput, ShippingMode,
     _ADDRESS_LIMITS, _load_order, _order_payload,
@@ -226,6 +227,7 @@ def _checkout_purchase(cursor, user, mode, address, cart, total, remaining):
         )
         cursor.execute("UPDATE product_boardgame SET quantity = quantity - %s WHERE bgg_id = %s",
                        [quantity, bgg_id])
+        record_catalog_event(cursor, "stock.changed", bgg_id)
     cursor.execute(
         "INSERT INTO credit_transaction (user_id, order_id, amount, currency) "
         "VALUES (%s, %s, %s, %s) RETURNING id", [user.pk, order_id, total, "ARS"]

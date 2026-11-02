@@ -1,6 +1,6 @@
 # Core Functional Specification: Product Detail and Reviews (As-Built)
 
-**Status**: As-built, retrospective
+**Status**: Closed and validated with scope limitations on 2026-10-30; see the [canonical closure](../../../specs/003-product-detail-reviews-as-built/spec.md).
 **Canonical use case**: [CU-C03 — Product Detail and Reviews](../../../specs/003-product-detail-reviews-as-built/spec.md)
 
 ## Problem and objective
@@ -24,10 +24,10 @@ Core supplies product detail and review data for the end-to-end CU-C03 flow. It 
 ## Limitations and exclusions
 
 - Core provides no moderation/approval operation or administrative workflow. Approved review publication depends on review records already having approved status.
-- Product-detail resolution is implemented, but the current Core tests do not directly exercise its approved-review result; the product tests focus on catalog listing. Review-creation tests use mocked authentication/database interactions rather than a live database.
+- Core product tests exercise the approved-review query and aggregation with a mocked cursor. Review-creation unit tests use mocks; a separate authenticated browser/GraphQL run used disposable PostgreSQL as documented in [tasks.md](./tasks.md).
 - Wishlist, manuals/rules, and buyer-facing review presentation are outside Core's evidenced responsibilities.
 
 ## Evidence
 
 - Contract and implementation: [GraphQL SDL](../schema.graphql), [product and review resolvers](../../saleor/graphql/api.py).
-- Tests: [Core product GraphQL tests](../../tests/test_graphql_products.py), [Core review GraphQL tests](../../tests/test_graphql_reviews.py).
+- Tests: [Core product GraphQL tests](../../tests/test_graphql_products.py), [Core review GraphQL tests](../../tests/test_graphql_reviews.py); persistence source: [review DDL](../../../import_catalog.sql).

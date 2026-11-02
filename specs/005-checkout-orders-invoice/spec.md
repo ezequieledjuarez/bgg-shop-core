@@ -1,6 +1,6 @@
 # Core Functional Specification: Checkout, Orders, and Invoice (As-Built)
 
-**Status**: As-built, retrospective
+**Status**: Closed for the local, non-production scope with an accepted exception on 2026-10-30; see the [canonical spec](../../../specs/005-checkout-orders-invoice-as-built/spec.md).
 **Canonical use case**: [CU-C05 — Checkout, Orders, and Invoice](../../../specs/005-checkout-orders-invoice-as-built/spec.md)
 
 ## Problem and objective

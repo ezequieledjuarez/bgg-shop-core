@@ -75,6 +75,7 @@ INSTALLED_APPS = [
     # Dominio de Saleor Core (Módulos activos)
     "saleor.graphql",
     "saleor.promotions",
+    "saleor.catalog_events",
     # Operations & Keys app for short-lived op sessions
     "opkeys",
 ]
@@ -115,6 +116,17 @@ DATABASES = {
 CELERY_BROKER_URL = env("CELERY_BROKER_URL", default="redis://redis:6379/1")
 CELERY_RESULT_BACKEND = env("REDIS_URL", default="redis://redis:6379/0")
 CELERY_TIMEZONE = "UTC"
+CELERY_ENABLE_UTC = True
+CELERY_BEAT_SCHEDULE = {
+    "dispatch-catalog-events": {
+        "task": "saleor.catalog_events.tasks.dispatch_due_catalog_events",
+        "schedule": 5.0,
+    },
+}
+CATALOG_EVENTS_BFF_URL = env(
+    "CATALOG_EVENTS_BFF_URL",
+    default="http://bff:5000/internal/v1/catalog-events",
+)
 
 # ==============================================================================
 # 8. MOTOR DE GRAPHQL (Graphene)
@@ -140,4 +152,8 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 # Feature flags and secrets for OpKeys
 OPKEYS_ISSUE_ON_LOGIN = env.bool("OPKEYS_ISSUE_ON_LOGIN", default=False)
 # Secret header value required by internal endpoints (BFF -> Core)
-OPKEY_INTERNAL_SECRET = env("OPKEY_INTERNAL_SECRET", default="changeme-internal-secret")
+OPKEY_INTERNAL_SECRET = env("OPKEY_INTERNAL_SECRET", default="")
+CATALOG_EVENTS_HMAC_SECRET = env(
+    "CATALOG_EVENTS_HMAC_SECRET",
+    default=OPKEY_INTERNAL_SECRET,
+)

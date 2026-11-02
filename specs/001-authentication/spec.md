@@ -1,6 +1,6 @@
 # Core Functional Specification: Customer Authentication (As-Built)
 
-**Status**: As-built, retrospective
+**Status**: Closed and validated with exceptions on 2026-10-30, with owner approval.
 **Canonical use case**: [CU-C01 — Customer Authentication](../../../specs/001-authentication-as-built/spec.md)
 
 ## Problem and objective
@@ -23,11 +23,13 @@ The `User`, `AuthToken`, and `UserError` payload types define returned identity,
 
 ## Limitations and exclusions
 
-- Core exposes no logout or token-revocation operation. CU-C01 local browser logout is outside this layer.
-- Registration does not automatically issue tokens. Password recovery, email confirmation, social login, refresh-token rotation/revocation, and server-side logout are not evidenced as implemented here.
+- Core exposes no JWT logout or token-revocation operation in CU-C01. Internal OpKey revocation is implemented separately in the [OpKey specification](../008-operations-keys-auth/spec.md).
+- Registration does not automatically issue tokens. Password recovery, email confirmation, social login, and JWT refresh-token revocation are not evidenced as implemented here.
 - Core tests verify schema fields and absence of a password field; the existing authentication tests do not exercise registration or credential authentication against a database.
+- The owner accepted closure without live verification of the guest-cart merge. The focused merge test uses mocks; the live merge is not represented as passed.
 
 ## Evidence
 
 - Contract and implementation: [GraphQL SDL](../schema.graphql), [Core GraphQL implementation](../../saleor/graphql/api.py).
 - Tests: [Core authentication schema tests](../../tests/test_graphql_auth.py); login's guest-cart handoff is covered in [Core cart tests](../../tests/test_graphql_cart.py).
+- On 2026-10-30, the authentication schema tests and mocked login guest-cart handoff passed 3 tests with one warning. This does not verify the complete merge against a live database.

@@ -3,7 +3,7 @@
 **Input**: [spec.md](spec.md), [Core SDL](../schema.graphql), and [CU-C01 ODD record](../../../odd/tasks/cu-c01-layered-bff.md)
 **Prerequisites**: [plan.md](plan.md), [spec.md](spec.md)
 
-**Status**: Retrospective/as-built. Every task is checked; Core-specific verification not reported in the CU-C01 ODD record is marked pending verification.
+**Status**: Closed and validated with exceptions on 2026-10-30, with owner approval. The live guest-cart merge remains unverified.
 
 ## Format: `[ID] [P?] [Story] Description`
 
@@ -27,4 +27,6 @@
 
 ## Implementation Strategy
 
-As-built Core scope only. The ODD record for CU-C01 is about BFF layering and does not report a Core test command, pass count, or Core commit; those items remain pending verification rather than being filled from another source.
+As-built Core scope only. The ODD record for CU-C01 is about BFF layering and does not report a historical Core test command, pass count, or Core commit; those historical items remain unverified. The later focused check below is separate evidence.
+
+On 2026-10-30, `python -m pytest -q -p no:cacheprovider tests/test_graphql_auth.py tests/test_graphql_cart.py::test_login_merges_guest_cart_only_after_account_authentication --tb=short` passed 3 tests with one warning. The merge test uses mocks and does not verify live PostgreSQL behavior.

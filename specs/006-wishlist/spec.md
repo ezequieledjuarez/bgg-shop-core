@@ -1,5 +1,7 @@
 # CU-C06 Wishlist
 
+**Status**: Closed for the local scope with limitations on 2026-10-30; see the [canonical spec](../../../specs/006-wishlist-as-built/spec.md).
+
 ## Core contract
 
 `ProductDetail` exposes the public BoardGameGeek product identifier as
@@ -7,10 +9,15 @@
 response so the Frontend can add the product to Wishlist from either catalog
 navigation or a direct detail route.
 
-Core stores Wishlist membership in `wishlist_entry`, keyed by the authenticated
-user and product. The composite primary key prevents duplicate entries, and
-foreign keys cascade when a user or catalog product is deleted. Apply this
-additive DDL from the repository-level `import_catalog.sql`.
+Core expects Wishlist membership in `wishlist_entry`, keyed by the authenticated
+user and product. The DDL in [import_catalog.sql](../../../import_catalog.sql)
+defines a composite primary key and foreign keys that cascade when a user or
+product is deleted. Its creation, repeated application, duplicate handling,
+foreign keys, and cascades were checked on disposable PostgreSQL on 2026-10-30.
+It has not been applied to the active database; `IF NOT EXISTS` does not repair
+an existing table with different constraints. On 2026-10-30, the authenticated
+save and purchase cleanup passed in [browser E2E](../../../bgg-shop-frontend/tests/e2e/cart-wishlist-purchase.spec.ts)
+against disposable PostgreSQL, with the payment provider simulated.
 
 The GraphQL API exposes:
 

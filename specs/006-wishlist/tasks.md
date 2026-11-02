@@ -3,7 +3,7 @@
 **Input**: [spec.md](spec.md), [Core SDL](../schema.graphql), and [CU-C06 ODD record](../../../odd/tasks/cu-c06-wishlist.md)
 **Prerequisites**: [plan.md](plan.md), [spec.md](spec.md)
 
-**Status**: Retrospective/as-built. All implementation tasks are checked; live PostgreSQL DDL/application is pending verification.
+**Status**: Closed for the local scope with limitations on 2026-10-30; DDL and authenticated purchase flow were checked in disposable PostgreSQL with simulated payment. Active database application remains pending.
 
 ## Format: `[ID] [P?] [Story] Description`
 
@@ -28,7 +28,10 @@
 - [x] T006 [US1] Record Core Wishlist/order focused tests — 29 passed — and Core full suite — 60 passed; one existing Django `USE_TZ` warning was reported.
 - [x] T007 [US1] Record ProductDetail identity follow-up: focused product tests — 6 passed; full Core suite — 61 passed; SDL drift check — 1 passed.
 - [x] T008 [US1] Record Core ODD work-unit commits `f089a72` (Wishlist) and `27d7e2d` (ProductDetail identity).
-- [x] T009 [US1] Record live PostgreSQL DDL/application and live authenticated Wishlist/purchase-confirmation flow as pending verification.
+- [x] T009 [US1] Record that live PostgreSQL DDL/application and authenticated Wishlist/purchase-confirmation flow were pending in the historical record; see T010 and T012 for later isolated verification.
+- [x] T010 [US1] Restore `wishlist_entry` DDL in [import_catalog.sql](../../../import_catalog.sql). On 2026-10-30, disposable PostgreSQL verified repeated creation, duplicate handling, foreign keys, and cascades; it was not applied to the active database.
+- [x] T011 [US1] Correct the schema test in [tests/test_graphql_wishlist.py](../../tests/test_graphql_wishlist.py) to check Wishlist arguments without rejecting unrelated administrative `userId` arguments. The focused Core cart/order/Wishlist command passed 95 tests with one warning on 2026-10-30.
+- [x] T012 [US1] Verify authenticated Wishlist save and purchased-item cleanup in [browser E2E](../../../bgg-shop-frontend/tests/e2e/cart-wishlist-purchase.spec.ts) against disposable PostgreSQL with simulated payment. The E2E passed twice on 2026-10-30; the [Core PostgreSQL file](../../tests/test_graphql_credit_postgres.py) passed 99 tests, including owner-scoped cleanup.
 
 ## Dependencies & Execution Order
 

@@ -141,7 +141,10 @@ def test_wishlist_operations_are_exposed_without_client_user_id():
     assert "myWishlist: [Product!]!" in document
     assert "addToWishlist(bggId: Int!): Product!" in document
     assert "removeFromWishlist(bggId: Int!): Product!" in document
-    assert "userId" not in document
+    graphql_schema = schema.graphql_schema
+    assert set(graphql_schema.query_type.fields["myWishlist"].args) == set()
+    assert set(graphql_schema.mutation_type.fields["addToWishlist"].args) == {"bggId"}
+    assert set(graphql_schema.mutation_type.fields["removeFromWishlist"].args) == {"bggId"}
 
 
 def test_wishlist_uses_the_verified_access_token_owner(wishlist_database):

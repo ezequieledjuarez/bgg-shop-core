@@ -2,6 +2,7 @@
 import datetime
 import os
 import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import django
@@ -14,6 +15,7 @@ django.setup()
 
 from django.conf import settings
 from django.db import IntegrityError
+from django.test import RequestFactory
 
 from saleor.graphql import api
 from saleor.graphql.api import schema
@@ -127,8 +129,7 @@ def _token(token_type, user_id=7):
 
 @pytest.mark.parametrize("header", ["", "Basic abc", "Bearer not-a-jwt"])
 def test_authenticated_user_rejects_missing_or_malformed_header(header):
-    info = MagicMock()
-    info.context.headers = {"Authorization": header}
+    info = SimpleNamespace(context=RequestFactory().get("/graphql/", HTTP_AUTHORIZATION=header))
     assert api._authenticated_user(info) is None
 
 

@@ -3,7 +3,7 @@
 **Input**: [spec.md](spec.md), [Core SDL](../schema.graphql), and [CU-C04 ODD record](../../../odd/tasks/cu-c04-shopping-cart.md)
 **Prerequisites**: [plan.md](plan.md), [spec.md](spec.md)
 
-**Status**: Retrospective/as-built. All tasks are checked. PostgreSQL DDL execution and live merge checks remain pending where stated in the ODD record.
+**Status**: Closed for the local scope with limitations on 2026-10-30. Isolated PostgreSQL and browser merge checks passed; full clean-database bootstrap remains unverified.
 
 ## Format: `[ID] [P?] [Story] Description`
 
@@ -24,8 +24,9 @@
 **Purpose**: Preserve exactly the verification evidence and outstanding checks in the ODD record.
 
 - [x] T004 [US1] Record focused Core tests — 12 passed — and full Core suite — 31 passed; both reported one existing Django `USE_TZ` deprecation warning.
-- [x] T005 [US1] Record that Core DDL/bootstrap was inspected but not executed against PostgreSQL; database-backed persistence verification remains pending.
+- [x] T005 [US1] Record that Core DDL/bootstrap had been inspected but not executed against PostgreSQL in the historical ODD record; see T007 for later isolated verification.
 - [x] T006 [US1] Record that guest-to-account merge was not live-verified; the ODD record reports automated merge coverage only.
+- [x] T007 [US1] Verify merge in isolated PostgreSQL with an existing account cart in [tests/test_graphql_credit_postgres.py](../../tests/test_graphql_credit_postgres.py), and through login in [the browser E2E](../../../bgg-shop-frontend/tests/e2e/cart-wishlist-purchase.spec.ts). The PostgreSQL file passed 99 tests; the browser flow passed twice with simulated payment.
 
 ## Dependencies & Execution Order
 

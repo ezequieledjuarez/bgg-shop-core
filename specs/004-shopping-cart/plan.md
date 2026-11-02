@@ -47,4 +47,4 @@ tests/test_graphql_products.py
 
 ## Complexity Tracking
 
-No separate cart repository layer is reported. PostgreSQL DDL/bootstrap execution and live guest-to-account merge remain pending; they are not inferred from mocked SQL tests.
+No separate cart repository layer is reported. The [isolated local flow](../../../odd/tasks/cart-checkout-wishlist-validation.md) later verified guest merge and selected DDL in disposable PostgreSQL; full clean-database bootstrap remains unverified.
