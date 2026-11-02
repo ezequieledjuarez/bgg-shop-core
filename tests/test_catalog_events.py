@@ -57,6 +57,7 @@ def _promotion_row(identifier=11):
         None,
         UTC_NOW,
         True,
+        None,
     )
 
 
@@ -175,7 +176,9 @@ def test_promotion_create_and_update_write_events(api_database):
         None,
         None,
         "11",
-        SimpleNamespace(name=None, discount_percent=None, active=False),
+        api.UpdatePromotionInput._meta.container(
+            {"name": None, "discount_percent": None, "active": False}
+        ),
     )
     assert updated.promotion.id == 11
     record_event.assert_called_once_with(cursor, "promotion.changed", 11)
