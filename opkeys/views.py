@@ -1,15 +1,31 @@
 import json
+import hashlib
+import logging
+from functools import wraps
 from django.http import JsonResponse, HttpResponseBadRequest
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
 from django.utils import timezone
 from django.shortcuts import get_object_or_404
 
-from .models import OpSession
-from .utils import key_hash
-from .utils import generate_raw_key, default_expiry
+from .models import OpKeyAudit, OpSession
+from .utils import has_internal_secret, key_hash
+from .utils import generate_raw_key, default_expiry, utc_isoformat
 from django.utils import timezone
 from django.conf import settings
+from django.db import DatabaseError, transaction
+
+logger = logging.getLogger(__name__)
+
+
+def require_internal_secret(view):
+    @wraps(view)
+    def guarded(request, *args, **kwargs):
+        if not has_internal_secret(request):
+            return JsonResponse({"valid": False, "reason": "forbidden"}, status=403)
+        return view(request, *args, **kwargs)
+
+    return guarded
 
 
 def _normalize_op(method: str, path: str) -> str:
@@ -22,6 +38,7 @@ def _normalize_op(method: str, path: str) -> str:
 
 @csrf_exempt
 @require_POST
+@require_internal_secret
 def op_validate(request):
     try:
         payload = json.loads(request.body.decode("utf-8"))
@@ -31,11 +48,6 @@ def op_validate(request):
     raw_key = payload.get("op_key")
     path = payload.get("path")
     method = payload.get("method", "GET")
-
-    # Security: require internal secret header to be present and correct
-    secret = request.headers.get("X-Internal-Secret") or request.META.get("HTTP_X_INTERNAL_SECRET")
-    if not secret or secret != getattr(settings, "OPKEY_INTERNAL_SECRET", None):
-        return JsonResponse({"valid": False, "reason": "forbidden"}, status=403)
 
     if not raw_key or not path:
         return HttpResponseBadRequest("missing fields")
@@ -47,7 +59,29 @@ def op_validate(request):
         return JsonResponse({"valid": False})
 
     if not session.is_valid():
+        if not session.revoked:
+            try:
+                with transaction.atomic(using=OpSession.objects.db):
+                    session = OpSession.objects.select_for_update().get(pk=session.pk)
+                    if not session.revoked and session.is_expired() and not OpKeyAudit.objects.filter(
+                        session_id=session.pk, action="EXPIRED"
+                    ).exists():
+                        OpKeyAudit.objects.create(
+                            session_id=session.pk, subject_user_id=session.user_id,
+                            actor_user_id=session.user_id, actor_source="KEY_HOLDER", action="EXPIRED",
+                        )
+            except DatabaseError:
+                logger.error("OpKey expiration could not be recorded")
+                return JsonResponse({"error": "Operation key expiration could not be confirmed"}, status=503)
+        reason = "revoked" if session.revoked else "expiry"
+        reference = hashlib.sha256(h.encode("utf-8")).hexdigest()[:16]
+        logger.info("OpKey validation denied reason=%s reference=%s", reason, reference)
         return JsonResponse({"valid": False, "reason": "expired_or_revoked"})
+
+    if path.split("?")[0].startswith("/api/v1/admin/"):
+        user = session.user if session.user_id else None
+        if not user or not user.is_active or not (user.is_staff or user.is_superuser):
+            return JsonResponse({"valid": False, "reason": "op_not_allowed"})
 
     op = _normalize_op(method, path)
     # Check exact match or prefix match
@@ -74,13 +108,14 @@ def op_validate(request):
             "session_id": str(session.id),
             "user_id": session.user_id,
             "ops": session.ops,
-            "expires_at": session.expires_at.isoformat() if session.expires_at else None,
+            "expires_at": utc_isoformat(session.expires_at),
         }
     )
 
 
 @csrf_exempt
 @require_POST
+@require_internal_secret
 def op_revoke(request):
     try:
         payload = json.loads(request.body.decode("utf-8"))
@@ -89,23 +124,47 @@ def op_revoke(request):
 
     session_id = payload.get("session_id")
     op_key = payload.get("op_key")
+    reason = payload.get("reason", "manual")
 
     if not session_id and not op_key:
         return HttpResponseBadRequest("provide session_id or op_key")
+    if reason not in ("logout", "manual"):
+        return HttpResponseBadRequest("invalid reason")
 
     if op_key:
         h = key_hash(op_key)
         qs = OpSession.objects.filter(key_hash=h)
+        reference = hashlib.sha256(h.encode("utf-8")).hexdigest()[:16]
     else:
         qs = OpSession.objects.filter(id=session_id)
+        reference = hashlib.sha256(str(session_id).encode("utf-8")).hexdigest()[:16]
 
-    updated = qs.update(revoked=True)
+    try:
+        with transaction.atomic(using=OpSession.objects.db):
+            updated = 0
+            for session in qs.select_for_update():
+                if session.revoked:
+                    continue
+                session.revoked = True
+                session.save(update_fields=["revoked"])
+                OpKeyAudit.objects.create(
+                    session_id=session.id, subject_user_id=session.user_id,
+                    actor_user_id=session.user_id if reason == "logout" else None,
+                    actor_source="KEY_HOLDER" if reason == "logout" else "INTERNAL_SERVICE",
+                    action="LOGOUT" if reason == "logout" else "REVOKE",
+                )
+                updated += 1
+    except DatabaseError:
+        logger.error("OpKey revocation could not be recorded")
+        return JsonResponse({"error": "Operation key revocation could not be confirmed"}, status=503)
+    logger.info("OpKey revocation reason=%s reference=%s affected=%s", reason, reference, updated)
 
     return JsonResponse({"revoked": updated})
 
 
 @csrf_exempt
 @require_POST
+@require_internal_secret
 def op_create(request):
     """Create an OpSession and return the raw key once.
 
@@ -133,15 +192,26 @@ def op_create(request):
     else:
         expires_dt = default_expiry()
 
-    sess = OpSession.objects.create(
-        user_id=user_id,
-        key_hash=h,
-        ops=ops,
-        expires_at=expires_dt,
-    )
+    try:
+        with transaction.atomic(using=OpSession.objects.db):
+            sess = OpSession.objects.create(
+                user_id=user_id,
+                key_hash=h,
+                ops=ops,
+                expires_at=expires_dt,
+            )
+            OpKeyAudit.objects.create(
+                session_id=sess.id, subject_user_id=sess.user_id, actor_user_id=None,
+                actor_source="INTERNAL_SERVICE", action="ISSUE",
+            )
+    except DatabaseError:
+        logger.error("OpKey issuance could not be recorded")
+        return JsonResponse({"error": "Operation key issuance could not be confirmed"}, status=503)
 
-    return JsonResponse({
+    response = JsonResponse({
         "raw_key": raw,
         "session_id": str(sess.id),
-        "expires_at": sess.expires_at.isoformat() if sess.expires_at else None,
+        "expires_at": utc_isoformat(sess.expires_at),
     })
+    response["Cache-Control"] = "no-store"
+    return response

@@ -33,7 +33,7 @@ class Migration(migrations.Migration):
                 (
                     "promotion",
                     models.ForeignKey(
-                        to="saleor.promotions.Promotion",
+                        to="promotions.Promotion",
                         null=True,
                         blank=True,
                         on_delete=models.SET_NULL,
@@ -51,7 +51,7 @@ class Migration(migrations.Migration):
                 (
                     "coupon",
                     models.OneToOneField(
-                        to="saleor.promotions.Coupon",
+                        to="promotions.Coupon",
                         on_delete=models.CASCADE,
                         primary_key=True,
                         serialize=False,

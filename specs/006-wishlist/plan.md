@@ -50,7 +50,7 @@ tests/test_graphql_products.py
 
 ## Complexity Tracking
 
-No new abstraction framework is recorded. Live PostgreSQL DDL/application and full authenticated live-flow verification remain pending, as reported in the ODD record.
+No new abstraction framework is recorded. The [isolated local flow](../../../odd/tasks/cart-checkout-wishlist-validation.md) later verified Wishlist DDL and authenticated purchase cleanup in disposable PostgreSQL with simulated payment. Application to the active database remains pending authorization.
 
 ## Delegación a agentes
 

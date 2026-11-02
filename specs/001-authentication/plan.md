@@ -3,6 +3,8 @@
 **Branch**: `CU-06-wishlist` | **Date**: 2026-10-21 | **Spec**: [spec.md](spec.md)
 **Input**: Core authentication specification in [spec.md](spec.md)
 
+**Status**: Closed and validated with exceptions on 2026-10-30; the live guest-cart merge remains unverified as accepted by the owner.
+
 ## Summary
 
 Retrospective plan for the Core portion of CU-C01. The Core exposes GraphQL registration and login using Django's built-in user model, normalizes email for identity lookup, hashes passwords through Django user creation, and issues signed access/refresh tokens on successful login. The reference contract is [specs/schema.graphql](../schema.graphql); browser session handling and logout presentation are outside this service.
@@ -16,7 +18,7 @@ Retrospective plan for the Core portion of CU-C01. The Core exposes GraphQL regi
 **Target Platform**: Linux server  
 **Project Type**: Django/Graphene web service  
 **Performance Goals**: Not specified in the retrospective source; pending verification.  
-**Constraints**: Do not expose passwords or password hashes; registration does not create a session; invalid credentials use a generic public error; no server-side logout or refresh-token revocation is evidenced.  
+**Constraints**: Do not expose passwords or password hashes; registration does not create a session; invalid credentials use a generic public error; JWT revocation is not implemented. Internal OpKey revocation belongs to [feature 008](../008-operations-keys-auth/spec.md).
 **Scale/Scope**: GraphQL register/login operations and their public schema.
 
 ## Constitution Check

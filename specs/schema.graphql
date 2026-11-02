@@ -8,6 +8,7 @@ type Product {
   minAge: Int!
   weight: Float!
   category: [String!]!
+  """The stored base price is strictly greater than zero."""
   price: Float!
   publisher: String!
   imageUrl: String!
@@ -139,6 +140,7 @@ type ProductDetail {
   minAge: Int!
   weight: Float!
   category: [String!]!
+  """Positive base price."""
   price: Float!
   publisher: String!
   imageUrl: String!
@@ -176,8 +178,14 @@ type CartPayload {
 type Promotion {
   id: ID!
   name: String!
+  """Manual activation state, independent of validity dates; admin changes require an active staff or superuser account."""
+  active: Boolean!
+  """Store promotions do not stack; an eligible product-specific offer wins over global offers, otherwise the highest eligible global percentage applies. Coupon-linked promotion rows are coupon offers, not global store promotions."""
   stackable: Boolean!
+  """Percentage discount from zero through 50, inclusive; at most one active promotion may target a product."""
   discountPct: Float!
+  """BGG identifier of the product this promotion applies to; null means a global store offer. An eligible product-specific offer wins for its product; otherwise the highest eligible global percentage applies. Store promotions do not stack, and coupon-linked rows are excluded from store offers."""
+  productBggId: Int
   startsAt: String
   endsAt: String
   createdAt: String!
@@ -185,10 +193,76 @@ type Promotion {
 
 type Coupon {
   id: ID!
+  """Unique by exact, case-sensitive equality; code is not normalized."""
   code: String!
   promotion: Promotion
+  """Number of uses remaining; never negative."""
   remaining: BigInt!
+  active: Boolean!
+  """UTC validity start, inclusive."""
+  startsAt: String
+  """UTC validity end, exclusive; when both boundaries exist, startsAt precedes endsAt."""
+  endsAt: String
   createdAt: String!
+}
+
+"""
+Redacted administrative change record. `before` and `after` are JSON objects (or null when absent). Values under keys naming credentials, tokens, passwords, secrets, authorization data, or payment/card data are replaced with "[REDACTED]" before the record is returned.
+"""
+type AdminAuditRecord {
+  id: BigInt!
+  actorId: String
+  action: String!
+  entityType: String
+  entityId: String
+  createdAt: String!
+  before: JSONString
+  after: JSONString
+}
+
+"""One page of audit records ordered by createdAt DESC, id DESC."""
+type AdminAuditPage {
+  records: [AdminAuditRecord!]!
+  nextCursor: String
+}
+
+"""Admin representation of a coupon; the discount is flattened from its product-less promotion."""
+type AdminCoupon {
+  id: Int!
+  code: String!
+  discountPercent: Float!
+  remaining: BigInt!
+  active: Boolean!
+  startsAt: String
+  endsAt: String
+  createdAt: String!
+}
+
+type AdminCouponPayload {
+  coupon: AdminCoupon
+  userErrors: [UserError!]!
+}
+
+"""
+Read-only estimate for the authenticated user's current cart. The estimate
+does not reserve or consume a use. A discount above 50% of the undiscounted
+cart subtotal is rejected, not capped. Preserve decimal precision while
+calculating each alternative, then round each total upward once to whole
+pesos. Select the greater saving; ties favor the store promotion.
+"""
+type CouponPreview {
+  valid: Boolean!
+  couponCode: String!
+  discountAmount: Float!
+  newTotal: Float!
+  """Null when the coupon is eligible for the current cart."""
+  reason: String
+}
+
+type AvailableCoupon {
+  code: String!
+  startsAt: String!
+  endsAt: String!
 }
 
 type StockReservation {
@@ -200,10 +274,33 @@ type StockReservation {
   createdAt: String!
 }
 
+type OperationSession {
+  id: ID!
+  userId: ID
+  ops: [String!]!
+  issuedAt: String!
+  expiresAt: String
+  lastUsed: String
+  revoked: Boolean!
+}
+
+type OperationSessionPage {
+  items: [OperationSession!]!
+  hasNext: Boolean!
+  userErrors: [OrderUserError!]!
+}
+
+type ManageOperationSessionPayload {
+  success: Boolean!
+  userErrors: [OrderUserError!]!
+}
+
 type Query {
   hello: String
   me: User
   productBySlug(slug: String!): ProductDetail
+  productByBggId(bggId: Int!): ProductDetail
+  productCategories: [String!]!
   products(
     page: Int = 1
     # Default pageSize changed from 20 to 50 to align BFF defaults and admin UX requirements
@@ -213,6 +310,7 @@ type Query {
     minPlayers: Int
     maxPlayers: Int
     categoryId: Int
+    categoryName: String
     priceMin: Float
     priceMax: Float
   ): ProductPage
@@ -222,14 +320,40 @@ type Query {
   myOrder(id: ID!): PurchaseOrder
   """Returns the authenticated buyer's ARS balance, or zero if no credit exists."""
   myCredit: CreditBalancePayload!
+  adminOpSessions(userId: ID, page: Int = 1, pageSize: Int = 50): OperationSessionPage!
   adminPaymentReviews(page: Int = 1, pageSize: Int = 50): PaymentReviewPage!
   adminPaymentAttempts(page: Int = 1, pageSize: Int = 50): PaymentAttemptPage!
   adminPaymentAttemptObservations(attemptId: ID!, page: Int = 1, pageSize: Int = 50): PaymentAttemptObservationPage!
   adminPaymentAttemptRelease(attemptId: ID!): PaymentAttemptReleasePayload!
+  """Requires an active staff or superuser account; an unknown UUID does not prove rejection."""
+  adminStockMovementStatus(movementId: ID!): StockMovementStatusPayload!
+  """Requires an active staff or superuser account. Lists global and product-specific store promotions but excludes coupon-linked promotion rows. For each product, an eligible specific offer wins over global offers; otherwise the highest eligible global percentage applies. Store promotions do not stack."""
   promotions: [Promotion!]!
+  """Requires an active staff or superuser account."""
+  adminCoupons: [AdminCoupon!]!
+  """
+  Requires an active staff or superuser account. Optional exact filters by entity type/ID, actor ID and action; createdFrom/createdTo are inclusive timezone-aware date-times normalized to UTC. Ordered by createdAt DESC, id DESC with an opaque signed cursor; limit defaults to 50 (maximum 100). Invalid filters, limits or cursors fail with extensions.code INVALID and extensions.field; authorization failures use UNAUTHENTICATED or FORBIDDEN.
+  """
+  adminAuditLogs(entityType: String, entityId: String, actorId: String, action: String, createdFrom: String, createdTo: String, cursor: String, limit: Int = 50): AdminAuditPage!
   couponByCode(code: String!): Coupon
+  availableCoupons: [AvailableCoupon!]!
+  """Requires an authenticated user; previews the current cart without reserving or consuming a use."""
+  previewCoupon(code: String!): CouponPreview!
   stockReservations(bggId: Int): [StockReservation!]!
 }
+
+enum StockMovementStatus {
+  IN_PROGRESS
+  APPLIED
+  REJECTED
+}
+
+type StockMovementStatusPayload {
+  movementId: ID!
+  status: StockMovementStatus
+  userErrors: [UserError!]!
+}
+
 input RegisterInput {
   email: String!
   password: String!
@@ -347,6 +471,7 @@ type CreditCheckoutPayload {
 type Mutation {
   register(input: RegisterInput!): RegisterPayload!
   login(input: LoginInput!): LoginPayload!
+  manageOpSession(sessionId: ID!, action: String!): ManageOperationSessionPayload!
   addToCart(bggId: Int!, cartId: ID, quantity: Int!): CartPayload!
   updateCartQuantity(bggId: Int!, cartId: ID, quantity: Int!): CartPayload!
   removeFromCart(bggId: Int!, cartId: ID): CartPayload!
@@ -369,20 +494,58 @@ type Mutation {
   with that key conflicts.
   """
   checkoutWithCredit(input: CheckoutWithCreditInput!): CreditCheckoutPayload!
-  checkout(address: ShippingAddressInput, cartId: ID, shippingMode: ShippingMode!): CheckoutPayload!
+  """
+  A supplied coupon is reserved atomically during checkout. Release only after
+  confirmed failure or cancellation; uncertain provider outcomes retain the
+  reservation for reconciliation and unresolved outcomes require manual review.
+  A timeout alone does not release a reservation. Coupon codes are matched by
+  exact, case-sensitive equality, without normalization.
+  Coupon checkouts require checkoutKey. Retrying the same key with the same
+  payload returns the original order; using it for a different payload conflicts.
+  """
+  checkout(address: ShippingAddressInput, cartId: ID, checkoutKey: String, couponCode: String, shippingMode: ShippingMode!): CheckoutPayload!
   retryPayment(orderId: ID!): CheckoutPayload!
   confirmPayment(orderId: ID!, paymentId: ID!): ConfirmPaymentPayload!
   resolvePaymentReview(orderId: ID!, paymentId: ID!, action: String!, reason: String!): ResolvePaymentReviewPayload!
   releasePaymentReview(orderId: ID!, paymentId: ID!, reason: String!): ReleasePaymentReviewPayload!
   recordPaymentAttemptObservation(orderId: ID!, attemptId: ID!, requestId: ID!, statement: String!): RecordPaymentAttemptObservationPayload!
   releasePaymentAttempt(orderId: ID!, attemptId: ID!, observationId: ID!, reason: String!, acknowledgeRisk: Boolean!): PaymentAttemptReleasePayload!
+  """Requires an active staff or superuser account."""
   createProduct(input: CreateProductInput!): CreateProductPayload!
+  """Requires an active staff or superuser account."""
   updateProduct(id: ID!, input: UpdateProductInput!): UpdateProductPayload!
-  adjustVariantStock(productId: ID!, variantId: ID!, newStock: Int!): AdjustVariantStockPayload!
+  # Legacy mutation rejects updates; use adjustProductStock with a UUID.
+  addProductStock(productId: ID!, newStock: Int!): AddProductStockPayload!
+  """
+  UUID-bound stock movement. Retries with the same product, direction and
+  quantity do not duplicate applied work; failed, rejected or no-change
+  operations may retry the exact payload indefinitely. Reusing the UUID with
+  different movement data rejects. OUT over available stock applies partially
+  to zero and reports requested and applied quantities. Requires an active
+  staff or superuser account.
+  """
+  adjustProductStock(productId: ID!, movementId: ID!, direction: StockMovementDirection!, quantity: Int!): AdjustProductStockPayload!
+  """Requires an active staff or superuser account."""
   createPromotion(input: CreatePromotionInput!): CreatePromotionPayload!
+  """Requires an active staff or superuser account."""
   updatePromotion(id: ID!, input: UpdatePromotionInput!): UpdatePromotionPayload!
+  """
+  Requires an active staff or superuser account. Coupon creation and its audit
+  record commit atomically; the percentage is stored on a product-less promotion.
+  """
+  createAdminCoupon(input: AdminCreateCouponInput!): AdminCouponPayload!
+  """
+  Requires an active staff or superuser account. Code is immutable. Coupon
+  updates and their audit records commit atomically; deactivation replaces deletion.
+  """
+  updateAdminCoupon(id: Int!, input: AdminUpdateCouponInput!): AdminCouponPayload!
 }
 
+"""
+Create a product with a positive base price and exactly one .webp image
+reference in imageUrl or imageFileName and a nonnegative initial quantity.
+Product administration requires an active staff or superuser account.
+"""
 input CreateProductInput {
   bggId: Int
   category: [String]
@@ -394,6 +557,7 @@ input CreateProductInput {
   minPlayers: Int
   name: String!
   playingTimeMinutes: Int
+  """Strictly greater than zero."""
   price: Float!
   publisher: String
   quantity: Int!
@@ -401,6 +565,10 @@ input CreateProductInput {
   weight: Float
 }
 
+"""
+Partial product update; BGG ID and quantity are immutable through this input.
+When changing the image, provide exactly one .webp imageUrl or imageFileName.
+"""
 input UpdateProductInput {
   category: [String]
   imageFileName: String
@@ -411,9 +579,9 @@ input UpdateProductInput {
   minPlayers: Int
   name: String
   playingTimeMinutes: Int
+  """Must be strictly greater than zero."""
   price: Float
   publisher: String
-  quantity: Int
   releaseYear: Int
   weight: Float
 }
@@ -428,21 +596,68 @@ type UpdateProductPayload {
   userErrors: [UserError!]!
 }
 
-type AdjustVariantStockPayload {
+type AddProductStockPayload {
   success: Boolean
+  errors: [UserError!]!
+}
+
+enum StockMovementDirection {
+  IN
+  OUT
+}
+
+type AdjustProductStockPayload {
+  movementId: ID!
+  status: StockMovementStatus
+  requestedQuantity: Int
+  appliedQuantity: Int
+  quantityBefore: Int
+  quantityAfter: Int
   errors: [UserError!]!
 }
 
 input CreatePromotionInput {
   active: Boolean!
+  """Percentage discount from zero through 50, inclusive."""
   discountPercent: Float!
   name: String!
+  """Optional product BGG identifier; omitted or null creates a global store offer."""
+  productBggId: Int
+}
+
+input AdminCreateCouponInput {
+  """Exact-case unique code; it is not normalized."""
+  code: String!
+  """Whole-purchase discount percentage from zero through 50, inclusive."""
+  discountPercent: Float!
+  """Remaining uses; must be non-negative."""
+  remaining: BigInt!
+  active: Boolean!
+  """UTC validity start, inclusive; null means no lower bound."""
+  startsAt: String
+  """UTC validity end, exclusive; when both boundaries exist, start precedes end."""
+  endsAt: String
+}
+
+input AdminUpdateCouponInput {
+  """Whole-purchase discount percentage from zero through 50, inclusive."""
+  discountPercent: Float
+  """Remaining uses; must be non-negative."""
+  remaining: BigInt
+  active: Boolean
+  """UTC validity start, inclusive; null clears the lower bound."""
+  startsAt: String
+  """UTC validity end, exclusive; null clears the upper bound."""
+  endsAt: String
 }
 
 input UpdatePromotionInput {
   active: Boolean
+  """Percentage discount from zero through 50, inclusive."""
   discountPercent: Float
   name: String
+  """Optional product BGG identifier; null clears the product link and creates a global store offer."""
+  productBggId: Int
 }
 
 type CreatePromotionPayload {
@@ -488,6 +703,14 @@ type Invoice {
   issuedAt: String!
   total: Float!
 }
+
+"""
+Allows use of a JSON String for input / output from the GraphQL schema.
+
+Use of this type is *not recommended* as you lose the benefits of having a defined, static
+schema (one of the key benefits of GraphQL).
+"""
+scalar JSONString
 
 """
 The `BigInt` scalar type represents non-fractional whole numeric values.

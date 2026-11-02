@@ -1,6 +1,6 @@
 # Core Functional Specification: Shopping Cart (As-Built)
 
-**Status**: As-built, retrospective
+**Status**: Closed for the local scope with limitations on 2026-10-30; see the [canonical spec](../../../specs/004-shopping-cart-as-built/spec.md).
 **Canonical use case**: [CU-C04 — Shopping Cart](../../../specs/004-shopping-cart-as-built/spec.md)
 
 ## Problem and objective

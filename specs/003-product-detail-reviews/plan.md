@@ -2,6 +2,7 @@
 
 **Branch**: `CU-06-wishlist` | **Date**: 2026-10-21 | **Spec**: [spec.md](spec.md)
 **Input**: Core product/review specification in [spec.md](spec.md)
+**Status**: Closed with scope limitations on 2026-10-30; see the [canonical closure](../../../specs/003-product-detail-reviews-as-built/spec.md).
 
 ## Summary
 
@@ -11,7 +12,7 @@ Retrospective plan for Core product detail and review submission. `productBySlug
 
 **Language/Version**: Python (exact runtime version not reported in the CU-C03 ODD record)  
 **Primary Dependencies**: Django, Graphene  
-**Storage**: PostgreSQL product and review records; live parser/database validation is not established by the Core ODD record  
+**Storage**: PostgreSQL product and review records; the review DDL and constraints were later checked in a disposable PostgreSQL instance
 **Testing**: pytest with Django; `tests/test_graphql_products.py` and `tests/test_graphql_reviews.py`  
 **Target Platform**: Linux server  
 **Project Type**: Django/Graphene web service  
@@ -47,4 +48,4 @@ tests/test_graphql_reviews.py
 
 ## Complexity Tracking
 
-No moderation service or new persistence framework is in the delivered Core scope. Live PostgreSQL and parser checks remain pending where not reported as passed in the ODD record.
+No moderation service or new persistence framework is in the delivered Core scope. The DDL-only check and subsequent authenticated GraphQL run against disposable PostgreSQL are recorded separately in [tasks.md](./tasks.md).

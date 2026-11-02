@@ -40,3 +40,14 @@ class OpSession(models.Model):
 
     def __str__(self):
         return f"OpSession({self.id}, user={self.user_id}, revoked={self.revoked})"
+
+class OpKeyAudit(models.Model):
+    session_id = models.UUIDField()
+    subject_user_id = models.BigIntegerField(null=True, blank=True)
+    actor_user_id = models.BigIntegerField(null=True, blank=True)
+    actor_source = models.CharField(max_length=32, default="INTERNAL_SERVICE")
+    action = models.CharField(max_length=32)
+    created_at = models.DateTimeField(default=timezone.now, db_index=True)
+
+    class Meta:
+        db_table = "opkeys_opkeyaudit"

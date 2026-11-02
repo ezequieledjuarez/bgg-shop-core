@@ -3,7 +3,7 @@
 **Input**: [spec.md](spec.md), [Core SDL](../schema.graphql), and [CU-C02 ODD record](../../../odd/tasks/cu-c02-catalog-filtering.md)
 **Prerequisites**: [plan.md](plan.md), [spec.md](spec.md)
 
-**Status**: Retrospective/as-built. All tasks are checked. Verification and limitations below follow the Core CU-C02 ODD record.
+**Status**: Closed with exceptions on 2026-10-30; see the [canonical closure](../../../specs/002-catalog-search-filters-as-built/spec.md). Checked tasks do not imply unreported verification.
 
 ## Format: `[ID] [P?] [Story] Description`
 
@@ -20,6 +20,7 @@
 - [x] T003 [US1] Preserve the fixed ordering and pagination metadata; retain the local three-ID category mapping without adding a migration.
 - [x] T004 [US1] Cover row mapping, pagination, combined filters, and inverted ranges in [tests/test_graphql_products.py](../../tests/test_graphql_products.py).
 - [x] T005 [US1] Record Core verification from the ODD record: `python -m pytest` — 4 passed with one Django `USE_TZ` warning; `python -m compileall -q saleor/graphql tests` — passed. No browser/live end-to-end validation was reported.
+- [x] T006 [US1] Expose product category names and exact name filtering in [GraphQL SDL](../schema.graphql) and [catalog resolver](../../saleor/graphql/api.py), retaining legacy IDs; verify in [Core product tests](../../tests/test_graphql_products.py) and the [BFF contract](../../../bgg-shop-bff/specs/openapi.yaml).
 
 ## Dependencies & Execution Order
 
@@ -28,4 +29,4 @@
 
 ## Implementation Strategy
 
-This is a retrospective record. Relevance ordering is not implemented, Core query ordering remains `ORDER BY id`, and direct live PostgreSQL validation is not claimed.
+On 2026-10-30, `python -m pytest -q tests/test_graphql_products.py` passed (10 tests, one Django warning). The local browser/BFF/Core flow filtered all four categories present in the running local database; all returned products had the selected category. Relevance ordering remains unimplemented and Core query ordering remains `ORDER BY id`.

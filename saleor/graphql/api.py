@@ -1,10 +1,11 @@
 import datetime
 import hashlib
+import json
 import re
 import secrets
 import unicodedata
 import uuid
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 import graphene
 import jwt
@@ -12,15 +13,33 @@ import logging
 from django.db import IntegrityError, connection, transaction
 from graphql import GraphQLError
 
+from saleor.catalog_events import record_catalog_event
 from . import wishlist
 from .credit import (
     CheckoutWithCreditMutation, CreditBalancePayload, RedeemGiftCardMutation,
     _error, balance_for_user,
 )
 from .orders import (
-    CheckoutMutation, ConfirmPaymentMutation, OrderUserError, PurchaseOrder, RetryPaymentMutation,
-    _lock_credit_account,
+    CheckoutMutation, ConfirmPaymentMutation, CouponPreview as BaseCouponPreview,
+    OrderUserError, PurchaseOrder,
+    RetryPaymentMutation, _lock_credit_account, preview_coupon,
 )
+
+
+class CouponPreview(BaseCouponPreview):
+    class Meta:
+        name = "CouponPreview"
+        description = (
+            "Read-only estimate for the authenticated user's current cart. The estimate\n"
+            "does not reserve or consume a use. A discount above 50% of the undiscounted\n"
+            "cart subtotal is rejected, not capped. Preserve decimal precision while\n"
+            "calculating each alternative, then round each total upward once to whole\n"
+            "pesos. Select the greater saving; ties favor the store promotion."
+        )
+
+    reason = graphene.String(
+        description="Null when the coupon is eligible for the current cart."
+    )
 
 
 class Product(graphene.ObjectType):
@@ -33,7 +52,9 @@ class Product(graphene.ObjectType):
     min_age = graphene.Int(required=True)
     weight = graphene.Float(required=True)
     category = graphene.List(graphene.NonNull(graphene.String), required=True)
-    price = graphene.Float(required=True)
+    price = graphene.Float(
+        required=True, description="The stored base price is strictly greater than zero."
+    )
     publisher = graphene.String(required=True)
     image_url = graphene.String(required=True)
     quantity = graphene.Int(required=True)
@@ -68,7 +89,7 @@ class ProductDetail(graphene.ObjectType):
     min_age = graphene.Int(required=True)
     weight = graphene.Float(required=True)
     category = graphene.List(graphene.NonNull(graphene.String), required=True)
-    price = graphene.Float(required=True)
+    price = graphene.Float(required=True, description="Positive base price.")
     publisher = graphene.String(required=True)
     image_url = graphene.String(required=True)
     quantity = graphene.Int(required=True)
@@ -124,19 +145,123 @@ class CreateReviewInput(graphene.InputObjectType):
 class Promotion(graphene.ObjectType):
     id = graphene.ID(required=True)
     name = graphene.String(required=True)
-    stackable = graphene.Boolean(required=True)
-    discount_pct = graphene.Float(required=True)
+    active = graphene.Boolean(
+        required=True,
+        description=(
+            "Manual activation state, independent of validity dates; admin changes "
+            "require an active staff or superuser account."
+        ),
+    )
+    stackable = graphene.Boolean(
+        required=True,
+        description=(
+            "Store promotions do not stack; an eligible product-specific offer "
+            "wins over global offers, otherwise the highest eligible global "
+            "percentage applies. Coupon-linked promotion rows are coupon offers, "
+            "not global store promotions."
+        ),
+    )
+    discount_pct = graphene.Float(
+        required=True,
+        description=(
+            "Percentage discount from zero through 50, inclusive; at most one "
+            "active promotion may target a product."
+        ),
+    )
+    product_bgg_id = graphene.Int(
+        description=(
+            "BGG identifier of the product this promotion applies to; null means a "
+            "global store offer. An eligible product-specific offer wins for its "
+            "product; otherwise the highest eligible global percentage applies. "
+            "Store promotions do not stack, and coupon-linked rows are excluded "
+            "from store offers."
+        )
+    )
     starts_at = graphene.String()
     ends_at = graphene.String()
     created_at = graphene.String(required=True)
 
 
+def _promotion_from_row(row):
+    (
+        identifier, name, stackable, discount, starts_at, ends_at, created_at,
+        active, product_bgg_id,
+    ) = row
+    return Promotion(
+        id=identifier, name=name, stackable=stackable, discount_pct=float(discount), active=active,
+        starts_at=starts_at.isoformat() if starts_at else None,
+        ends_at=ends_at.isoformat() if ends_at else None,
+        created_at=created_at.isoformat() if created_at else None,
+        product_bgg_id=product_bgg_id,
+    )
+
+
 class Coupon(graphene.ObjectType):
     id = graphene.ID(required=True)
-    code = graphene.String(required=True)
+    code = graphene.String(
+        required=True,
+        description="Unique by exact, case-sensitive equality; code is not normalized.",
+    )
     promotion = graphene.Field(Promotion)
-    remaining = graphene.BigInt(required=True)
+    remaining = graphene.BigInt(
+        required=True, description="Number of uses remaining; never negative."
+    )
+    active = graphene.Boolean(required=True)
+    starts_at = graphene.String(description="UTC validity start, inclusive.")
+    ends_at = graphene.String(
+        description=(
+            "UTC validity end, exclusive; when both boundaries exist, startsAt "
+            "precedes endsAt."
+        )
+    )
     created_at = graphene.String(required=True)
+
+
+class AdminCoupon(graphene.ObjectType):
+    class Meta:
+        description = (
+            "Admin representation of a coupon; the discount is flattened from "
+            "its product-less promotion."
+        )
+
+    id = graphene.Int(required=True)
+    code = graphene.String(required=True)
+    discount_percent = graphene.Float(required=True)
+    remaining = graphene.BigInt(required=True)
+    active = graphene.Boolean(required=True)
+    starts_at = graphene.String()
+    ends_at = graphene.String()
+    created_at = graphene.String(required=True)
+
+
+def _admin_coupon_from_row(row):
+    starts_at = _coupon_utc_datetime(row["starts_at"])
+    ends_at = _coupon_utc_datetime(row["ends_at"])
+    created_at = _coupon_utc_datetime(row["created_at"])
+    return AdminCoupon(
+        id=row["id"],
+        code=row["code"],
+        discount_percent=float(row["discount_pct"]),
+        remaining=row["remaining"],
+        active=row["active"],
+        starts_at=starts_at.isoformat() if starts_at else None,
+        ends_at=ends_at.isoformat() if ends_at else None,
+        created_at=created_at.isoformat(),
+    )
+
+
+def _coupon_utc_datetime(value):
+    if value is None:
+        return None
+    if value.utcoffset() is None:
+        return value.replace(tzinfo=datetime.timezone.utc)
+    return value.astimezone(datetime.timezone.utc)
+
+
+class AvailableCoupon(graphene.ObjectType):
+    code = graphene.String(required=True)
+    starts_at = graphene.String(required=True)
+    ends_at = graphene.String(required=True)
 
 
 class StockReservation(graphene.ObjectType):
@@ -186,6 +311,37 @@ def _product_by_slug(cursor, slug):
     return None
 
 
+def _product_by_bgg_id(cursor, bgg_id):
+    cursor.execute(
+        "SELECT bgg_id, name, release_year, min_players, max_players, "
+        "playing_time_minutes, min_age, weight, category, price_amount, "
+        "publisher, image_url, quantity FROM product_boardgame WHERE bgg_id = %s",
+        [bgg_id],
+    )
+    row = cursor.fetchone()
+    return dict(zip((column[0] for column in cursor.description), row)) if row else None
+
+
+def _product_detail(cursor, product):
+    if product is None:
+        return None
+    cursor.execute(
+        "SELECT rating, body, created_at FROM product_review "
+        "WHERE bgg_id = %s AND status = 'APPROVED' ORDER BY created_at DESC",
+        [product["bgg_id"]],
+    )
+    public_reviews = [
+        PublicReview(rating=rating, body=body, created_at=created_at.isoformat())
+        for rating, body, created_at in cursor.fetchall()
+    ]
+    average = sum(review.rating for review in public_reviews) / len(public_reviews) if public_reviews else None
+    return ProductDetail(
+        **_product_from_row(product),
+        review_summary=ReviewSummary(approved_review_count=len(public_reviews), average_rating=average),
+        approved_reviews=public_reviews,
+    )
+
+
 def _review_error(code, message, field=None):
     return ReviewUserError(field=field, code=code, message=message)
 
@@ -196,6 +352,12 @@ def _authenticated_user(info):
 
     request = info.context
     header = request.headers.get("Authorization", "")
+    if not header and getattr(request, "opkey_delegated", False):
+        user = getattr(request, "user", None)
+        if getattr(user, "is_active", False) and (
+            getattr(user, "is_staff", False) or getattr(user, "is_superuser", False)
+        ):
+            return user
     if not header.startswith("Bearer "):
         return None
     token = header[7:].strip()
@@ -493,6 +655,27 @@ def _payment_attempt_release(attempt_id, record, provider_response=None):
         user_errors=[])
 
 
+class OperationSession(graphene.ObjectType):
+    id = graphene.ID(required=True)
+    user_id = graphene.ID()
+    ops = graphene.List(graphene.NonNull(graphene.String), required=True)
+    issued_at = graphene.String(required=True)
+    expires_at = graphene.String()
+    last_used = graphene.String()
+    revoked = graphene.Boolean(required=True)
+
+
+class OperationSessionPage(graphene.ObjectType):
+    items = graphene.List(graphene.NonNull(OperationSession), required=True)
+    has_next = graphene.Boolean(required=True)
+    user_errors = graphene.List(graphene.NonNull(OrderUserError), required=True)
+
+
+class ManageOperationSessionPayload(graphene.ObjectType):
+    success = graphene.Boolean(required=True)
+    user_errors = graphene.List(graphene.NonNull(OrderUserError), required=True)
+
+
 class Query(graphene.ObjectType):
     hello = graphene.String(default_value="Saleor API activa y respondiendo OK")
     me = graphene.Field(lambda: AuthUser)
@@ -500,6 +683,8 @@ class Query(graphene.ObjectType):
         ProductDetail,
         slug=graphene.String(required=True),
     )
+    product_by_bgg_id = graphene.Field(ProductDetail, bgg_id=graphene.Int(required=True))
+    product_categories = graphene.List(graphene.NonNull(graphene.String), required=True)
     products = graphene.Field(
         ProductPage,
         page=graphene.Int(default_value=1),
@@ -509,6 +694,7 @@ class Query(graphene.ObjectType):
         min_players=graphene.Int(),
         max_players=graphene.Int(),
         category_id=graphene.Int(),
+        category_name=graphene.String(),
         price_min=graphene.Float(),
         price_max=graphene.Float(),
     )
@@ -519,6 +705,10 @@ class Query(graphene.ObjectType):
     my_credit = graphene.Field(
         CreditBalancePayload, required=True,
         description="Returns the authenticated buyer's ARS balance, or zero if no credit exists.",
+    )
+    admin_op_sessions = graphene.Field(
+        OperationSessionPage, required=True, user_id=graphene.ID(),
+        page=graphene.Int(default_value=1), page_size=graphene.Int(default_value=50),
     )
     admin_payment_reviews = graphene.Field(
         PaymentReviewPage, required=True,
@@ -535,8 +725,61 @@ class Query(graphene.ObjectType):
     admin_payment_attempt_release = graphene.Field(
         PaymentAttemptReleasePayload, required=True, attempt_id=graphene.ID(required=True),
     )
-    promotions = graphene.List(graphene.NonNull(Promotion), required=True)
+    admin_stock_movement_status = graphene.Field(
+        lambda: StockMovementStatusPayload, required=True,
+        movement_id=graphene.ID(required=True),
+        description=(
+            "Requires an active staff or superuser account; an unknown UUID does "
+            "not prove rejection."
+        ),
+    )
+    promotions = graphene.List(
+        graphene.NonNull(Promotion),
+        required=True,
+        description=(
+            "Requires an active staff or superuser account. Lists global and "
+            "product-specific store promotions but excludes coupon-linked "
+            "promotion rows. For each product, an eligible specific offer wins "
+            "over global offers; otherwise the highest eligible global percentage "
+            "applies. Store promotions do not stack."
+        ),
+    )
+    admin_coupons = graphene.List(
+        graphene.NonNull(AdminCoupon),
+        required=True,
+        description="Requires an active staff or superuser account.",
+    )
+    admin_audit_logs = graphene.Field(
+        lambda: AdminAuditPage,
+        required=True,
+        entity_type=graphene.String(),
+        entity_id=graphene.String(),
+        actor_id=graphene.String(),
+        action=graphene.String(),
+        created_from=graphene.String(),
+        created_to=graphene.String(),
+        cursor=graphene.String(),
+        limit=graphene.Int(default_value=50),
+        description=(
+            "Requires an active staff or superuser account. Optional exact filters by "
+            "entity type/ID, actor ID and action; createdFrom/createdTo are inclusive "
+            "timezone-aware date-times normalized to UTC. Ordered by createdAt DESC, id DESC "
+            "with an opaque signed cursor; limit defaults to 50 (maximum 100). Invalid "
+            "filters, limits or cursors fail with extensions.code INVALID and "
+            "extensions.field; authorization failures use UNAUTHENTICATED or FORBIDDEN."
+        ),
+    )
     coupon_by_code = graphene.Field(Coupon, code=graphene.String(required=True))
+    available_coupons = graphene.List(graphene.NonNull(AvailableCoupon), required=True)
+    preview_coupon = graphene.Field(
+        CouponPreview,
+        required=True,
+        code=graphene.String(required=True),
+        description=(
+            "Requires an authenticated user; previews the current cart without "
+            "reserving or consuming a use."
+        ),
+    )
     stock_reservations = graphene.List(graphene.NonNull(StockReservation), bgg_id=graphene.Int(), required=True)
 
     def resolve_hello(self, info):
@@ -553,6 +796,57 @@ class Query(graphene.ObjectType):
             return balance_for_user(_authenticated_user(info))
         except Exception:
             return _error("SERVER_ERROR")
+
+    def resolve_admin_stock_movement_status(self, info, movement_id):
+        try:
+            user = _authenticated_user(info)
+            if user is None or not getattr(user, "is_active", False):
+                return StockMovementStatusPayload(movement_id=movement_id, user_errors=[_auth_error("Authentication required", "UNAUTHENTICATED")])
+            if not (getattr(user, "is_staff", False) or getattr(user, "is_superuser", False)):
+                return StockMovementStatusPayload(movement_id=movement_id, user_errors=[_auth_error("Administrator permission required", "FORBIDDEN")])
+            try:
+                normalized_id = str(uuid.UUID(movement_id))
+            except (ValueError, TypeError, AttributeError):
+                return StockMovementStatusPayload(movement_id=movement_id, user_errors=[_auth_error("Invalid movement identifier", "INVALID", ["movementId"])])
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT status FROM stock_movement_status WHERE movement_id = %s", [normalized_id])
+                row = cursor.fetchone()
+            if row is None:
+                return StockMovementStatusPayload(movement_id=movement_id, user_errors=[_auth_error("Movement not found", "NOT_FOUND")])
+            if row[0] not in ("IN_PROGRESS", "APPLIED", "REJECTED"):
+                raise ValueError("Invalid movement status")
+            return StockMovementStatusPayload(movement_id=normalized_id, status=row[0], user_errors=[])
+        except Exception:
+            return StockMovementStatusPayload(movement_id=movement_id, user_errors=[_auth_error("Could not load movement status", "SERVER_ERROR")])
+
+    def resolve_admin_op_sessions(self, info, user_id=None, page=1, page_size=50):
+        try:
+            user = _authenticated_user(info)
+            if user is None:
+                return OperationSessionPage(items=[], has_next=False, user_errors=[OrderUserError(code="UNAUTHENTICATED", message="Authentication required.")])
+            if not (getattr(user, "is_staff", False) or getattr(user, "is_superuser", False)):
+                return OperationSessionPage(items=[], has_next=False, user_errors=[OrderUserError(code="FORBIDDEN", message="Administrator permission required.")])
+            if page is None or page_size is None or not 1 <= page <= 10000 or not 1 <= page_size <= 100:
+                raise ValueError("Invalid pagination")
+            owner = int(user_id) if user_id is not None else None
+            if owner is not None and owner < 1:
+                raise ValueError("Invalid user")
+            from opkeys.models import OpSession
+            from opkeys.utils import utc_isoformat
+            sessions = OpSession.objects.all()
+            if owner is not None:
+                sessions = sessions.filter(user_id=owner)
+            offset = (page - 1) * page_size
+            rows = list(sessions.order_by("-issued_at", "-id")[offset:offset + page_size + 1])
+            return OperationSessionPage(items=[OperationSession(
+                id=str(row.id), user_id=str(row.user_id) if row.user_id else None, ops=row.ops or [],
+                issued_at=utc_isoformat(row.issued_at), expires_at=utc_isoformat(row.expires_at),
+                last_used=utc_isoformat(row.last_used), revoked=row.revoked,
+            ) for row in rows[:page_size]], has_next=len(rows) > page_size, user_errors=[])
+        except (TypeError, ValueError):
+            return OperationSessionPage(items=[], has_next=False, user_errors=[OrderUserError(code="INVALID", message="Invalid request.")])
+        except Exception:
+            return OperationSessionPage(items=[], has_next=False, user_errors=[OrderUserError(code="SERVER_ERROR", message="Could not load operation sessions.")])
 
     def resolve_admin_payment_attempt_release(self, info, attempt_id):
         try:
@@ -728,35 +1022,20 @@ class Query(graphene.ObjectType):
 
     def resolve_product_by_slug(self, info, slug):
         with connection.cursor() as cursor:
-            product = _product_by_slug(cursor, slug)
-            if product is None:
-                return None
-            cursor.execute(
-                "SELECT rating, body, created_at FROM product_review "
-                "WHERE bgg_id = %s AND status = 'APPROVED' ORDER BY created_at DESC",
-                [product["bgg_id"]],
-            )
-            reviews = cursor.fetchall()
-        public_reviews = [
-            PublicReview(rating=rating, body=body, created_at=created_at.isoformat())
-            for rating, body, created_at in reviews
-        ]
-        average = (
-            sum(review.rating for review in public_reviews) / len(public_reviews)
-            if public_reviews else None
-        )
-        return ProductDetail(
-            **_product_from_row(product),
-            review_summary=ReviewSummary(
-                approved_review_count=len(public_reviews),
-                average_rating=average,
-            ),
-            approved_reviews=public_reviews,
-        )
+            return _product_detail(cursor, _product_by_slug(cursor, slug))
+
+    def resolve_product_by_bgg_id(self, info, bgg_id):
+        with connection.cursor() as cursor:
+            return _product_detail(cursor, _product_by_bgg_id(cursor, bgg_id))
+
+    def resolve_product_categories(self, info):
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT DISTINCT category FROM product_boardgame WHERE category IS NOT NULL")
+            return sorted({name.strip() for (value,) in cursor.fetchall() for name in (value or "").split(",") if name.strip()})
 
     def resolve_products(self, info, page=1, page_size=50, search=None,
                          year_published=None, min_players=None, max_players=None,
-                         category_id=None, price_min=None, price_max=None):
+                         category_id=None, category_name=None, price_min=None, price_max=None):
         if page < 1 or page_size < 1:
             raise ValueError("page and pageSize must be positive integers")
         if min_players is not None and max_players is not None and min_players > max_players:
@@ -788,6 +1067,14 @@ class Query(graphene.ObjectType):
                     ])
                 else:
                     conditions.append("1 = 0")
+            if category_name is not None:
+                if not category_name.strip():
+                    raise ValueError("categoryName must not be blank")
+                conditions.append(
+                    "EXISTS (SELECT 1 FROM regexp_split_to_table(category, ',') AS category_part "
+                    "WHERE trim(category_part) = %s)"
+                )
+                parameters.append(category_name.strip())
             if price_min is not None:
                 conditions.append("price_amount >= %s")
                 parameters.append(price_min)
@@ -856,26 +1143,124 @@ class Query(graphene.ObjectType):
     def resolve_promotions(self, info):
         with connection.cursor() as cursor:
             cursor.execute(
-                "SELECT id, name, stackable, discount_pct, starts_at, ends_at, created_at FROM promotion"
+                "SELECT id, name, stackable, discount_pct, starts_at, ends_at, "
+                "created_at, active, product_bgg_id FROM promotion "
+                "WHERE NOT EXISTS (SELECT 1 FROM coupon c WHERE c.promotion_id = promotion.id)"
             )
             rows = cursor.fetchall()
-            columns = [c[0] for c in cursor.description]
-        result = []
-        for row in rows:
-            r = dict(zip(columns, row))
-            result.append(Promotion(
-                id=r["id"], name=r["name"], stackable=r["stackable"],
-                discount_pct=float(r["discount_pct"]),
-                starts_at=r["starts_at"].isoformat() if r["starts_at"] else None,
-                ends_at=r["ends_at"].isoformat() if r["ends_at"] else None,
-                created_at=r["created_at"].isoformat(),
+        return [_promotion_from_row(row) for row in rows]
+
+    def resolve_admin_coupons(self, info):
+        _, error = _coupon_admin_user(info)
+        if error:
+            raise GraphQLError(
+                error.message,
+                extensions={"code": error.code},
+            )
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT c.id, c.code, COALESCE(p.discount_pct, 0) AS discount_pct, "
+                "c.remaining, c.active, c.starts_at AT TIME ZONE 'UTC' AS starts_at, "
+                "c.ends_at AT TIME ZONE 'UTC' AS ends_at, "
+                "c.created_at AT TIME ZONE 'UTC' AS created_at "
+                "FROM coupon c LEFT JOIN promotion p ON p.id = c.promotion_id "
+                "WHERE p.product_bgg_id IS NULL ORDER BY c.id"
+            )
+            columns = [column[0] for column in cursor.description]
+            rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
+        return [_admin_coupon_from_row(row) for row in rows]
+
+    def resolve_admin_audit_logs(
+        self, info, entity_type=None, entity_id=None, actor_id=None, action=None,
+        created_from=None, created_to=None, cursor=None, limit=50,
+    ):
+        from django.core import signing
+
+        _, error = _coupon_admin_user(info)
+        if error:
+            raise GraphQLError(error.message, extensions={"code": error.code})
+        if limit is None or not 1 <= limit <= 100:
+            raise _audit_invalid("limit")
+        clauses, params = [], []
+        filters = {
+            "entity_type": (entity_type, "target_table"),
+            "entity_id": (entity_id, "target_id"),
+            "actor_id": (actor_id, "actor"),
+            "action": (action, "action"),
+        }
+        for name, (value, column) in filters.items():
+            if value is None:
+                continue
+            if not value or len(value) > _AUDIT_FILTER_LIMITS[name]:
+                raise _audit_invalid(name)
+            clauses.append(f"{column} = %s")
+            params.append(value)
+        bounds = []
+        for name, value, operator in (
+            ("created_from", created_from, ">="), ("created_to", created_to, "<="),
+        ):
+            if value is None:
+                continue
+            try:
+                parsed = _coupon_date(value, name)
+            except ValueError:
+                raise _audit_invalid(name) from None
+            bounds.append(parsed)
+            clauses.append(f"created_at {operator} %s")
+            params.append(parsed)
+        if len(bounds) == 2 and bounds[0] > bounds[1]:
+            raise _audit_invalid("created_to")
+        if cursor is not None:
+            cursor_time, cursor_id = _audit_cursor_decode(cursor)
+            clauses.append("(created_at, id) < (%s, %s)")
+            params.extend([cursor_time, cursor_id])
+        where = f"WHERE {' AND '.join(clauses)} " if clauses else ""
+        try:
+            with connection.cursor() as db:
+                db.execute(
+                    "SELECT id, actor, action, target_table, target_id, diff, "
+                    "created_at AT TIME ZONE 'UTC' AS created_at FROM audit_log "
+                    + where + "ORDER BY created_at DESC, id DESC LIMIT %s",
+                    [*params, limit + 1],
+                )
+                rows = db.fetchall()
+        except Exception:
+            logging.getLogger(__name__).error("Audit lookup failed.")
+            raise GraphQLError(
+                "Audit lookup failed", extensions={"code": "SERVER_ERROR"}
+            ) from None
+        page = rows[:limit]
+        records = []
+        for row_id, actor, row_action, table, target, diff, created_at in page:
+            before, after = _audit_changes(diff)
+            records.append(AdminAuditRecord(
+                id=row_id, actor_id=actor, action=row_action, entity_type=table,
+                entity_id=target,
+                created_at=_coupon_utc_datetime(created_at).isoformat(),
+                before=before, after=after,
             ))
-        return result
+        next_cursor = None
+        if len(rows) > limit:
+            last = page[-1]
+            next_cursor = signing.dumps(
+                {"c": _coupon_utc_datetime(last[6]).isoformat(), "i": last[0]},
+                salt=_AUDIT_CURSOR_SALT, compress=False,
+            )
+        return AdminAuditPage(records=records, next_cursor=next_cursor)
 
     def resolve_coupon_by_code(self, info, code):
         with connection.cursor() as cursor:
             cursor.execute(
-                "SELECT c.id, c.code, c.promotion_id, c.remaining, c.created_at, p.name, p.stackable, p.discount_pct, p.starts_at, p.ends_at, p.created_at as p_created "
+                "SELECT c.id, c.code, c.promotion_id, c.remaining, "
+                "c.created_at AT TIME ZONE 'UTC' AS coupon_created_at, "
+                "p.name, p.stackable, p.discount_pct, "
+                "p.starts_at AS promotion_starts_at, "
+                "p.ends_at AS promotion_ends_at, "
+                "p.created_at AS promotion_created_at, "
+                "p.active AS promotion_active, p.product_bgg_id, "
+                "c.active AS coupon_active, "
+                "c.starts_at AT TIME ZONE 'UTC' AS coupon_starts_at, "
+                "c.ends_at AT TIME ZONE 'UTC' AS coupon_ends_at "
                 "FROM coupon c LEFT JOIN promotion p ON p.id = c.promotion_id WHERE c.code = %s",
                 [code],
             )
@@ -886,14 +1271,44 @@ class Query(graphene.ObjectType):
             r = dict(zip(cols, row))
         promotion = None
         if r.get("promotion_id"):
-            promotion = Promotion(
-                id=r.get("promotion_id"), name=r.get("name"), stackable=r.get("stackable"),
-                discount_pct=float(r.get("discount_pct") or 0),
-                starts_at=r.get("starts_at").isoformat() if r.get("starts_at") else None,
-                ends_at=r.get("ends_at").isoformat() if r.get("ends_at") else None,
-                created_at=r.get("p_created").isoformat() if r.get("p_created") else None,
+            promotion = _promotion_from_row((
+                r["promotion_id"], r["name"], r["stackable"], r["discount_pct"],
+                r["promotion_starts_at"], r["promotion_ends_at"],
+                r["promotion_created_at"], r["promotion_active"],
+                r["product_bgg_id"],
+            ))
+        return Coupon(
+            id=r["id"],
+            code=r["code"],
+            promotion=promotion,
+            remaining=r["remaining"],
+            active=r["coupon_active"],
+            starts_at=(
+                _coupon_utc_datetime(r["coupon_starts_at"]).isoformat()
+                if r["coupon_starts_at"] else None
+            ),
+            ends_at=(
+                _coupon_utc_datetime(r["coupon_ends_at"]).isoformat()
+                if r["coupon_ends_at"] else None
+            ),
+            created_at=_coupon_utc_datetime(r["coupon_created_at"]).isoformat(),
+        )
+
+    def resolve_available_coupons(self, info):
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT code, starts_at AT TIME ZONE 'UTC', ends_at AT TIME ZONE 'UTC' FROM coupon "
+                "WHERE active = TRUE AND remaining > 0 "
+                "AND starts_at <= CURRENT_TIMESTAMP AND ends_at > CURRENT_TIMESTAMP "
+                "ORDER BY code"
             )
-        return Coupon(id=r["id"], code=r["code"], promotion=promotion, remaining=r["remaining"], created_at=r["created_at"].isoformat())
+            rows = cursor.fetchall()
+        return [AvailableCoupon(code=code, starts_at=starts_at.replace(tzinfo=datetime.timezone.utc).isoformat(),
+                    ends_at=ends_at.replace(tzinfo=datetime.timezone.utc).isoformat())
+                for code, starts_at, ends_at in rows]
+
+    def resolve_preview_coupon(self, info, code):
+        return preview_coupon(info, code)
 
     def resolve_stock_reservations(self, info, bgg_id=None):
         with connection.cursor() as cursor:
@@ -962,6 +1377,65 @@ class UserError(graphene.ObjectType):
     message = graphene.String(required=True)
 
 
+class AdminCouponPayload(graphene.ObjectType):
+    coupon = graphene.Field(AdminCoupon)
+    user_errors = graphene.List(graphene.NonNull(UserError), required=True)
+
+
+class AdminAuditRecord(graphene.ObjectType):
+    id = graphene.BigInt(required=True)
+    actor_id = graphene.String()
+    action = graphene.String(required=True)
+    entity_type = graphene.String()
+    entity_id = graphene.String()
+    created_at = graphene.String(required=True)
+    before = graphene.JSONString()
+    after = graphene.JSONString()
+
+    class Meta:
+        description = (
+            "Redacted administrative change record. `before` and `after` are JSON "
+            "objects (or null when absent). Values under keys naming credentials, "
+            "tokens, passwords, secrets, authorization data, or payment/card data "
+            'are replaced with "[REDACTED]" before the record is returned.'
+        )
+
+
+class AdminAuditPage(graphene.ObjectType):
+    records = graphene.List(graphene.NonNull(AdminAuditRecord), required=True)
+    next_cursor = graphene.String()
+
+    class Meta:
+        description = "One page of audit records ordered by createdAt DESC, id DESC."
+
+
+class StockMovementStatus(graphene.Enum):
+    IN_PROGRESS = "IN_PROGRESS"
+    APPLIED = "APPLIED"
+    REJECTED = "REJECTED"
+
+
+class StockMovementStatusPayload(graphene.ObjectType):
+    movement_id = graphene.ID(required=True)
+    status = graphene.Field(StockMovementStatus)
+    user_errors = graphene.List(graphene.NonNull(UserError), required=True)
+
+
+class StockMovementDirection(graphene.Enum):
+    IN = "IN"
+    OUT = "OUT"
+
+
+class AdjustProductStockPayload(graphene.ObjectType):
+    movement_id = graphene.ID(required=True)
+    status = graphene.Field(StockMovementStatus)
+    requested_quantity = graphene.Int()
+    applied_quantity = graphene.Int()
+    quantity_before = graphene.Int()
+    quantity_after = graphene.Int()
+    errors = graphene.List(graphene.NonNull(UserError), required=True)
+
+
 class RegisterPayload(graphene.ObjectType):
     user = graphene.Field(AuthUser)
     tokens = graphene.Field(AuthToken)
@@ -974,6 +1448,149 @@ class LoginPayload(RegisterPayload):
 
 def _auth_error(message, code, field=None):
     return UserError(field=field, code=code, message=message)
+
+
+def _coupon_admin_user(info):
+    user = _authenticated_user(info)
+    if user is None or not getattr(user, "is_active", False):
+        return None, _auth_error("Authentication required", "UNAUTHENTICATED")
+    if not (getattr(user, "is_staff", False) or getattr(user, "is_superuser", False)):
+        return None, _auth_error("Administrator permission required", "FORBIDDEN")
+    return user, None
+
+
+def _coupon_date(value, field):
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a UTC date-time or null")
+    try:
+        parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError(f"{field} must be a UTC date-time or null") from None
+    if parsed.utcoffset() is None:
+        raise ValueError(f"{field} must include a timezone")
+    return parsed.astimezone(datetime.timezone.utc)
+
+
+def _coupon_dates_valid(starts_at, ends_at):
+    return starts_at is None or ends_at is None or starts_at < ends_at
+
+
+def _coupon_audit_values(row):
+    return {
+        "code": row["code"],
+        "discount_percent": float(row["discount_pct"]),
+        "remaining": row["remaining"],
+        "active": row["active"],
+        "starts_at": (
+            _coupon_utc_datetime(row["starts_at"]).isoformat()
+            if row["starts_at"] else None
+        ),
+        "ends_at": (
+            _coupon_utc_datetime(row["ends_at"]).isoformat()
+            if row["ends_at"] else None
+        ),
+    }
+
+
+_AUDIT_SENSITIVE_KEY = re.compile(
+    r"password|passwd|secret|token|credential|authorization|api[_-]?key|card|cvv|cvc|payment|iban",
+    re.IGNORECASE,
+)
+_AUDIT_SECRET_VALUE = re.compile(
+    r"^(?:Bearer\s+\S+|[\w-]{10,}\.[\w-]{10,}\.[\w-]{10,})$"
+)
+_PRODUCT_AUDIT_COLUMNS = (
+    "bgg_id, name, price_amount, quantity, publisher, image_url, image_filename, "
+    "release_year, min_players, max_players, playing_time_minutes, min_age, max_age, "
+    "weight, category"
+)
+_PROMOTION_COLUMNS = (
+    "id, name, stackable, discount_pct, starts_at, ends_at, created_at, active, "
+    "product_bgg_id"
+)
+
+
+def _prefixed(columns, alias):
+    return ", ".join(f"{alias}.{column.strip()}" for column in columns.split(","))
+
+_AUDIT_INSERT = (
+    "INSERT INTO audit_log (actor, action, target_table, target_id, diff, created_at) "
+    "SELECT %s, '{action}', '{table}', {target}::text, "
+    "jsonb_build_object('previous', {previous}, 'new', to_jsonb({new}) - 'previous'), CURRENT_TIMESTAMP "
+)
+_AUDIT_CURSOR_SALT = "admin-audit-cursor"
+_AUDIT_FILTER_LIMITS = {
+    "entity_type": 150, "entity_id": 64, "actor_id": 150, "action": 100,
+}
+
+
+def _audit_redact(value, depth=0):
+    if depth > 12:
+        return "[REDACTED]"
+    if isinstance(value, dict):
+        return {
+            str(key): "[REDACTED]" if _AUDIT_SENSITIVE_KEY.search(str(key))
+            else _audit_redact(item, depth + 1)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_audit_redact(item, depth + 1) for item in value]
+    if isinstance(value, str) and _AUDIT_SECRET_VALUE.match(value):
+        return "[REDACTED]"
+    return value
+
+
+def _audit_changes(diff):
+    if isinstance(diff, str):
+        try:
+            diff = json.loads(diff)
+        except ValueError:
+            return None, None
+    if not isinstance(diff, dict):
+        return None, None
+    if "previous" in diff:
+        before, after = diff.get("previous"), diff.get("new")
+    elif "old" in diff:
+        before, after = {"quantity": diff.get("old")}, {"quantity": diff.get("new")}
+    else:
+        return None, None
+    return (
+        _audit_redact(before) if isinstance(before, dict) else None,
+        _audit_redact(after) if isinstance(after, dict) else None,
+    )
+
+
+def _audit_actor(user):
+    pk = getattr(user, "pk", None)
+    return None if pk is None else str(pk)
+
+
+def _audit_invalid(field):
+    return GraphQLError(
+        f"{field} is invalid", extensions={"code": "INVALID", "field": field}
+    )
+
+
+def _audit_cursor_decode(value):
+    from django.core import signing
+
+    if len(value) > 512:
+        raise _audit_invalid("cursor")
+    try:
+        data = signing.loads(value, salt=_AUDIT_CURSOR_SALT, max_age=None)
+        created_at = datetime.datetime.fromisoformat(data["c"])
+        row_id = data["i"]
+        if (
+            created_at.utcoffset() is None
+            or type(row_id) is not int
+            or row_id < 1
+        ):
+            raise ValueError
+    except (signing.BadSignature, KeyError, TypeError, ValueError):
+        raise _audit_invalid("cursor") from None
+    return created_at, row_id
 
 
 def _auth_user(user):
@@ -1033,8 +1650,8 @@ class LoginMutation(graphene.Mutation):
     def mutate(_root, info, input):
         from django.contrib.auth import authenticate
         # OpKeys: create a one-time OpSession for privileged users
-        from opkeys.utils import generate_raw_key, key_hash, default_expiry
-        from opkeys.models import OpSession
+        from opkeys.utils import generate_raw_key, key_hash, default_expiry, internal_secret_configured, utc_isoformat
+        from opkeys.models import OpKeyAudit, OpSession
 
         user = authenticate(
             request=info.context, username=input.email.strip().casefold(), password=input.password
@@ -1050,7 +1667,7 @@ class LoginMutation(graphene.Mutation):
         # Issue op_key only when enabled in settings and for staff/superusers
         from django.conf import settings as dj_settings
         try:
-            if getattr(dj_settings, "OPKEYS_ISSUE_ON_LOGIN", False) and (
+            if getattr(dj_settings, "OPKEYS_ISSUE_ON_LOGIN", False) and internal_secret_configured() and (
                 getattr(user, "is_staff", False) or getattr(user, "is_superuser", False)
             ):
                 raw = generate_raw_key()
@@ -1058,10 +1675,15 @@ class LoginMutation(graphene.Mutation):
                 # default ops: admin endpoints wildcard for main HTTP methods
                 methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
                 ops_list = [f"{m}:/api/v1/admin/*" for m in methods]
-                sess = OpSession.objects.create(user=user, key_hash=h, ops=ops_list, expires_at=default_expiry())
+                with transaction.atomic(using=OpSession.objects.db):
+                    sess = OpSession.objects.create(user=user, key_hash=h, ops=ops_list, expires_at=default_expiry())
+                    OpKeyAudit.objects.create(
+                        session_id=sess.id, subject_user_id=user.pk, actor_user_id=user.pk,
+                        actor_source="AUTHENTICATED_USER", action="ISSUE",
+                    )
                 # expose raw op_key only once in the login payload
                 tokens.op_key = raw
-                tokens.op_key_expires_at = sess.expires_at.isoformat() if sess.expires_at else None
+                tokens.op_key_expires_at = utc_isoformat(sess.expires_at)
                 tokens.ops = sess.ops
         except Exception:
             # don't break login if op session creation fails
@@ -1203,8 +1825,17 @@ class CreateReviewMutation(graphene.Mutation):
 
 
 class CreateProductInput(graphene.InputObjectType):
+    class Meta:
+        description = (
+            "Create a product with a positive base price and exactly one .webp image\n"
+            "reference in imageUrl or imageFileName and a nonnegative initial quantity.\n"
+            "Product administration requires an active staff or superuser account."
+        )
+
     name = graphene.String(required=True)
-    price = graphene.Float(required=True)
+    price = graphene.Float(
+        required=True, description="Strictly greater than zero."
+    )
     quantity = graphene.Int(required=True)
     # Business id provided by client
     bggId = graphene.Int()
@@ -1242,7 +1873,7 @@ class CreateProductMutation(graphene.Mutation):
         if not name:
             return CreateProductPayload(product=None, userErrors=[_auth_error("Name is required", "NAME_REQUIRED", ["name"])])
         try:
-            with connection.cursor() as cursor:
+            with transaction.atomic(), connection.cursor() as cursor:
                 # Use provided bggId if present, otherwise generate next sequential bgg_id
                 provided_bgg = getattr(input, 'bggId', None)
                 if provided_bgg is None:
@@ -1250,7 +1881,9 @@ class CreateProductMutation(graphene.Mutation):
                     provided_bgg = cursor.fetchone()[0]
 
                 cursor.execute(
-                    "INSERT INTO product_boardgame (bgg_id, name, price_amount, quantity, publisher, image_url, image_filename, release_year, min_players, max_players, playing_time_minutes, min_age, max_age, weight, category) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING bgg_id, name",
+                    "WITH ins AS (INSERT INTO product_boardgame (bgg_id, name, price_amount, quantity, publisher, image_url, image_filename, release_year, min_players, max_players, playing_time_minutes, min_age, max_age, weight, category) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING " + _PRODUCT_AUDIT_COLUMNS + "), "
+                    "aud AS (" + _AUDIT_INSERT.format(action="product_created", table="product_boardgame", target="ins.bgg_id", previous="'null'::jsonb", new="ins") + "FROM ins RETURNING id) "
+                    "SELECT bgg_id, name FROM ins",
                     [
                         provided_bgg,
                         name,
@@ -1269,9 +1902,11 @@ class CreateProductMutation(graphene.Mutation):
                         (getattr(input, 'weight', None) or 0.0),
                         # category stored as comma-separated string internally
                         (','.join(getattr(input, 'category', []) or []) if (getattr(input, 'category', None) is not None) else ''),
+                        _audit_actor(user),
                     ],
                 )
                 row = cursor.fetchone()
+                record_catalog_event(cursor, "product.changed", row[0])
             product = Product(
                 bgg_id=row[0],
                 name=row[1],
@@ -1296,9 +1931,14 @@ class CreateProductMutation(graphene.Mutation):
 
 
 class UpdateProductInput(graphene.InputObjectType):
+    class Meta:
+        description = (
+            "Partial product update; BGG ID and quantity are immutable through this input.\n"
+            "When changing the image, provide exactly one .webp imageUrl or imageFileName."
+        )
+
     name = graphene.String()
-    price = graphene.Float()
-    quantity = graphene.Int()
+    price = graphene.Float(description="Must be strictly greater than zero.")
     publisher = graphene.String()
     # Contract: accept camelCase fields only
     imageUrl = graphene.String()
@@ -1331,7 +1971,7 @@ class UpdateProductMutation(graphene.Mutation):
         if user is None or (not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False)):
             return UpdateProductPayload(product=None, userErrors=[_auth_error("Authentication required", "UNAUTHENTICATED")])
         try:
-            with connection.cursor() as cursor:
+            with transaction.atomic(), connection.cursor() as cursor:
                 # Build update statement dynamically
                 fields = []
                 values = []
@@ -1341,9 +1981,6 @@ class UpdateProductMutation(graphene.Mutation):
                 if input.price is not None:
                     fields.append("price_amount = %s")
                     values.append(input.price)
-                if input.quantity is not None:
-                    fields.append("quantity = %s")
-                    values.append(input.quantity)
                 if input.publisher is not None:
                     fields.append("publisher = %s")
                     values.append(input.publisher)
@@ -1380,12 +2017,20 @@ class UpdateProductMutation(graphene.Mutation):
                     values.append(','.join(input.category) if isinstance(input.category, (list, tuple)) else input.category)
                 if not fields:
                     return UpdateProductPayload(product=None, userErrors=[_auth_error("No fields to update", "NO_OP")])
-                values.append(id)
-                sql = f"UPDATE product_boardgame SET {', '.join(fields)} WHERE bgg_id = %s RETURNING bgg_id, name, price_amount, quantity"
+                values = [*values, id, _audit_actor(user)]
+                sql = (
+                    f"WITH upd AS (UPDATE product_boardgame AS p SET {', '.join(fields)} "
+                    f"FROM (SELECT {_PRODUCT_AUDIT_COLUMNS} FROM product_boardgame WHERE bgg_id = %s FOR UPDATE) AS o "
+                    f"WHERE p.bgg_id = o.bgg_id RETURNING {_prefixed(_PRODUCT_AUDIT_COLUMNS, 'p')}, to_jsonb(o) AS previous), "
+                    "aud AS (" + _AUDIT_INSERT.format(action="product_updated", table="product_boardgame", target="upd.bgg_id", previous="upd.previous", new="upd")
+                    + "FROM upd RETURNING id) "
+                    "SELECT bgg_id, name, price_amount, quantity FROM upd"
+                )
                 cursor.execute(sql, values)
                 row = cursor.fetchone()
                 if not row:
                     return UpdateProductPayload(product=None, userErrors=[_auth_error("Product not found", "PRODUCT_NOT_FOUND")])
+                record_catalog_event(cursor, "product.changed", row[0])
             product = Product(
                 bgg_id=row[0],
                 name=row[1],
@@ -1406,39 +2051,158 @@ class UpdateProductMutation(graphene.Mutation):
             return UpdateProductPayload(product=None, userErrors=[_auth_error("Update failed", "SERVER_ERROR")])
 
 
-class AdjustVariantStockPayload(graphene.ObjectType):
+class AddProductStockPayload(graphene.ObjectType):
     success = graphene.Boolean()
     errors = graphene.List(graphene.NonNull(UserError), required=True)
 
 
-class AdjustVariantStockMutation(graphene.Mutation):
+class AddProductStockMutation(graphene.Mutation):
     class Arguments:
         productId = graphene.ID(required=True)
-        variantId = graphene.ID(required=True)
         newStock = graphene.Int(required=True)
 
-    Output = AdjustVariantStockPayload
+    Output = AddProductStockPayload
 
     @staticmethod
-    def mutate(_root, info, productId, variantId, newStock):
+    def mutate(_root, info, productId, newStock):
         user = _authenticated_user(info)
-        if user is None or (not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False)):
-            return AdjustVariantStockPayload(success=False, errors=[_auth_error("Authentication required", "UNAUTHENTICATED")])
+        if user is None or not getattr(user, "is_active", False):
+            return AddProductStockPayload(success=False, errors=[_auth_error("Authentication required", "UNAUTHENTICATED")])
+        if not (getattr(user, "is_staff", False) or getattr(user, "is_superuser", False)):
+            return AddProductStockPayload(success=False, errors=[_auth_error("Administrator access required", "FORBIDDEN")])
+        return AddProductStockPayload(success=False, errors=[_auth_error("Use a UUID-bound stock movement", "MIGRATION_REQUIRED")])
+
+
+class AdjustProductStockMutation(graphene.Mutation):
+    class Arguments:
+        product_id = graphene.ID(required=True)
+        movement_id = graphene.ID(required=True)
+        direction = StockMovementDirection(required=True)
+        quantity = graphene.Int(required=True)
+
+    Output = AdjustProductStockPayload
+
+    @staticmethod
+    def mutate(_root, info, product_id, movement_id, direction, quantity):
+        def failure(code, message, field=None):
+            return AdjustProductStockPayload(movement_id=movement_id, errors=[_auth_error(message, code, field)])
+
         try:
-            with connection.cursor() as cursor:
-                cursor.execute("UPDATE product_boardgame SET quantity = %s WHERE bgg_id = %s RETURNING bgg_id", [newStock, productId])
-                row = cursor.fetchone()
-                if not row:
-                    return AdjustVariantStockPayload(success=False, errors=[_auth_error("Product or variant not found", "NOT_FOUND")])
-            return AdjustVariantStockPayload(success=True, errors=[])
+            user = _authenticated_user(info)
+            if user is None or not getattr(user, "is_active", False):
+                return failure("UNAUTHENTICATED", "Authentication required")
+            if not (getattr(user, "is_staff", False) or getattr(user, "is_superuser", False)):
+                return failure("FORBIDDEN", "Administrator access required")
+            normalized_product = product_id.lstrip("0")
+            if (not product_id.isascii() or not product_id.isdecimal() or not normalized_product
+                    or len(normalized_product) > 10 or int(normalized_product) > 2147483647):
+                return failure("INVALID", "Invalid product identifier", ["productId"])
+            try:
+                normalized_movement = str(uuid.UUID(movement_id))
+            except (ValueError, TypeError, AttributeError):
+                return failure("INVALID", "Invalid movement identifier", ["movementId"])
+            if quantity <= 0:
+                return failure("INVALID", "Quantity must be positive", ["quantity"])
+            actor_id = int(user.pk)
+            if actor_id <= 0:
+                return failure("UNAUTHENTICATED", "Authentication required")
+            direction_value = direction.value
+            product_number = int(normalized_product)
+            request = info.context
+            if getattr(request, "opkey_delegated", False) and not request.headers.get("Authorization", ""):
+                path = request.headers.get("X-Op-Path", "")
+                match = re.fullmatch(r"/api/v1/admin/products/([0-9]+)/stock", path)
+                if (request.headers.get("X-Op-Method", "").upper() != "POST" or not match
+                        or match.group(1).lstrip("0") != normalized_product):
+                    return failure("FORBIDDEN", "Administrator access required")
+            with transaction.atomic(durable=True):
+                with connection.cursor() as cursor:
+                    cursor.execute("INSERT INTO stock_movement_status (movement_id, status) VALUES (%s, 'IN_PROGRESS') ON CONFLICT (movement_id) DO NOTHING RETURNING movement_id", [normalized_movement])
+                    created = cursor.fetchone() is not None
+                    if created:
+                        cursor.execute("INSERT INTO stock_movement_details (movement_id, product_id, direction, requested_quantity, actor_id) VALUES (%s, %s, %s, %s, %s)", [normalized_movement, product_number, direction_value, quantity, actor_id])
+                    else:
+                        cursor.execute("SELECT status FROM stock_movement_status WHERE movement_id = %s", [normalized_movement])
+                        status_row = cursor.fetchone()
+                        cursor.execute("SELECT product_id, direction, requested_quantity, applied_quantity, quantity_before, quantity_after FROM stock_movement_details WHERE movement_id = %s", [normalized_movement])
+                        detail = cursor.fetchone()
+                        if not status_row or not detail:
+                            return failure("SERVER_ERROR", "Movement details unavailable")
+                        if (detail[0], detail[1], detail[2]) != (product_number, direction_value, quantity):
+                            return failure("IDEMPOTENCY_CONFLICT", "Movement identifier already used with different data")
+                        if status_row[0] == "APPLIED":
+                            if any(value is None for value in detail[3:]):
+                                return failure("SERVER_ERROR", "Movement details unavailable")
+                            return AdjustProductStockPayload(movement_id=normalized_movement, status="APPLIED", requested_quantity=quantity, applied_quantity=detail[3], quantity_before=detail[4], quantity_after=detail[5], errors=[])
+                        if status_row[0] not in ("IN_PROGRESS", "REJECTED"):
+                            return failure("SERVER_ERROR", "Movement details unavailable")
+            rolled_back = False
+            with transaction.atomic(durable=True):
+                try:
+                    with connection.cursor() as cursor:
+                        cursor.execute("SELECT status FROM stock_movement_status WHERE movement_id = %s FOR UPDATE SKIP LOCKED", [normalized_movement])
+                        locked_status = cursor.fetchone()
+                        if locked_status is None:
+                            return AdjustProductStockPayload(movement_id=normalized_movement, status="IN_PROGRESS", errors=[])
+                        if locked_status[0] == "APPLIED":
+                            cursor.execute("SELECT applied_quantity, quantity_before, quantity_after FROM stock_movement_details WHERE movement_id = %s", [normalized_movement])
+                            applied_details = cursor.fetchone()
+                            if not applied_details or any(value is None for value in applied_details):
+                                return failure("SERVER_ERROR", "Movement details unavailable")
+                            return AdjustProductStockPayload(movement_id=normalized_movement, status="APPLIED", requested_quantity=quantity, applied_quantity=applied_details[0], quantity_before=applied_details[1], quantity_after=applied_details[2], errors=[])
+                        if locked_status[0] == "REJECTED":
+                            cursor.execute("UPDATE stock_movement_status SET status = 'IN_PROGRESS' WHERE movement_id = %s", [normalized_movement])
+                            cursor.execute("UPDATE stock_movement_details SET actor_id = %s WHERE movement_id = %s", [actor_id, normalized_movement])
+                        elif locked_status[0] != "IN_PROGRESS":
+                            return failure("SERVER_ERROR", "Movement details unavailable")
+                        cursor.execute("SELECT quantity FROM product_boardgame WHERE bgg_id = %s FOR UPDATE", [product_number])
+                        row = cursor.fetchone()
+                        if row is None:
+                            cursor.execute("UPDATE stock_movement_status SET status = 'REJECTED' WHERE movement_id = %s", [normalized_movement])
+                            return failure("NOT_FOUND", "Product not found")
+                        before = row[0]
+                        if before < 0:
+                            raise ValueError("Invalid stored stock")
+                        if direction_value == "IN":
+                            applied = quantity
+                            after = before + quantity
+                            if after > 2147483647:
+                                cursor.execute("UPDATE stock_movement_status SET status = 'REJECTED' WHERE movement_id = %s", [normalized_movement])
+                                return failure("INVALID", "Stock exceeds the supported limit", ["quantity"])
+                        else:
+                            applied = min(before, quantity)
+                            after = before - applied
+                            if not applied:
+                                cursor.execute("UPDATE stock_movement_status SET status = 'REJECTED' WHERE movement_id = %s", [normalized_movement])
+                                return failure("NO_STOCK", "Product has no stock")
+                        cursor.execute("UPDATE product_boardgame SET quantity = %s WHERE bgg_id = %s", [after, product_number])
+                        cursor.execute("UPDATE stock_movement_details SET applied_quantity = %s, quantity_before = %s, quantity_after = %s WHERE movement_id = %s", [applied, before, after, normalized_movement])
+                        diff = json.dumps({"movement_id": normalized_movement, "direction": direction_value, "requested_quantity": quantity, "applied_quantity": applied, "old": before, "new": after})
+                        cursor.execute("INSERT INTO audit_log (actor, action, target_table, target_id, diff, created_at) VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP)", [str(actor_id), "stock_" + direction_value.lower(), "product_boardgame", str(product_number), diff])
+                        record_catalog_event(cursor, "stock.changed", product_number)
+                        cursor.execute("UPDATE stock_movement_status SET status = 'APPLIED' WHERE movement_id = %s", [normalized_movement])
+                except Exception:
+                    transaction.set_rollback(True)
+                    rolled_back = True
+            if rolled_back:
+                with transaction.atomic(durable=True), connection.cursor() as cursor:
+                    cursor.execute("UPDATE stock_movement_status SET status = 'REJECTED' WHERE movement_id = %s AND status = 'IN_PROGRESS'", [normalized_movement])
+                return failure("SERVER_ERROR", "Stock movement failed")
+            return AdjustProductStockPayload(movement_id=normalized_movement, status="APPLIED", requested_quantity=quantity, applied_quantity=applied, quantity_before=before, quantity_after=after, errors=[])
         except Exception:
-            return AdjustVariantStockPayload(success=False, errors=[_auth_error("Adjust stock failed", "SERVER_ERROR")])
+            return failure("SERVER_ERROR", "Stock movement failed")
 
 
 class CreatePromotionInput(graphene.InputObjectType):
     name = graphene.String(required=True)
-    discount_percent = graphene.Float(required=True)
+    discount_percent = graphene.Float(
+        required=True,
+        description="Percentage discount from zero through 50, inclusive.",
+    )
     active = graphene.Boolean(required=True)
+    product_bgg_id = graphene.Int(
+        description="Optional product BGG identifier; omitted or null creates a global store offer."
+    )
 
 
 class CreatePromotionPayload(graphene.ObjectType):
@@ -1460,23 +2224,79 @@ class CreatePromotionMutation(graphene.Mutation):
         name = (input.name or "").strip()
         if not name:
             return CreatePromotionPayload(promotion=None, userErrors=[_auth_error("Name is required", "NAME_REQUIRED", ["name"])])
+        if not 0 < input.discount_percent <= 50:
+            return CreatePromotionPayload(promotion=None, userErrors=[_auth_error("Discount must be greater than 0 and at most 50", "INVALID", ["discountPercent"])])
+        product_bgg_id = getattr(input, "product_bgg_id", None)
+        if product_bgg_id is not None and product_bgg_id <= 0:
+            return CreatePromotionPayload(
+                promotion=None,
+                userErrors=[
+                    _auth_error(
+                        "A product identifier must be positive.",
+                        "INVALID",
+                        ["productBggId"],
+                    )
+                ],
+            )
         try:
-            with connection.cursor() as cursor:
+            with transaction.atomic(), connection.cursor() as cursor:
+                if product_bgg_id is not None:
+                    cursor.execute(
+                        "SELECT bgg_id FROM product_boardgame WHERE bgg_id = %s",
+                        [product_bgg_id],
+                    )
+                    if cursor.fetchone() is None:
+                        return CreatePromotionPayload(
+                            promotion=None,
+                            userErrors=[
+                                _auth_error(
+                                    "Product not found.",
+                                    "NOT_FOUND",
+                                    ["productBggId"],
+                                )
+                            ],
+                        )
                 cursor.execute(
-                    "INSERT INTO promotion (name, discount_pct, starts_at, ends_at, stackable, created_at) VALUES (%s, %s, %s, %s, %s, now()) RETURNING id, name",
-                    [name, input.discount_percent, None, None, False],
+                    "WITH ins AS (INSERT INTO promotion "
+                    "(name, discount_pct, starts_at, ends_at, stackable, active, "
+                    "product_bgg_id, created_at) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, now()) RETURNING "
+                    + _PROMOTION_COLUMNS + "), "
+                    "aud AS (" + _AUDIT_INSERT.format(action="promotion_created", table="promotion", target="ins.id", previous="'null'::jsonb", new="ins") + "FROM ins RETURNING id) "
+                    "SELECT " + _PROMOTION_COLUMNS + " FROM ins",
+                    [
+                        name, input.discount_percent, None, None, False,
+                        input.active, product_bgg_id, _audit_actor(user),
+                    ],
                 )
                 row = cursor.fetchone()
-            promo = Promotion(id=row[0], name=row[1], stackable=False, discount_pct=float(input.discount_percent), starts_at=None, ends_at=None, created_at="")
+                record_catalog_event(cursor, "promotion.changed", row[0])
+            promo = _promotion_from_row(row)
             return CreatePromotionPayload(promotion=promo, userErrors=[])
+        except IntegrityError:
+            return CreatePromotionPayload(
+                promotion=None,
+                userErrors=[
+                    _auth_error(
+                        "An active promotion already exists for this product.",
+                        "CONFLICT",
+                        ["productBggId"],
+                    )
+                ],
+            )
         except Exception:
             return CreatePromotionPayload(promotion=None, userErrors=[_auth_error("Create promotion failed", "SERVER_ERROR")])
 
 
 class UpdatePromotionInput(graphene.InputObjectType):
     name = graphene.String()
-    discount_percent = graphene.Float()
+    discount_percent = graphene.Float(
+        description="Percentage discount from zero through 50, inclusive."
+    )
     active = graphene.Boolean()
+    product_bgg_id = graphene.Int(
+        description="Optional product BGG identifier; null clears the product link and creates a global store offer."
+    )
 
 
 class UpdatePromotionPayload(graphene.ObjectType):
@@ -1496,28 +2316,408 @@ class UpdatePromotionMutation(graphene.Mutation):
         user = _authenticated_user(info)
         if user is None or (not getattr(user, "is_staff", False) and not getattr(user, "is_superuser", False)):
             return UpdatePromotionPayload(promotion=None, userErrors=[_auth_error("Authentication required", "UNAUTHENTICATED")])
+        if input.discount_percent is not None and not 0 < input.discount_percent <= 50:
+            return UpdatePromotionPayload(promotion=None, userErrors=[_auth_error("Discount must be greater than 0 and at most 50", "INVALID", ["discountPercent"])])
         try:
-            with connection.cursor() as cursor:
+            with transaction.atomic(), connection.cursor() as cursor:
                 fields = []
                 values = []
+                if "product_bgg_id" in input:
+                    product_bgg_id = input["product_bgg_id"]
+                    if product_bgg_id is not None and product_bgg_id <= 0:
+                        return UpdatePromotionPayload(
+                            promotion=None,
+                            userErrors=[
+                                _auth_error(
+                                    "A product identifier must be positive.",
+                                    "INVALID",
+                                    ["productBggId"],
+                                )
+                            ],
+                        )
+                    if product_bgg_id is not None:
+                        cursor.execute(
+                            "SELECT bgg_id FROM product_boardgame WHERE bgg_id = %s",
+                            [product_bgg_id],
+                        )
+                        if cursor.fetchone() is None:
+                            return UpdatePromotionPayload(
+                                promotion=None,
+                                userErrors=[
+                                    _auth_error(
+                                        "Product not found.",
+                                        "NOT_FOUND",
+                                        ["productBggId"],
+                                    )
+                                ],
+                            )
+                    fields.append("product_bgg_id = %s")
+                    values.append(product_bgg_id)
                 if input.name is not None:
                     fields.append("name = %s")
                     values.append(input.name)
                 if input.discount_percent is not None:
                     fields.append("discount_pct = %s")
                     values.append(input.discount_percent)
+                if input.active is not None:
+                    fields.append("active = %s")
+                    values.append(input.active)
                 if not fields:
                     return UpdatePromotionPayload(promotion=None, userErrors=[_auth_error("No fields to update", "NO_OP")])
-                values.append(id)
-                sql = f"UPDATE promotion SET {', '.join(fields)} WHERE id = %s RETURNING id, name"
+                values = [*values, id, _audit_actor(user)]
+                sql = (
+                    f"WITH upd AS (UPDATE promotion AS p SET {', '.join(fields)} "
+                    f"FROM (SELECT {_PROMOTION_COLUMNS} FROM promotion WHERE id = %s FOR UPDATE) AS o "
+                    f"WHERE p.id = o.id RETURNING {_prefixed(_PROMOTION_COLUMNS, 'p')}, to_jsonb(o) AS previous), "
+                    "aud AS (" + _AUDIT_INSERT.format(action="promotion_updated", table="promotion", target="upd.id", previous="upd.previous", new="upd")
+                    + "FROM upd RETURNING id) "
+                    f"SELECT {_PROMOTION_COLUMNS} FROM upd"
+                )
                 cursor.execute(sql, values)
                 row = cursor.fetchone()
                 if not row:
                     return UpdatePromotionPayload(promotion=None, userErrors=[_auth_error("Promotion not found", "NOT_FOUND")])
-            promo = Promotion(id=row[0], name=row[1], stackable=False, discount_pct=float(input.discount_percent or 0), starts_at=None, ends_at=None, created_at="")
+                record_catalog_event(cursor, "promotion.changed", row[0])
+            promo = _promotion_from_row(row)
             return UpdatePromotionPayload(promotion=promo, userErrors=[])
+        except IntegrityError:
+            return UpdatePromotionPayload(
+                promotion=None,
+                userErrors=[
+                    _auth_error(
+                        "An active promotion already exists for this product.",
+                        "CONFLICT",
+                        ["productBggId"],
+                    )
+                ],
+            )
         except Exception:
             return UpdatePromotionPayload(promotion=None, userErrors=[_auth_error("Update promotion failed", "SERVER_ERROR")])
+
+
+class AdminCreateCouponInput(graphene.InputObjectType):
+    code = graphene.String(
+        required=True,
+        description="Exact-case unique code; it is not normalized.",
+    )
+    discount_percent = graphene.Float(
+        required=True,
+        description="Whole-purchase discount percentage from zero through 50, inclusive.",
+    )
+    remaining = graphene.BigInt(
+        required=True, description="Remaining uses; must be non-negative."
+    )
+    active = graphene.Boolean(required=True)
+    starts_at = graphene.String(
+        description="UTC validity start, inclusive; null means no lower bound."
+    )
+    ends_at = graphene.String(
+        description=(
+            "UTC validity end, exclusive; when both boundaries exist, start "
+            "precedes end."
+        )
+    )
+
+
+class AdminUpdateCouponInput(graphene.InputObjectType):
+    discount_percent = graphene.Float(
+        description="Whole-purchase discount percentage from zero through 50, inclusive."
+    )
+    remaining = graphene.BigInt(
+        description="Remaining uses; must be non-negative."
+    )
+    active = graphene.Boolean()
+    starts_at = graphene.String(
+        description="UTC validity start, inclusive; null clears the lower bound."
+    )
+    ends_at = graphene.String(
+        description="UTC validity end, exclusive; null clears the upper bound."
+    )
+
+
+def _coupon_field_error(field, message):
+    return AdminCouponPayload(
+        coupon=None,
+        user_errors=[_auth_error(message, "INVALID", [field])],
+    )
+
+
+def _coupon_record(cursor, coupon_id):
+    cursor.execute(
+        "SELECT c.id, c.code, COALESCE(p.discount_pct, 0) AS discount_pct, "
+        "c.remaining, c.active, c.starts_at AT TIME ZONE 'UTC' AS starts_at, "
+        "c.ends_at AT TIME ZONE 'UTC' AS ends_at, "
+        "c.created_at AT TIME ZONE 'UTC' AS created_at "
+        "FROM coupon c LEFT JOIN promotion p ON p.id = c.promotion_id "
+        "WHERE c.id = %s",
+        [coupon_id],
+    )
+    row = cursor.fetchone()
+    if row is None:
+        return None
+    return dict(zip((column[0] for column in cursor.description), row))
+
+
+def _coupon_admin_result(cursor, coupon_id, user, action, previous):
+    row = _coupon_record(cursor, coupon_id)
+    if row is None:
+        raise RuntimeError("Coupon disappeared during its transaction")
+    from saleor.promotions.models import AuditLog
+
+    AuditLog.objects.create(
+        actor=str(user.pk),
+        action=action,
+        target_table="coupon",
+        target_id=str(coupon_id),
+        diff={"previous": previous, "new": _coupon_audit_values(row)},
+    )
+    return _admin_coupon_from_row(row)
+
+
+def _coupon_code_conflict(exc):
+    cause = getattr(exc, "__cause__", None)
+    diagnostic = getattr(cause, "diag", None)
+    return getattr(diagnostic, "constraint_name", None) == "coupon_code_key"
+
+
+class AdminCreateCouponMutation(graphene.Mutation):
+    class Arguments:
+        input = AdminCreateCouponInput(required=True)
+
+    Output = AdminCouponPayload
+
+    @staticmethod
+    def mutate(_root, info, input):
+        user, auth_error = _coupon_admin_user(info)
+        if auth_error:
+            return AdminCouponPayload(coupon=None, user_errors=[auth_error])
+
+        code = input.get("code")
+        discount = input.get("discount_percent")
+        remaining = input.get("remaining")
+        active = input.get("active")
+        if not isinstance(code, str) or not code or len(code) > 64:
+            return _coupon_field_error("code", "Code must contain 1 to 64 characters.")
+        if isinstance(discount, bool) or not isinstance(discount, (int, float)):
+            return _coupon_field_error("discountPercent", "Discount must be a number from 0 to 50.")
+        try:
+            discount = Decimal(str(discount))
+        except (InvalidOperation, ValueError):
+            return _coupon_field_error("discountPercent", "Discount must be a number from 0 to 50.")
+        if not discount.is_finite() or not Decimal("0") <= discount <= Decimal("50"):
+            return _coupon_field_error("discountPercent", "Discount must be a number from 0 to 50.")
+        if type(remaining) is not int or not 0 <= remaining <= 9223372036854775807:
+            return _coupon_field_error("remaining", "Remaining uses must be a non-negative integer.")
+        if type(active) is not bool:
+            return _coupon_field_error("active", "Active must be a boolean.")
+        try:
+            starts_at = _coupon_date(input.get("starts_at"), "startsAt")
+            ends_at = _coupon_date(input.get("ends_at"), "endsAt")
+        except ValueError as exc:
+            field = "startsAt" if "startsAt" in str(exc) else "endsAt"
+            return _coupon_field_error(field, str(exc))
+        if not _coupon_dates_valid(starts_at, ends_at):
+            return _coupon_field_error("endsAt", "End date must be later than start date.")
+
+        previous = None
+        try:
+            with transaction.atomic():
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        "INSERT INTO promotion "
+                        "(name, active, stackable, discount_pct, starts_at, ends_at, created_at) "
+                        "VALUES (%s, TRUE, FALSE, %s, NULL, NULL, CURRENT_TIMESTAMP) "
+                        "RETURNING id",
+                        [f"Coupon {code}", discount],
+                    )
+                    promotion_id = cursor.fetchone()[0]
+                    cursor.execute(
+                        "INSERT INTO coupon "
+                        "(code, promotion_id, remaining, active, starts_at, ends_at, created_at) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP) "
+                        "RETURNING id",
+                        [code, promotion_id, remaining, active, starts_at, ends_at],
+                    )
+                    coupon_id = cursor.fetchone()[0]
+                    coupon = _coupon_admin_result(
+                        cursor, coupon_id, user, "coupon_created", previous
+                    )
+            return AdminCouponPayload(coupon=coupon, user_errors=[])
+        except IntegrityError as exc:
+            if _coupon_code_conflict(exc):
+                return AdminCouponPayload(
+                    coupon=None,
+                    user_errors=[
+                        _auth_error("A coupon with this code already exists.", "CODE_EXISTS", ["code"])
+                    ],
+                )
+            return AdminCouponPayload(
+                coupon=None,
+                user_errors=[_auth_error("Could not create coupon.", "SERVER_ERROR")],
+            )
+        except Exception:
+            return AdminCouponPayload(
+                coupon=None,
+                user_errors=[_auth_error("Could not create coupon.", "SERVER_ERROR")],
+            )
+
+
+class AdminUpdateCouponMutation(graphene.Mutation):
+    class Arguments:
+        id = graphene.Int(required=True)
+        input = AdminUpdateCouponInput(required=True)
+
+    Output = AdminCouponPayload
+
+    @staticmethod
+    def mutate(_root, info, id, input):
+        user, auth_error = _coupon_admin_user(info)
+        if auth_error:
+            return AdminCouponPayload(coupon=None, user_errors=[auth_error])
+        present = set(input.keys())
+        if not present:
+            return AdminCouponPayload(
+                coupon=None,
+                user_errors=[_auth_error("At least one field must be provided.", "NO_OP")],
+            )
+
+        updates = {}
+        if "discount_percent" in present:
+            discount = input.get("discount_percent")
+            if isinstance(discount, bool) or not isinstance(discount, (int, float)):
+                return _coupon_field_error("discountPercent", "Discount must be a number from 0 to 50.")
+            try:
+                discount = Decimal(str(discount))
+            except (InvalidOperation, ValueError):
+                return _coupon_field_error("discountPercent", "Discount must be a number from 0 to 50.")
+            if not discount.is_finite() or not Decimal("0") <= discount <= Decimal("50"):
+                return _coupon_field_error("discountPercent", "Discount must be a number from 0 to 50.")
+            updates["discount_percent"] = discount
+        if "remaining" in present:
+            remaining = input.get("remaining")
+            if type(remaining) is not int or not 0 <= remaining <= 9223372036854775807:
+                return _coupon_field_error("remaining", "Remaining uses must be a non-negative integer.")
+            updates["remaining"] = remaining
+        if "active" in present:
+            active = input.get("active")
+            if type(active) is not bool:
+                return _coupon_field_error("active", "Active must be a boolean.")
+            updates["active"] = active
+        for field in ("starts_at", "ends_at"):
+            if field in present:
+                graph_field = "startsAt" if field == "starts_at" else "endsAt"
+                try:
+                    updates[field] = _coupon_date(input.get(field), graph_field)
+                except ValueError as exc:
+                    return _coupon_field_error(graph_field, str(exc))
+
+        try:
+            with transaction.atomic():
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT id, code, promotion_id, remaining, active, "
+                        "starts_at AT TIME ZONE 'UTC' AS starts_at, "
+                        "ends_at AT TIME ZONE 'UTC' AS ends_at, created_at "
+                        "FROM coupon WHERE id = %s FOR UPDATE",
+                        [id],
+                    )
+                    raw = cursor.fetchone()
+                    if raw is None:
+                        return AdminCouponPayload(
+                            coupon=None,
+                            user_errors=[_auth_error("Coupon not found.", "NOT_FOUND")],
+                        )
+                    previous_coupon = dict(
+                        zip((column[0] for column in cursor.description), raw)
+                    )
+                    previous_coupon["starts_at"] = _coupon_utc_datetime(
+                        previous_coupon["starts_at"]
+                    )
+                    previous_coupon["ends_at"] = _coupon_utc_datetime(
+                        previous_coupon["ends_at"]
+                    )
+                    promotion_id = previous_coupon["promotion_id"]
+                    previous_discount = Decimal("0")
+                    if promotion_id is not None:
+                        cursor.execute(
+                            "SELECT discount_pct, product_bgg_id FROM promotion "
+                            "WHERE id = %s FOR UPDATE",
+                            [promotion_id],
+                        )
+                        promotion = cursor.fetchone()
+                        if promotion is None or promotion[1] is not None:
+                            return AdminCouponPayload(
+                                coupon=None,
+                                user_errors=[
+                                    _auth_error(
+                                        "Coupon does not have a product-less promotion.",
+                                        "PROMOTION_NOT_FOUND",
+                                    )
+                                ],
+                            )
+                        previous_discount = Decimal(str(promotion[0]))
+                    else:
+                        return AdminCouponPayload(
+                            coupon=None,
+                            user_errors=[
+                                _auth_error(
+                                    "Coupon does not have a product-less promotion.",
+                                    "PROMOTION_NOT_FOUND",
+                                )
+                            ],
+                        )
+
+                    starts_at = updates.get("starts_at", previous_coupon["starts_at"])
+                    ends_at = updates.get("ends_at", previous_coupon["ends_at"])
+                    if not _coupon_dates_valid(starts_at, ends_at):
+                        return _coupon_field_error(
+                            "endsAt", "End date must be later than start date."
+                        )
+                    previous = {
+                        "code": previous_coupon["code"],
+                        "discount_percent": float(previous_discount),
+                        "remaining": previous_coupon["remaining"],
+                        "active": previous_coupon["active"],
+                        "starts_at": (
+                            previous_coupon["starts_at"].isoformat()
+                            if previous_coupon["starts_at"] else None
+                        ),
+                        "ends_at": (
+                            previous_coupon["ends_at"].isoformat()
+                            if previous_coupon["ends_at"] else None
+                        ),
+                    }
+                    if "discount_percent" in updates:
+                        cursor.execute(
+                            "UPDATE promotion SET discount_pct = %s WHERE id = %s",
+                            [updates["discount_percent"], promotion_id],
+                        )
+                    coupon_updates = {
+                        field: updates[field]
+                        for field in ("remaining", "active", "starts_at", "ends_at")
+                        if field in updates
+                    }
+                    if coupon_updates:
+                        assignments = ", ".join(
+                            f"{field} = %s" for field in coupon_updates
+                        )
+                        cursor.execute(
+                            f"UPDATE coupon SET {assignments} WHERE id = %s",
+                            [*coupon_updates.values(), id],
+                        )
+                    coupon = _coupon_admin_result(
+                        cursor,
+                        id,
+                        user,
+                        "coupon_updated",
+                        previous,
+                    )
+            return AdminCouponPayload(coupon=coupon, user_errors=[])
+        except Exception:
+            return AdminCouponPayload(
+                coupon=None,
+                user_errors=[_auth_error("Could not update coupon.", "SERVER_ERROR")],
+            )
 
 
 class IssuedGiftCard(graphene.ObjectType):
@@ -1885,9 +3085,51 @@ class ReleasePaymentAttemptMutation(graphene.Mutation):
             return PaymentAttemptReleasePayload(user_errors=[OrderUserError(code="SERVER_ERROR", message="Could not release payment attempt.")])
 
 
+class ManageOperationSessionMutation(graphene.Mutation):
+    class Arguments:
+        session_id = graphene.ID(required=True)
+        action = graphene.String(required=True)
+
+    Output = ManageOperationSessionPayload
+
+    @staticmethod
+    def mutate(_root, info, session_id, action):
+        try:
+            user = _authenticated_user(info)
+            if user is None:
+                return ManageOperationSessionPayload(success=False, user_errors=[OrderUserError(code="UNAUTHENTICATED", message="Authentication required.")])
+            if not (getattr(user, "is_staff", False) or getattr(user, "is_superuser", False)):
+                return ManageOperationSessionPayload(success=False, user_errors=[OrderUserError(code="FORBIDDEN", message="Administrator permission required.")])
+            identifier = uuid.UUID(str(session_id))
+            if action not in ("REVOKE", "EXPIRE"):
+                raise ValueError("Invalid action")
+            from django.utils import timezone
+            from opkeys.models import OpKeyAudit, OpSession
+            changes = {"revoked": True} if action == "REVOKE" else {"expires_at": timezone.now()}
+            with transaction.atomic(using=OpSession.objects.db):
+                session = OpSession.objects.select_for_update().filter(pk=identifier).first()
+                if session is None:
+                    return ManageOperationSessionPayload(success=False, user_errors=[OrderUserError(code="NOT_FOUND", message="Operation session not found.")])
+                for field, value in changes.items():
+                    setattr(session, field, value)
+                session.save(update_fields=list(changes))
+                OpKeyAudit.objects.create(
+                    session_id=session.id, subject_user_id=session.user_id, actor_user_id=user.pk,
+                    actor_source="ADMIN", action=action,
+                )
+            reference = hashlib.sha256(str(identifier).encode("utf-8")).hexdigest()[:16]
+            logging.getLogger("opkeys.audit").info("OpKey administrative action=%s actor_id=%s reference=%s", action, user.pk, reference)
+            return ManageOperationSessionPayload(success=True, user_errors=[])
+        except (TypeError, ValueError):
+            return ManageOperationSessionPayload(success=False, user_errors=[OrderUserError(code="INVALID", message="Invalid request.")])
+        except Exception:
+            return ManageOperationSessionPayload(success=False, user_errors=[OrderUserError(code="SERVER_ERROR", message="Could not update operation session.")])
+
+
 class Mutation(graphene.ObjectType):
     register = RegisterMutation.Field(required=True)
     login = LoginMutation.Field(required=True)
+    manage_op_session = ManageOperationSessionMutation.Field(required=True)
     add_to_cart = AddToCartMutation.Field(required=True)
     update_cart_quantity = UpdateCartQuantityMutation.Field(required=True)
     remove_from_cart = RemoveFromCartMutation.Field(required=True)
@@ -1895,11 +3137,48 @@ class Mutation(graphene.ObjectType):
     remove_from_wishlist = RemoveFromWishlistMutation.Field(required=True)
     create_review = CreateReviewMutation.Field(required=True)
     # Admin mutations for BFF
-    create_product = CreateProductMutation.Field(required=True)
-    update_product = UpdateProductMutation.Field(required=True)
-    adjust_variant_stock = AdjustVariantStockMutation.Field(required=True)
-    create_promotion = CreatePromotionMutation.Field(required=True)
-    update_promotion = UpdatePromotionMutation.Field(required=True)
+    create_product = CreateProductMutation.Field(
+        required=True,
+        description="Requires an active staff or superuser account.",
+    )
+    update_product = UpdateProductMutation.Field(
+        required=True,
+        description="Requires an active staff or superuser account.",
+    )
+    add_product_stock = AddProductStockMutation.Field(required=True)
+    adjust_product_stock = AdjustProductStockMutation.Field(
+        required=True,
+        description=(
+            "UUID-bound stock movement. Retries with the same product, direction and\n"
+            "quantity do not duplicate applied work; failed, rejected or no-change\n"
+            "operations may retry the exact payload indefinitely. Reusing the UUID with\n"
+            "different movement data rejects. OUT over available stock applies partially\n"
+            "to zero and reports requested and applied quantities. Requires an active\n"
+            "staff or superuser account."
+        ),
+    )
+    create_promotion = CreatePromotionMutation.Field(
+        required=True,
+        description="Requires an active staff or superuser account.",
+    )
+    update_promotion = UpdatePromotionMutation.Field(
+        required=True,
+        description="Requires an active staff or superuser account.",
+    )
+    create_admin_coupon = AdminCreateCouponMutation.Field(
+        required=True,
+        description=(
+            "Requires an active staff or superuser account. Coupon creation and "
+            "its audit\nrecord commit atomically; the percentage is stored on a product-less promotion."
+        ),
+    )
+    update_admin_coupon = AdminUpdateCouponMutation.Field(
+        required=True,
+        description=(
+            "Requires an active staff or superuser account. Code is immutable. Coupon\n"
+            "updates and their audit records commit atomically; deactivation replaces deletion."
+        ),
+    )
     create_gift_card = CreateGiftCardMutation.Field(required=True)
     redeem_gift_card = RedeemGiftCardMutation.Field(
         required=True,
@@ -1920,7 +3199,18 @@ class Mutation(graphene.ObjectType):
             "with that key conflicts."
         ),
     )
-    checkout = CheckoutMutation.Field(required=True)
+    checkout = CheckoutMutation.Field(
+        required=True,
+        description=(
+            "A supplied coupon is reserved atomically during checkout. Release only after\n"
+            "confirmed failure or cancellation; uncertain provider outcomes retain the\n"
+            "reservation for reconciliation and unresolved outcomes require manual review.\n"
+            "A timeout alone does not release a reservation. Coupon codes are matched by\n"
+            "exact, case-sensitive equality, without normalization.\n"
+            "Coupon checkouts require checkoutKey. Retrying the same key with the same\n"
+            "payload returns the original order; using it for a different payload conflicts."
+        ),
+    )
     retry_payment = RetryPaymentMutation.Field(required=True)
     confirm_payment = ConfirmPaymentMutation.Field(required=True)
     resolve_payment_review = ResolvePaymentReviewMutation.Field(required=True)

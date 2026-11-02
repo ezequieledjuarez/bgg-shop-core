@@ -2,6 +2,7 @@
 
 **Branch**: `CU-06-wishlist` | **Date**: 2026-10-21 | **Spec**: [spec.md](spec.md)
 **Input**: Core catalog specification in [spec.md](spec.md)
+**Status**: Closed with exceptions on 2026-10-30; see the [canonical closure](../../../specs/002-catalog-search-filters-as-built/spec.md).
 
 ## Summary
 
@@ -16,7 +17,7 @@ Retrospective plan for Core's paginated `products` GraphQL query. The query appl
 **Target Platform**: Linux server  
 **Project Type**: Django/Graphene web service  
 **Performance Goals**: Not specified; pending verification.  
-**Constraints**: Parameterized SQL; filters precede count/limit/offset; fixed `ORDER BY id`; the category map is limited to three local IDs; relevance ordering is not implemented.  
+**Constraints**: Parameterized SQL; filters precede count/limit/offset; fixed `ORDER BY id`; legacy category IDs remain limited to three names while dynamic names come from product data; relevance ordering is not implemented.
 **Scale/Scope**: One public catalog query with optional filters and pagination.
 
 ## Constitution Check
@@ -46,4 +47,4 @@ tests/test_graphql_products.py
 
 ## Complexity Tracking
 
-No added persistence layer is reported. Relevance ranking, a category table, and UI pagination are out of scope for the delivered Core behavior and remain limitations rather than implied implementation work.
+No added persistence layer is reported. Relevance ranking and a category table remain outside Core scope. UI pagination is implemented in the [frontend catalog](../../../bgg-shop-frontend/src/App.tsx), not in Core.
