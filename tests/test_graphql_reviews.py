@@ -384,6 +384,16 @@ mutation ModerateReview($reviewId: ID!, $action: ReviewModerationAction!) {
 }
 """
 
+DELETE_REVIEW_MUTATION = """
+mutation DeleteReview($reviewId: ID!) {
+  moderateReview(reviewId: $reviewId, action: DELETE) {
+    success
+    review { id status deleted publiclyVisible }
+    userErrors { code field message }
+  }
+}
+"""
+
 
 def _moderator(is_staff=False, is_superuser=False, is_active=True):
     return SimpleNamespace(
@@ -682,6 +692,35 @@ def test_review_moderation_is_idempotent_for_same_state(status, action):
     assert payload["review"]["publiclyVisible"] is (status == "ACCEPTED")
 
 
+def test_delete_accepted_review_reports_soft_deleted_and_not_public():
+    accepted = (91, 7, "Catan", 5, "Great game", CREATED_AT, "ACCEPTED", False)
+    deleted = (91, 7, "Catan", 5, "Great game", CREATED_AT, "ACCEPTED", True)
+    connection, cursor = _review_cursor()
+    cursor.fetchone.side_effect = [accepted, deleted]
+
+    with patch.object(api, "connection", connection), \
+         patch.object(
+             api, "_authenticated_user", return_value=_moderator(is_staff=True)
+         ), \
+         patch.object(api.transaction, "atomic"):
+        result = schema.execute(
+            DELETE_REVIEW_MUTATION,
+            variable_values={"reviewId": "91"},
+            context_value=SimpleNamespace(headers={}),
+        )
+
+    assert result.errors is None
+    payload = result.data["moderateReview"]
+    assert payload["userErrors"] == []
+    assert payload["success"] is True
+    assert payload["review"] == {
+        "id": "91",
+        "status": "ACCEPTED",
+        "deleted": True,
+        "publiclyVisible": False,
+    }
+
+
 def test_pending_is_not_a_valid_moderation_action():
     connection, cursor = _review_cursor()
     with patch.object(api, "connection", connection), \
@@ -861,3 +900,83 @@ def test_public_detail_includes_only_accepted_non_deleted_reviews_and_matching_s
     public_sql = cursor.execute.call_args.args[0].lower()
     assert "status = 'accepted'" in public_sql
     assert "is_deleted = false" in public_sql
+
+
+def test_deleting_last_accepted_review_retains_row_and_removes_public_visibility(
+    review_migration_database,
+):
+    database = review_migration_database
+    _migrate_review_status(database, REVIEW_STATUS_TARGET)
+    with database.cursor() as cursor:
+        cursor.execute("ALTER TABLE product_boardgame ADD COLUMN name varchar(200)")
+        cursor.execute("UPDATE product_boardgame SET name = 'Catan' WHERE bgg_id = 7")
+
+    with patch.object(
+        api, "_authenticated_user", return_value=_moderator(is_staff=True)
+    ):
+        delete_result = schema.execute(
+            DELETE_REVIEW_MUTATION,
+            variable_values={"reviewId": "2"},
+            context_value=SimpleNamespace(headers={}),
+        )
+
+    assert delete_result.errors is None
+    delete_payload = delete_result.data["moderateReview"]
+    assert delete_payload["success"] is True
+    assert delete_payload["userErrors"] == []
+    assert delete_payload["review"]["status"] == "ACCEPTED"
+    assert delete_payload["review"]["deleted"] is True
+    assert delete_payload["review"]["publiclyVisible"] is False
+
+    with database.cursor() as cursor:
+        cursor.execute(
+            "SELECT status, is_deleted FROM product_review WHERE id = 2"
+        )
+        assert cursor.fetchone() == ("ACCEPTED", True)
+
+    with patch.object(
+        api, "_authenticated_user", return_value=_moderator(is_staff=True)
+    ):
+        admin_result = schema.execute(
+            ADMIN_REVIEWS_QUERY,
+            variable_values={"status": "ACCEPTED", "page": 1, "pageSize": 50},
+            context_value=SimpleNamespace(headers={}),
+        )
+
+    assert admin_result.errors is None
+    assert admin_result.data["adminReviews"]["items"] == []
+
+    product = {
+        "bgg_id": 7,
+        "name": "Catan",
+        "release_year": 1995,
+        "min_players": 3,
+        "max_players": 4,
+        "playing_time_minutes": 60,
+        "min_age": 10,
+        "weight": 2.3,
+        "category": "Strategy",
+        "price_amount": 49.99,
+        "publisher": "Kosmos",
+        "image_url": "https://example.test/catan.jpg",
+        "quantity": 4,
+    }
+    with patch.object(api, "_product_by_slug", return_value=product):
+        public_result = schema.execute(
+            """
+            {
+              productBySlug(slug: "catan") {
+                reviewSummary { approvedReviewCount averageRating }
+                approvedReviews { rating body }
+              }
+            }
+            """
+        )
+
+    assert public_result.errors is None
+    detail = public_result.data["productBySlug"]
+    assert detail["reviewSummary"] == {
+        "approvedReviewCount": 0,
+        "averageRating": None,
+    }
+    assert detail["approvedReviews"] == []
