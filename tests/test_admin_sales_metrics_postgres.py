@@ -424,6 +424,25 @@ def test_invalid_timezone_or_range_returns_field_specific_invalid_error(
 
 
 @pytest.mark.parametrize(
+    "variables,missing_field",
+    [
+        ({"from": DEFAULT_FROM, "to": None}, "to"),
+        ({"from": None, "to": DEFAULT_TO}, "from"),
+    ],
+)
+def test_one_sided_date_range_returns_invalid_for_missing_bound(
+    database, variables, missing_field
+):
+    result = _execute(METRICS_QUERY, variables)
+
+    assert result.errors
+    assert result.errors[0].extensions == {
+        "code": "INVALID",
+        "field": missing_field,
+    }
+
+
+@pytest.mark.parametrize(
     "context,code",
     [
         (SimpleNamespace(user=None), "UNAUTHENTICATED"),

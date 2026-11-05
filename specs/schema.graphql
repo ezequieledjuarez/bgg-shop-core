@@ -362,10 +362,12 @@ type Query {
   """
   adminAuditLogs(entityType: String, entityId: String, actorId: String, action: String, createdFrom: String, createdTo: String, cursor: String, limit: Int = 50): AdminAuditPage!
   """
-  Requires an active staff or superuser account. from and to are optional
-  timezone-aware ISO instants normalized to UTC and define the half-open range
-  [from, to); if both are omitted, the range is the last 30 days. The maximum
-  range is 366 days. Revenue and ordersCount use paid orders by paid_at;
+  Requires an active staff or superuser account. from and to are individually
+  optional timezone-aware ISO instants normalized to UTC and define the
+  half-open range [from, to). Callers must provide both bounds or omit both;
+  if exactly one is supplied, INVALID identifies the missing bound in
+  extensions.field. If both are omitted, the range is the last 30 days. The
+  maximum range is 366 days. Revenue and ordersCount use paid orders by paid_at;
   payment and dispatch status counts use orders by created_at. Gross revenue
   sums purchase-order line subtotals and may differ from the order total. Exact
   category and product filters include matching lines only; each matching
