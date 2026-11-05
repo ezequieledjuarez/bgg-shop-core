@@ -47,3 +47,4 @@ Branch: `010-sales-metrics-reports`. Local validation only; disposable PostgreSQ
 - `PYTHONPATH=. python -m pytest -q -p no:cacheprovider tests/test_graphql_products.py::test_generated_schema_matches_reference_sdl`: PASS, 1 passed, 1 Django `USE_TZ` deprecation warning in 1.72s. The test only builds and compares schemas in memory; it does not connect to a database.
 - Parent rerun of the full C-3 PostgreSQL suite: PASS, 22 passed and 1 warning in 5.04s; `TEST_CONTAINER_CLEANUP=PASS`.
 - Delegated execution-verifier result: NOT ACCEPTED as pass evidence; 22 skipped in 1.64s because its test process did not receive the disposable DSN. Parent rerun with the DSN explicitly passed to pytest exercised all tests and passed.
+- C-3 work-unit commits: Core `5c7724ec875ba8076d486fe87cd88966d263413d`; orchestrator `ae0e724956aaf9a9c5d9a441cbf4eb30d7e10bf0`.
