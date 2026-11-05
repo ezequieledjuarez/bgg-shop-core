@@ -2230,16 +2230,16 @@ class ModerateReviewMutation(graphene.Mutation):
             )
 
         action_value = getattr(action, "value", action)
-        if action_value not in {"ACCEPT", "REJECT"}:
+        if action_value not in {"ACCEPT", "REJECT", "DELETE"}:
             return ModerateReviewPayload(
                 success=False,
                 user_errors=[_moderation_error(
                     "INVALID_TRANSITION",
-                    "Only ACCEPT and REJECT actions are supported.",
+                    "Only ACCEPT, REJECT, and DELETE actions are supported.",
                 )],
             )
-        target_status = (
-            "ACCEPTED" if action_value == "ACCEPT" else "REJECTED"
+        target_status = {"ACCEPT": "ACCEPTED", "REJECT": "REJECTED"}.get(
+            action_value
         )
         valid_statuses = {"PENDING", "ACCEPTED", "REJECTED"}
         try:
@@ -2256,13 +2256,18 @@ class ModerateReviewMutation(graphene.Mutation):
 
         with transaction.atomic():
             with connection.cursor() as cursor:
+                deletion_filter = (
+                    ""
+                    if action_value == "DELETE"
+                    else " AND review.is_deleted = FALSE"
+                )
                 cursor.execute(
                     "SELECT review.id, review.bgg_id, game.name, review.rating, "
                     "review.body, review.created_at, review.status, review.is_deleted "
                     "FROM product_review review "
                     "JOIN product_boardgame game ON game.bgg_id = review.bgg_id "
-                    "WHERE review.id = %s AND review.is_deleted = FALSE "
-                    "FOR UPDATE OF review",
+                    "WHERE review.id = %s" + deletion_filter +
+                    " FOR UPDATE OF review",
                     [identifier],
                 )
                 row = cursor.fetchone()
@@ -2274,7 +2279,43 @@ class ModerateReviewMutation(graphene.Mutation):
                         )],
                     )
 
-                if row[6] not in valid_statuses:
+                if row[7] and action_value != "DELETE":
+                    return ModerateReviewPayload(
+                        success=False,
+                        user_errors=[_moderation_error(
+                            "REVIEW_NOT_FOUND", "Review not found.", ["reviewId"]
+                        )],
+                    )
+
+                if action_value == "DELETE":
+                    if not row[7]:
+                        cursor.execute(
+                            "UPDATE product_review SET is_deleted = TRUE, "
+                            "updated_at = CURRENT_TIMESTAMP "
+                            "WHERE id = %s AND is_deleted = FALSE",
+                            [identifier],
+                        )
+                        cursor.execute(
+                            "SELECT review.id, review.bgg_id, game.name, "
+                            "review.rating, review.body, review.created_at, "
+                            "review.status, review.is_deleted "
+                            "FROM product_review review "
+                            "JOIN product_boardgame game "
+                            "ON game.bgg_id = review.bgg_id "
+                            "WHERE review.id = %s",
+                            [identifier],
+                        )
+                        row = cursor.fetchone()
+                        if row is None:
+                            return ModerateReviewPayload(
+                                success=False,
+                                user_errors=[_moderation_error(
+                                    "REVIEW_NOT_FOUND",
+                                    "Review not found.",
+                                    ["reviewId"],
+                                )],
+                            )
+                elif row[6] not in valid_statuses:
                     return ModerateReviewPayload(
                         success=False,
                         user_errors=[_moderation_error(
@@ -2282,8 +2323,7 @@ class ModerateReviewMutation(graphene.Mutation):
                             f"Cannot {action_value.lower()} a {row[6].lower()} review.",
                         )],
                     )
-
-                if row[6] != target_status:
+                elif row[6] != target_status:
                     cursor.execute(
                         "UPDATE product_review SET status = %s, "
                         "updated_at = CURRENT_TIMESTAMP "
