@@ -35,4 +35,4 @@ Branch: `010-sales-metrics-reports`. Local validation only; disposable PostgreSQ
 - `git diff --check`: PASS.
 - Parent rerun of the C-2 focused metrics/filter suite: PASS, 17 passed and 4 deselected, 1 Django warning in 4.20s. The exit trap left the uniquely named container running; the parent removed it explicitly and verified it was absent.
 - `PYTHONPATH=. python -m pytest -q -p no:cacheprovider --tb=short tests/test_graphql_products.py::test_generated_schema_matches_reference_sdl`: FAIL because runtime still lacks `adminSalesCategories`, reserved for C-3. Targeted comparison confirmed this is the only missing Query field; `adminSalesMetrics` type, arguments, payload fields, and description match the SDL.
-- No commit was created, per instruction; parent handles commit after independent verification.
+- C-2 work-unit commits: Core `b447261a93d6f127963646ea24874ea9a9eb487d`; orchestrator `717be40568313763f6c09f94f64aa8455871fe6c`.
