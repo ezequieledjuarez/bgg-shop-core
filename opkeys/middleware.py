@@ -21,6 +21,8 @@ def _delegated_operation_allowed(request, method, path):
             ("GET", r"/api/v1/admin/op-sessions", OperationType.QUERY, "adminOpSessions", None),
             ("POST", r"/api/v1/admin/op-sessions/(?P<sessionId>[^/]+)/(?P<action>revoke|expire)", OperationType.MUTATION, "manageOpSession", "session"),
             ("GET", r"/api/v1/admin/audit", OperationType.QUERY, "adminAuditLogs", None),
+            ("GET", r"/api/v1/admin/sales-metrics", OperationType.QUERY, "adminSalesMetrics", None),
+            ("GET", r"/api/v1/admin/sales-metrics/categories", OperationType.QUERY, "adminSalesCategories", None),
             ("GET", r"/api/v1/admin/coupons", OperationType.QUERY, "adminCoupons", None),
             ("POST", r"/api/v1/admin/coupons", OperationType.MUTATION, "createAdminCoupon", None),
             ("PATCH", r"/api/v1/admin/coupons/(?P<couponId>[0-9]+)", OperationType.MUTATION, "updateAdminCoupon", "couponId"),

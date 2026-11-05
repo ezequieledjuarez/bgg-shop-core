@@ -676,6 +676,55 @@ class ManageOperationSessionPayload(graphene.ObjectType):
     user_errors = graphene.List(graphene.NonNull(OrderUserError), required=True)
 
 
+class TopProduct(graphene.ObjectType):
+    bgg_id = graphene.Int(required=True)
+    name = graphene.String(required=True)
+    units = graphene.Int(required=True)
+    revenue = graphene.Float(required=True)
+
+
+class RevenueByDay(graphene.ObjectType):
+    date = graphene.String(required=True)
+    revenue = graphene.Float(required=True)
+
+
+class StatusCount(graphene.ObjectType):
+    status = graphene.String(required=True)
+    count = graphene.Int(required=True)
+
+
+class SalesMetrics(graphene.ObjectType):
+    revenue_total = graphene.Float(required=True)
+    orders_count = graphene.Int(required=True)
+    top_products = graphene.List(graphene.NonNull(TopProduct), required=True)
+    orders_by_dispatch_status = graphene.List(
+        graphene.NonNull(StatusCount), required=True
+    )
+    orders_by_payment_status = graphene.List(
+        graphene.NonNull(StatusCount), required=True
+    )
+    revenue_by_day = graphene.List(graphene.NonNull(RevenueByDay), required=True)
+
+
+def _sales_metrics_invalid(field):
+    return GraphQLError(
+        f"{field} is invalid", extensions={"code": "INVALID", "field": field}
+    )
+
+
+def _sales_metrics_date(value, field):
+    if not isinstance(value, str):
+        raise _sales_metrics_invalid(field)
+    try:
+        normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+        parsed = datetime.datetime.fromisoformat(normalized)
+    except ValueError:
+        raise _sales_metrics_invalid(field) from None
+    if parsed.utcoffset() is None:
+        raise _sales_metrics_invalid(field)
+    return parsed.astimezone(datetime.timezone.utc)
+
+
 class Query(graphene.ObjectType):
     hello = graphene.String(default_value="Saleor API activa y respondiendo OK")
     me = graphene.Field(lambda: AuthUser)
@@ -767,6 +816,40 @@ class Query(graphene.ObjectType):
             "with an opaque signed cursor; limit defaults to 50 (maximum 100). Invalid "
             "filters, limits or cursors fail with extensions.code INVALID and "
             "extensions.field; authorization failures use UNAUTHENTICATED or FORBIDDEN."
+        ),
+    )
+    admin_sales_metrics = graphene.Field(
+        SalesMetrics,
+        from_=graphene.String(name="from"),
+        to=graphene.String(),
+        categories=graphene.List(graphene.NonNull(graphene.String)),
+        product_ids=graphene.List(graphene.NonNull(graphene.Int), name="productIds"),
+        required=True,
+        description=(
+            "Requires an active staff or superuser account. from and to are individually\n"
+            "optional timezone-aware ISO instants normalized to UTC and define the\n"
+            "half-open range [from, to). Callers must provide both bounds or omit both;\n"
+            "if exactly one is supplied, INVALID identifies the missing bound in\n"
+            "extensions.field. If both are omitted, the range is the last 30 days. The\n"
+            "maximum range is 366 days. Revenue and ordersCount use paid orders by paid_at;\n"
+            "payment and dispatch status counts use orders by created_at. Gross revenue\n"
+            "sums purchase-order line subtotals and may differ from the order total. Exact\n"
+            "category and product filters include matching lines only; each matching\n"
+            "order is counted once. Dispatch status is derived at query time from paid_at:\n"
+            "Pendiente for pending_payment, En preparación before 24 hours, Enviado from\n"
+            "24 to less than 72 hours, and Entregado at 72 hours or later. pickup orders\n"
+            "follow the same rule; rejected, cancelled and paid_stock_conflict orders have\n"
+            "no dispatch status. Invalid input fails with extensions.code INVALID and\n"
+            "extensions.field; authorization failures use UNAUTHENTICATED or FORBIDDEN."
+        ),
+    )
+    admin_sales_categories = graphene.List(
+        graphene.NonNull(graphene.String),
+        required=True,
+        description=(
+            "Requires an active staff or superuser account; returns distinct stored "
+            "category strings for the sales-metrics filter. Authorization failures "
+            "use UNAUTHENTICATED or FORBIDDEN."
         ),
     )
     coupon_by_code = graphene.Field(Coupon, code=graphene.String(required=True))
@@ -1247,6 +1330,162 @@ class Query(graphene.ObjectType):
                 salt=_AUDIT_CURSOR_SALT, compress=False,
             )
         return AdminAuditPage(records=records, next_cursor=next_cursor)
+
+    def resolve_admin_sales_metrics(
+        self, info, from_=None, to=None, categories=None, product_ids=None
+    ):
+        user = _authenticated_user(info)
+        if user is None or not getattr(user, "is_active", False):
+            raise GraphQLError(
+                "Authentication is required.",
+                extensions={"code": "UNAUTHENTICATED"},
+            )
+        if not (
+            getattr(user, "is_staff", False)
+            or getattr(user, "is_superuser", False)
+        ):
+            raise GraphQLError(
+                "Administrator permission is required.",
+                extensions={"code": "FORBIDDEN"},
+            )
+
+        if (from_ is None) != (to is None):
+            raise _sales_metrics_invalid("to" if from_ is not None else "from")
+        if from_ is None:
+            range_to = datetime.datetime.now(datetime.timezone.utc)
+            range_from = range_to - datetime.timedelta(days=30)
+        else:
+            range_from = _sales_metrics_date(from_, "from")
+            range_to = _sales_metrics_date(to, "to")
+        if range_from >= range_to:
+            raise _sales_metrics_invalid("to")
+        if range_to - range_from > datetime.timedelta(days=366):
+            raise _sales_metrics_invalid("to")
+
+        filters = []
+        filter_parameters = []
+        if categories is not None:
+            filters.append("p.category = ANY(%s)")
+            filter_parameters.append(categories)
+        if product_ids is not None:
+            filters.append("p.bgg_id = ANY(%s)")
+            filter_parameters.append(product_ids)
+        filter_clause = " AND " + " AND ".join(filters) if filters else ""
+        query_time = datetime.datetime.now(datetime.timezone.utc)
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT COALESCE(SUM(l.subtotal), 0), COUNT(DISTINCT o.id) "
+                "FROM purchase_order o "
+                "LEFT JOIN purchase_order_line l ON l.order_id = o.id "
+                "LEFT JOIN product_boardgame p ON p.bgg_id = l.bgg_id "
+                "WHERE o.status = 'paid' AND o.paid_at >= %s AND o.paid_at < %s"
+                + filter_clause,
+                [range_from, range_to, *filter_parameters],
+            )
+            revenue_total, orders_count = cursor.fetchone()
+
+            cursor.execute(
+                "SELECT p.bgg_id, p.name, SUM(l.quantity), SUM(l.subtotal) "
+                "FROM purchase_order o "
+                "JOIN purchase_order_line l ON l.order_id = o.id "
+                "JOIN product_boardgame p ON p.bgg_id = l.bgg_id "
+                "WHERE o.status = 'paid' AND o.paid_at >= %s AND o.paid_at < %s"
+                + filter_clause
+                + " GROUP BY p.bgg_id, p.name "
+                "ORDER BY SUM(l.quantity) DESC, SUM(l.subtotal) DESC, p.bgg_id ASC "
+                "LIMIT 10",
+                [range_from, range_to, *filter_parameters],
+            )
+            top_products = [
+                TopProduct(bgg_id=row[0], name=row[1], units=row[2], revenue=row[3])
+                for row in cursor.fetchall()
+            ]
+
+            cursor.execute(
+                "SELECT (o.paid_at AT TIME ZONE 'UTC')::date, SUM(l.subtotal) "
+                "FROM purchase_order o "
+                "JOIN purchase_order_line l ON l.order_id = o.id "
+                "JOIN product_boardgame p ON p.bgg_id = l.bgg_id "
+                "WHERE o.status = 'paid' AND o.paid_at >= %s AND o.paid_at < %s"
+                + filter_clause
+                + " GROUP BY (o.paid_at AT TIME ZONE 'UTC')::date "
+                "ORDER BY (o.paid_at AT TIME ZONE 'UTC')::date ASC",
+                [range_from, range_to, *filter_parameters],
+            )
+            revenue_by_day = [
+                RevenueByDay(date=row[0].isoformat(), revenue=row[1])
+                for row in cursor.fetchall()
+            ]
+
+            cursor.execute(
+                "SELECT COALESCE(o.payment_status, o.status), COUNT(DISTINCT o.id) "
+                "FROM purchase_order o "
+                "LEFT JOIN purchase_order_line l ON l.order_id = o.id "
+                "LEFT JOIN product_boardgame p ON p.bgg_id = l.bgg_id "
+                "WHERE o.created_at >= %s AND o.created_at < %s"
+                + filter_clause
+                + " GROUP BY COALESCE(o.payment_status, o.status) "
+                "ORDER BY COALESCE(o.payment_status, o.status)",
+                [range_from, range_to, *filter_parameters],
+            )
+            payment_statuses = [
+                StatusCount(status=row[0], count=row[1])
+                for row in cursor.fetchall()
+            ]
+
+            cursor.execute(
+                "SELECT CASE "
+                "WHEN o.status = 'pending_payment' THEN 'Pendiente' "
+                "WHEN o.paid_at > %s - INTERVAL '24 hours' THEN 'En preparación' "
+                "WHEN o.paid_at > %s - INTERVAL '72 hours' THEN 'Enviado' "
+                "ELSE 'Entregado' END, COUNT(DISTINCT o.id) "
+                "FROM purchase_order o "
+                "LEFT JOIN purchase_order_line l ON l.order_id = o.id "
+                "LEFT JOIN product_boardgame p ON p.bgg_id = l.bgg_id "
+                "WHERE o.created_at >= %s AND o.created_at < %s "
+                "AND (o.status = 'pending_payment' OR "
+                "(o.status = 'paid' AND o.paid_at IS NOT NULL))"
+                + filter_clause
+                + " GROUP BY 1 ORDER BY 1",
+                [query_time, query_time, range_from, range_to, *filter_parameters],
+            )
+            dispatch_statuses = [
+                StatusCount(status=row[0], count=row[1])
+                for row in cursor.fetchall()
+            ]
+
+        return SalesMetrics(
+            revenue_total=revenue_total,
+            orders_count=orders_count,
+            top_products=top_products,
+            orders_by_dispatch_status=dispatch_statuses,
+            orders_by_payment_status=payment_statuses,
+            revenue_by_day=revenue_by_day,
+        )
+
+    def resolve_admin_sales_categories(self, info):
+        user = _authenticated_user(info)
+        if user is None or not getattr(user, "is_active", False):
+            raise GraphQLError(
+                "Authentication is required.",
+                extensions={"code": "UNAUTHENTICATED"},
+            )
+        if not (
+            getattr(user, "is_staff", False)
+            or getattr(user, "is_superuser", False)
+        ):
+            raise GraphQLError(
+                "Administrator permission is required.",
+                extensions={"code": "FORBIDDEN"},
+            )
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT DISTINCT category FROM product_boardgame "
+                "ORDER BY category"
+            )
+            return [row[0] for row in cursor.fetchall()]
 
     def resolve_coupon_by_code(self, info, code):
         with connection.cursor() as cursor:
