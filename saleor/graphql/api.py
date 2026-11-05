@@ -843,6 +843,15 @@ class Query(graphene.ObjectType):
             "extensions.field; authorization failures use UNAUTHENTICATED or FORBIDDEN."
         ),
     )
+    admin_sales_categories = graphene.List(
+        graphene.NonNull(graphene.String),
+        required=True,
+        description=(
+            "Requires an active staff or superuser account; returns distinct stored "
+            "category strings for the sales-metrics filter. Authorization failures "
+            "use UNAUTHENTICATED or FORBIDDEN."
+        ),
+    )
     coupon_by_code = graphene.Field(Coupon, code=graphene.String(required=True))
     available_coupons = graphene.List(graphene.NonNull(AvailableCoupon), required=True)
     preview_coupon = graphene.Field(
@@ -1454,6 +1463,29 @@ class Query(graphene.ObjectType):
             orders_by_payment_status=payment_statuses,
             revenue_by_day=revenue_by_day,
         )
+
+    def resolve_admin_sales_categories(self, info):
+        user = _authenticated_user(info)
+        if user is None or not getattr(user, "is_active", False):
+            raise GraphQLError(
+                "Authentication is required.",
+                extensions={"code": "UNAUTHENTICATED"},
+            )
+        if not (
+            getattr(user, "is_staff", False)
+            or getattr(user, "is_superuser", False)
+        ):
+            raise GraphQLError(
+                "Administrator permission is required.",
+                extensions={"code": "FORBIDDEN"},
+            )
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT DISTINCT category FROM product_boardgame "
+                "ORDER BY category"
+            )
+            return [row[0] for row in cursor.fetchall()]
 
     def resolve_coupon_by_code(self, info, code):
         with connection.cursor() as cursor:

@@ -482,7 +482,14 @@ def test_categories_returns_distinct_stored_category_strings(database):
     result = _execute(CATEGORIES_QUERY)
 
     assert result.errors is None, result.errors
-    assert set(result.data["adminSalesCategories"]) == {
+    categories = result.data["adminSalesCategories"]
+    with database.cursor() as cursor:
+        cursor.execute(
+            "SELECT DISTINCT category FROM product_boardgame ORDER BY category"
+        )
+        expected_categories = [row[0] for row in cursor.fetchall()]
+    assert categories == expected_categories
+    assert set(categories) == {
         "Strategy",
         "strategy",
         " Strategy ",
@@ -493,6 +500,7 @@ def test_categories_returns_distinct_stored_category_strings(database):
     "context,code",
     [
         (SimpleNamespace(user=None), "UNAUTHENTICATED"),
+        (_context(is_active=False), "UNAUTHENTICATED"),
         (_context(is_staff=False), "FORBIDDEN"),
     ],
 )
