@@ -43,6 +43,8 @@ ruta para exploración manual. En Compose está disponible en
 | `removeFromWishlist` | `bggId`; requires an access token | Removes a product from the buyer's Wishlist and returns its data. |
 | `register` | `RegisterInput` (`email`, `password`, `firstName`, `lastName`) | Usuario creado y errores de dominio; no emite sesión. |
 | `login` | `LoginInput` (`email`, `password`) | Usuario autenticado, JWT access/refresh y errores de dominio. |
+| `adminSalesMetrics` | `from`, `to`, `categories`, `productIds`; requires staff/superuser | Totales de ventas brutas, productos principales, estados y serie diaria. |
+| `adminSalesCategories` | Requires staff/superuser | Categorías almacenadas distintas para filtrar el panel de ventas. |
 
 Ejemplo de consulta:
 
@@ -61,6 +63,19 @@ y, por GraphQL, `cart`, `addToCart`, `updateCartQuantity` y `removeFromCart`
 (el carrito no reserva ni descuenta stock). No expone checkout ni pedidos. La documentación completa de
 autenticación está en
 [`docs/CU-C01-AUTHENTICATION-CHANGES.md`](../docs/CU-C01-AUTHENTICATION-CHANGES.md).
+
+### Métricas de ventas (Admin)
+
+`adminSalesMetrics` requiere un usuario activo staff o superuser. `from` y `to`
+son límites ISO-8601 con zona horaria, se envían juntos o se omiten juntos, y
+definen el intervalo semiabierto UTC `[from, to)`; si ambos se omiten, se usa
+el rango de los últimos 30 días. Revenue y órdenes pagas usan `paid_at`; los
+conteos de pago y despacho usan `created_at`. Revenue suma subtotales
+históricos de líneas y los filtros de categoría/producto cuentan cada orden
+coincidente una sola vez. `adminSalesCategories` devuelve valores distintos
+almacenados en `product_boardgame.category` y aplica la misma autorización.
+El contrato REST consumido por el panel está documentado en el
+[`README del BFF`](../bgg-shop-bff/README.md).
 
 ### Esquema de producto y paginación
 

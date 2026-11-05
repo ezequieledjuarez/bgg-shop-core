@@ -58,6 +58,27 @@ def test_audit_and_coupon_delegation_allow_only_exact_routes_and_roots(method, p
     assert _delegated_operation_allowed(request, method, path) is allowed
 
 
+@pytest.mark.parametrize("method,path,query,allowed", [
+    ("GET", "/api/v1/admin/sales-metrics", "query { adminSalesMetrics { __typename } }", True),
+    ("GET", "/api/v1/admin/sales-metrics/categories", "query { adminSalesCategories }", True),
+    ("GET", "/api/v1/admin/sales-metrics", "query { adminSalesCategories }", False),
+    ("GET", "/api/v1/admin/sales-metrics/categories", "query { adminSalesMetrics { __typename } }", False),
+    ("GET", "/api/v1/admin/sales-metrics", "query { adminCoupons { id } }", False),
+    ("GET", "/api/v1/admin/sales-metrics/categories", "query { adminCoupons { id } }", False),
+    ("POST", "/api/v1/admin/sales-metrics", "query { adminSalesMetrics { __typename } }", False),
+    ("GET", "/api/v1/admin/sales-metrics/extra", "query { adminSalesMetrics { __typename } }", False),
+    ("GET", "/api/v1/admin/sales-metrics", "query { adminSalesMetrics { __typename } adminSalesCategories }", False),
+    ("GET", "/api/v1/admin/sales-metrics/categories", "query { adminSalesCategories adminSalesMetrics { __typename } }", False),
+])
+def test_sales_metrics_delegation_allows_only_exact_routes_and_roots(method, path, query, allowed):
+    request = RequestFactory().post(
+        "/graphql/",
+        data=json.dumps({"query": query}),
+        content_type="application/json",
+    )
+    assert _delegated_operation_allowed(request, method, path) is allowed
+
+
 @pytest.mark.parametrize("argument,extra,allowed", [
     ("12345678-1234-4234-8234-123456789abc", "", True),
     ("12345678-1234-4234-8234-123456789abd", "", False),

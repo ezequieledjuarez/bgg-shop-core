@@ -16,7 +16,8 @@ Branch: `010-sales-metrics-reports`. Local validation only; disposable PostgreSQ
 - [x] C-2 Implement `adminSalesMetrics` resolver in `saleor/graphql/api.py`: staff/superuser guard, validation, parameterized SQL, and Decimal database results through Graphene serialization. Metrics and filter cases in C-1/C-1a pass.
 - [x] C-3 Implement `adminSalesCategories` resolver and test. (after X-3)
 - [x] C-4 Review `EXPLAIN` on synthetic local data; record the outcome. No index migration is justified without representative workload and latency requirements; any future index change is a separately reviewed step.
-- [ ] C-5 Run Core tests for touched areas; record results in the global ledger.
+- [x] C-5 Run Core tests for touched areas; record results in the global ledger.
+- [x] C-6 Add exact OpKey delegation mappings for `GET /api/v1/admin/sales-metrics` → `adminSalesMetrics` and `/categories` → `adminSalesCategories`; test allowed matches and cross-route/root rejection. (required by F-5)
 
 ## C-1 Evidence
 
@@ -52,3 +53,16 @@ Branch: `010-sales-metrics-reports`. Local validation only; disposable PostgreSQ
 
 - `EXPLAIN (ANALYZE, BUFFERS)` on 100,000 synthetic orders/lines and 500 products covered unfiltered paid-at range, combined category/product filter, and created-at status counts. Plans completed in approximately 28–46 ms; the selective category/product query matched 12 rows but used sequential scans on purchase-order lines. No index was added because this synthetic dataset does not establish a representative workload or latency target. The temporary database/container was removed; active `saleor` was not used.
 - C-3 work-unit commits: Core `5c7724ec875ba8076d486fe87cd88966d263413d`; orchestrator `ae0e724956aaf9a9c5d9a441cbf4eb30d7e10bf0`.
+
+## C-6 Evidence
+
+- Test-first RED: `PYTHONPATH=. python -m pytest -q -p no:cacheprovider --tb=short tests/test_opkeys_internal.py -k sales_metrics_delegation` returned 2 failed, 8 passed, 148 deselected, 1 Django `USE_TZ` deprecation warning in 2.29s; only the two new positive route cases failed.
+- GREEN: the same focused command returned 10 passed, 148 deselected, 1 Django `USE_TZ` deprecation warning in 1.51s. Negative cases cover cross-route roots, unrelated roots, wrong method, extra path, and an extra root field.
+- Parent rerun and independent verifier: 10 passed, 148 deselected, 1 Django warning; `py_compile` and `git diff --check` passed.
+
+## C-5 Combined Verification
+
+- `PYTHONPATH=. python -m pytest -q -p no:cacheprovider --tb=short tests/test_admin_sales_metrics_postgres.py tests/test_opkeys_internal.py` with both Django database settings pointed at the disposable loopback `sales_metrics_test_<uuid>` DB: PASS, 180 passed, 1 Django `USE_TZ` deprecation warning in 6.51s. The active `saleor` database was not used.
+- `python -m py_compile opkeys/middleware.py tests/test_opkeys_internal.py`: PASS.
+- `git diff --check`: PASS.
+- No schema or SDL change; both delegated roots already exist in the GraphQL contract. C-5 passed in the combined touched-area run above.
