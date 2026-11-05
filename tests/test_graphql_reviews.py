@@ -699,6 +699,29 @@ def test_pending_is_not_a_valid_moderation_action():
     cursor.execute.assert_not_called()
 
 
+def test_moderation_returns_not_found_for_missing_or_deleted_reviews():
+    connection, cursor = _review_cursor()
+    cursor.fetchone.return_value = None
+
+    with patch.object(api, "connection", connection), \
+         patch.object(
+             api, "_authenticated_user", return_value=_moderator(is_staff=True)
+         ), \
+         patch.object(api.transaction, "atomic"):
+        result = schema.execute(
+            MODERATE_REVIEW_MUTATION,
+            variable_values={"reviewId": "91", "action": "REJECT"},
+            context_value=SimpleNamespace(headers={}),
+        )
+
+    assert result.errors is None
+    payload = result.data["moderateReview"]
+    assert payload["success"] is False
+    assert payload["userErrors"][0]["code"] == "REVIEW_NOT_FOUND"
+    query = cursor.execute.call_args.args[0].lower()
+    assert "review.is_deleted = false" in query
+
+
 def test_concurrent_moderation_last_serialized_action_wins(review_migration_database):
     database = review_migration_database
     _migrate_review_status(database, REVIEW_STATUS_TARGET)
@@ -755,23 +778,28 @@ def test_concurrent_moderation_last_serialized_action_wins(review_migration_data
     lock_transaction = transaction.atomic()
     lock_transaction.__enter__()
     threads = []
+    moderator_patch = patch.object(
+        api, "_authenticated_user", return_value=_moderator(is_staff=True)
+    )
+    moderator_patch.start()
     try:
         with database.cursor() as cursor:
             cursor.execute("SELECT id FROM product_review WHERE id = 5 FOR UPDATE")
 
-        with patch.object(
-            api, "_authenticated_user", return_value=_moderator(is_staff=True)
-        ):
-            for name, action in (("accept", "ACCEPT"), ("reject", "REJECT")):
-                thread = threading.Thread(target=moderate, args=(name, action))
-                threads.append(thread)
-                thread.start()
-                assert ready[name].wait(timeout=5)
+        for name, action in (("accept", "ACCEPT"), ("reject", "REJECT")):
+            thread = threading.Thread(target=moderate, args=(name, action))
+            threads.append(thread)
+            thread.start()
+            assert ready[name].wait(timeout=5)
+            if name == "accept":
                 wait_for_row_lock(name)
     finally:
-        lock_transaction.__exit__(None, None, None)
-        for thread in threads:
-            thread.join(timeout=10)
+        try:
+            lock_transaction.__exit__(None, None, None)
+        finally:
+            for thread in threads:
+                thread.join()
+            moderator_patch.stop()
 
     assert all(not thread.is_alive() for thread in threads)
     assert results["accept"].errors is None

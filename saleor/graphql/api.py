@@ -2230,14 +2230,18 @@ class ModerateReviewMutation(graphene.Mutation):
             )
 
         action_value = getattr(action, "value", action)
-        if action_value != "ACCEPT":
+        if action_value not in {"ACCEPT", "REJECT"}:
             return ModerateReviewPayload(
                 success=False,
                 user_errors=[_moderation_error(
                     "INVALID_TRANSITION",
-                    "Only pending reviews can be accepted by this operation.",
+                    "Only ACCEPT and REJECT actions are supported.",
                 )],
             )
+        target_status = (
+            "ACCEPTED" if action_value == "ACCEPT" else "REJECTED"
+        )
+        valid_statuses = {"PENDING", "ACCEPTED", "REJECTED"}
         try:
             identifier = int(review_id)
             if identifier < 1:
@@ -2270,13 +2274,21 @@ class ModerateReviewMutation(graphene.Mutation):
                         )],
                     )
 
-                if row[6] == "PENDING":
+                if row[6] not in valid_statuses:
+                    return ModerateReviewPayload(
+                        success=False,
+                        user_errors=[_moderation_error(
+                            "INVALID_TRANSITION",
+                            f"Cannot {action_value.lower()} a {row[6].lower()} review.",
+                        )],
+                    )
+
+                if row[6] != target_status:
                     cursor.execute(
-                        "UPDATE product_review SET status = 'ACCEPTED', "
+                        "UPDATE product_review SET status = %s, "
                         "updated_at = CURRENT_TIMESTAMP "
-                        "WHERE id = %s AND status = 'PENDING' "
-                        "AND is_deleted = FALSE",
-                        [identifier],
+                        "WHERE id = %s AND is_deleted = FALSE",
+                        [target_status, identifier],
                     )
                     cursor.execute(
                         "SELECT review.id, review.bgg_id, game.name, review.rating, "
@@ -2296,14 +2308,6 @@ class ModerateReviewMutation(graphene.Mutation):
                                 ["reviewId"],
                             )],
                         )
-                elif row[6] != "ACCEPTED":
-                    return ModerateReviewPayload(
-                        success=False,
-                        user_errors=[_moderation_error(
-                            "INVALID_TRANSITION",
-                            "Only pending reviews can be accepted by this operation.",
-                        )],
-                    )
 
         return ModerateReviewPayload(
             success=True,
