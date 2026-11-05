@@ -226,6 +226,32 @@ type AdminAuditPage {
   nextCursor: String
 }
 
+type TopProduct {
+  bggId: Int!
+  name: String!
+  units: Int!
+  revenue: Float!
+}
+
+type RevenueByDay {
+  date: String!
+  revenue: Float!
+}
+
+type StatusCount {
+  status: String!
+  count: Int!
+}
+
+type SalesMetrics {
+  revenueTotal: Float!
+  ordersCount: Int!
+  topProducts: [TopProduct!]!
+  ordersByDispatchStatus: [StatusCount!]!
+  ordersByPaymentStatus: [StatusCount!]!
+  revenueByDay: [RevenueByDay!]!
+}
+
 """Admin representation of a coupon; the discount is flattened from its product-less promotion."""
 type AdminCoupon {
   id: Int!
@@ -335,6 +361,24 @@ type Query {
   Requires an active staff or superuser account. Optional exact filters by entity type/ID, actor ID and action; createdFrom/createdTo are inclusive timezone-aware date-times normalized to UTC. Ordered by createdAt DESC, id DESC with an opaque signed cursor; limit defaults to 50 (maximum 100). Invalid filters, limits or cursors fail with extensions.code INVALID and extensions.field; authorization failures use UNAUTHENTICATED or FORBIDDEN.
   """
   adminAuditLogs(entityType: String, entityId: String, actorId: String, action: String, createdFrom: String, createdTo: String, cursor: String, limit: Int = 50): AdminAuditPage!
+  """
+  Requires an active staff or superuser account. from and to are optional
+  timezone-aware ISO instants normalized to UTC and define the half-open range
+  [from, to); if both are omitted, the range is the last 30 days. The maximum
+  range is 366 days. Revenue and ordersCount use paid orders by paid_at;
+  payment and dispatch status counts use orders by created_at. Gross revenue
+  sums purchase-order line subtotals and may differ from the order total. Exact
+  category and product filters include matching lines only; each matching
+  order is counted once. Dispatch status is derived at query time from paid_at:
+  Pendiente for pending_payment, En preparación before 24 hours, Enviado from
+  24 to less than 72 hours, and Entregado at 72 hours or later. pickup orders
+  follow the same rule; rejected, cancelled and paid_stock_conflict orders have
+  no dispatch status. Invalid input fails with extensions.code INVALID and
+  extensions.field; authorization failures use UNAUTHENTICATED or FORBIDDEN.
+  """
+  adminSalesMetrics(from: String, to: String, categories: [String!], productIds: [Int!]): SalesMetrics!
+  """Requires an active staff or superuser account; returns distinct stored category strings for the sales-metrics filter. Authorization failures use UNAUTHENTICATED or FORBIDDEN."""
+  adminSalesCategories: [String!]!
   couponByCode(code: String!): Coupon
   availableCoupons: [AvailableCoupon!]!
   """Requires an authenticated user; previews the current cart without reserving or consuming a use."""

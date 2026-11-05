@@ -5,8 +5,8 @@ Branch: `010-sales-metrics-reports`. Local validation only; disposable PostgreSQ
 
 ## Contract (blocking)
 
-- [ ] X-1 Add `adminSalesMetrics(from, to, categories, productIds)` and types (`SalesMetrics`, `TopProduct`, `RevenueByDay`, `StatusCount`) to `specs/schema.graphql`. Document: staff/superuser only; `[from, to)` UTC; revenue and `ordersCount` by `paid_at`; status counts by `created_at`; gross revenue from line subtotals (may differ from order total); dispatch rules (Pendiente / En preparación <24 h / Enviado 24–<72 h / Entregado ≥72 h after `paid_at`); errors `UNAUTHENTICATED`/`FORBIDDEN`/`INVALID` with `extensions.field`; max 366 days; default last 30 days.
-- [ ] X-3 Add `adminSalesCategories` (distinct `product_boardgame.category` values) to the SDL, same access rules.
+- [x] X-1 Add `adminSalesMetrics(from, to, categories, productIds)` and types (`SalesMetrics`, `TopProduct`, `RevenueByDay`, `StatusCount`) to `specs/schema.graphql`. Document staff/superuser access; timezone-aware UTC instants and `[from, to)`; revenue/`ordersCount` by `paid_at`; status counts by `created_at`; gross line-subtotal revenue; exact filters with matching orders counted once; dispatch boundaries; `UNAUTHENTICATED`/`FORBIDDEN`/`INVALID` with `extensions.field`; maximum 366 days; and last-30-days default when both bounds are omitted.
+- [x] X-3 Add `adminSalesCategories` (distinct stored `product_boardgame.category` values) to the SDL with staff/superuser access and documented `UNAUTHENTICATED`/`FORBIDDEN` authorization errors.
 
 ## Implementation
 
