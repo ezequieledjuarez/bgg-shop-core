@@ -15,7 +15,7 @@ Branch: `010-sales-metrics-reports`. Local validation only; disposable PostgreSQ
 - [x] C-1a Add GraphQL tests for `from`-only (expect missing `to`) and `to`-only (expect missing `from`), explicitly passing `None` for the omitted bound. Keep both-omitted default-range coverage unchanged; observe expected RED before C-2.
 - [x] C-2 Implement `adminSalesMetrics` resolver in `saleor/graphql/api.py`: staff/superuser guard, validation, parameterized SQL, and Decimal database results through Graphene serialization. Metrics and filter cases in C-1/C-1a pass.
 - [x] C-3 Implement `adminSalesCategories` resolver and test. (after X-3)
-- [ ] C-4 Review `EXPLAIN` on seeded data; add an index migration only if justified, as a separate reviewed step. Record the outcome either way.
+- [x] C-4 Review `EXPLAIN` on synthetic local data; record the outcome. No index migration is justified without representative workload and latency requirements; any future index change is a separately reviewed step.
 - [ ] C-5 Run Core tests for touched areas; record results in the global ledger.
 
 ## C-1 Evidence
@@ -47,4 +47,8 @@ Branch: `010-sales-metrics-reports`. Local validation only; disposable PostgreSQ
 - `PYTHONPATH=. python -m pytest -q -p no:cacheprovider tests/test_graphql_products.py::test_generated_schema_matches_reference_sdl`: PASS, 1 passed, 1 Django `USE_TZ` deprecation warning in 1.72s. The test only builds and compares schemas in memory; it does not connect to a database.
 - Parent rerun of the full C-3 PostgreSQL suite: PASS, 22 passed and 1 warning in 5.04s; `TEST_CONTAINER_CLEANUP=PASS`.
 - Delegated execution-verifier result: NOT ACCEPTED as pass evidence; 22 skipped in 1.64s because its test process did not receive the disposable DSN. Parent rerun with the DSN explicitly passed to pytest exercised all tests and passed.
+
+## C-4 Evidence
+
+- `EXPLAIN (ANALYZE, BUFFERS)` on 100,000 synthetic orders/lines and 500 products covered unfiltered paid-at range, combined category/product filter, and created-at status counts. Plans completed in approximately 28–46 ms; the selective category/product query matched 12 rows but used sequential scans on purchase-order lines. No index was added because this synthetic dataset does not establish a representative workload or latency target. The temporary database/container was removed; active `saleor` was not used.
 - C-3 work-unit commits: Core `5c7724ec875ba8076d486fe87cd88966d263413d`; orchestrator `ae0e724956aaf9a9c5d9a441cbf4eb30d7e10bf0`.
