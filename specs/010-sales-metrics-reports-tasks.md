@@ -13,7 +13,7 @@ Branch: `010-sales-metrics-reports`. Local validation only; disposable PostgreSQ
 
 - [x] C-1 Write failing tests in `tests/test_admin_sales_metrics_postgres.py`: `[from, to)` boundaries; only `paid` counts as revenue; subtotal-based revenue; exact category and product filters independently and together; order with ≥1 matching line counted once, revenue only from matching lines; top-10 order (units, revenue, bgg_id); `revenueByDay` in UTC (empty-day filling remains unspecified); dispatch boundaries 23h59m/24h/71h59m/72h; pending payment mapping; rejected/cancelled/`paid_stock_conflict` excluded from dispatch counts; payment and dispatch counts by `created_at`; empty range; invalid timezone/range, >366 days, `from >= to`; 401/403; distinct stored categories and category authorization. (after X-1; expected RED observed)
 - [x] C-1a Add GraphQL tests for `from`-only (expect missing `to`) and `to`-only (expect missing `from`), explicitly passing `None` for the omitted bound. Keep both-omitted default-range coverage unchanged; observe expected RED before C-2.
-- [ ] C-2 Implement `adminSalesMetrics` resolver in `saleor/graphql/api.py` (or a new module imported there): staff/superuser guard, validation, parameterized SQL, `Decimal` throughout. Make metrics and filter cases in C-1/C-1a pass; category-query cases remain for C-3.
+- [x] C-2 Implement `adminSalesMetrics` resolver in `saleor/graphql/api.py`: staff/superuser guard, validation, parameterized SQL, and Decimal database results through Graphene serialization. Metrics and filter cases in C-1/C-1a pass; category-query cases remain for C-3.
 - [ ] C-3 Implement `adminSalesCategories` resolver with test. (after X-3)
 - [ ] C-4 Review `EXPLAIN` on seeded data; add an index migration only if justified, as a separate reviewed step. Record the outcome either way.
 - [ ] C-5 Run Core tests for touched areas; record results in the global ledger.
@@ -27,3 +27,12 @@ Branch: `010-sales-metrics-reports`. Local validation only; disposable PostgreSQ
 - X-5: PyYAML/OpenAPI and graphql-core/SDL parses and paired-bound assertions passed; both query parameters remain individually optional.
 - C-1a: `python -m py_compile tests/test_admin_sales_metrics_postgres.py` passed. The focused PostgreSQL run produced the expected RED: 20 failed, 1 warning in 5.35s because Graphene does not expose `adminSalesMetrics` or `adminSalesCategories`; no collection or database setup errors occurred. The fresh loopback-only container was removed and its absence verified. No resolver behavior was implemented or passed.
 - C-1a parent rerun: 20 failed, 1 warning in 5.23s against a fresh Podman PostgreSQL container, reproducing the expected missing-field behavior; cleanup passed. A delegated execution verifier reported 20 errors without a traceback; the parent rerun immediately afterward collected and ran all cases successfully to expected RED.
+
+## C-2 Evidence
+
+- `PYTHONPATH=. python -m pytest -q -p no:cacheprovider --tb=short tests/test_admin_sales_metrics_postgres.py -k 'not categories'` against fresh loopback-only Podman PostgreSQL 15: PASS, 17 passed, 4 deselected, 1 Django `USE_TZ` deprecation warning in 4.25s. The temporary container was explicitly removed and its absence verified; the active `saleor` database was not used.
+- `python -m py_compile saleor/graphql/api.py`: PASS.
+- `git diff --check`: PASS.
+- Parent rerun of the C-2 focused metrics/filter suite: PASS, 17 passed and 4 deselected, 1 Django warning in 4.20s. The exit trap left the uniquely named container running; the parent removed it explicitly and verified it was absent.
+- `PYTHONPATH=. python -m pytest -q -p no:cacheprovider --tb=short tests/test_graphql_products.py::test_generated_schema_matches_reference_sdl`: FAIL because runtime still lacks `adminSalesCategories`, reserved for C-3. Targeted comparison confirmed this is the only missing Query field; `adminSalesMetrics` type, arguments, payload fields, and description match the SDL.
+- No commit was created, per instruction; parent handles commit after independent verification.

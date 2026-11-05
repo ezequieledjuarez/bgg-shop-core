@@ -459,6 +459,17 @@ def test_metrics_requires_active_staff_or_superuser(database, context, code):
     assert result.errors and result.errors[0].extensions["code"] == code
 
 
+def test_metrics_allows_superuser(database):
+    result = _execute(
+        METRICS_QUERY,
+        {"from": DEFAULT_FROM, "to": DEFAULT_TO},
+        _context(is_staff=False, is_superuser=True),
+    )
+
+    assert result.errors is None, result.errors
+    assert result.data["adminSalesMetrics"]["revenueTotal"] == 0
+
+
 def test_categories_returns_distinct_stored_category_strings(database):
     for bgg_id, category in (
         (50, "Strategy"),
