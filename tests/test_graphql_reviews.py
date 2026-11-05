@@ -4,6 +4,8 @@ import importlib
 import os
 import re
 import sys
+import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 from urllib.parse import unquote, urlsplit
@@ -18,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 django.setup()
 
 from django.conf import settings
-from django.db import IntegrityError
+from django.db import IntegrityError, transaction
 from django.db import connections
 from django.db.migrations.executor import MigrationExecutor
 from django.db.migrations.recorder import MigrationRecorder
@@ -372,6 +374,16 @@ mutation AcceptReview($reviewId: ID!) {
 }
 """
 
+MODERATE_REVIEW_MUTATION = """
+mutation ModerateReview($reviewId: ID!, $action: ReviewModerationAction!) {
+  moderateReview(reviewId: $reviewId, action: $action) {
+    success
+    review { id status publiclyVisible }
+    userErrors { code field message }
+  }
+}
+"""
+
 
 def _moderator(is_staff=False, is_superuser=False, is_active=True):
     return SimpleNamespace(
@@ -598,6 +610,177 @@ def test_pending_review_can_be_accepted():
         "for update" in call.args[0].lower()
         for call in cursor.execute.call_args_list
     )
+
+
+def _moderate_review(action, initial_status, resulting_status=None):
+    initial = (91, 7, "Catan", 5, "Great game", CREATED_AT, initial_status, False)
+    if resulting_status is None:
+        rows = [initial]
+    else:
+        resulting = (
+            91, 7, "Catan", 5, "Great game", CREATED_AT, resulting_status, False
+        )
+        rows = [initial, resulting]
+    connection, cursor = _review_cursor()
+    cursor.fetchone.side_effect = rows
+
+    with patch.object(api, "connection", connection), \
+         patch.object(
+             api, "_authenticated_user", return_value=_moderator(is_staff=True)
+         ), \
+         patch.object(api.transaction, "atomic"):
+        result = schema.execute(
+            MODERATE_REVIEW_MUTATION,
+            variable_values={"reviewId": "91", "action": action},
+            context_value=SimpleNamespace(headers={}),
+        )
+
+    return result, cursor
+
+
+@pytest.mark.parametrize(
+    ("initial_status", "action", "expected_status"),
+    [
+        ("PENDING", "REJECT", "REJECTED"),
+        ("ACCEPTED", "REJECT", "REJECTED"),
+        ("REJECTED", "ACCEPT", "ACCEPTED"),
+    ],
+    ids=["pending-to-rejected", "accepted-to-rejected", "rejected-to-accepted"],
+)
+def test_review_moderation_transitions(initial_status, action, expected_status):
+    result, cursor = _moderate_review(
+        action, initial_status, resulting_status=expected_status
+    )
+
+    assert result.errors is None
+    payload = result.data["moderateReview"]
+    assert payload["success"] is True
+    assert payload["userErrors"] == []
+    assert payload["review"]["status"] == expected_status
+    assert payload["review"]["publiclyVisible"] is (
+        expected_status == "ACCEPTED"
+    )
+    assert any(
+        "for update" in call.args[0].lower()
+        for call in cursor.execute.call_args_list
+    )
+
+
+@pytest.mark.parametrize(
+    ("status", "action"),
+    [("ACCEPTED", "ACCEPT"), ("REJECTED", "REJECT")],
+    ids=["accepted-again", "rejected-again"],
+)
+def test_review_moderation_is_idempotent_for_same_state(status, action):
+    result, _ = _moderate_review(action, status)
+
+    assert result.errors is None
+    payload = result.data["moderateReview"]
+    assert payload["success"] is True
+    assert payload["userErrors"] == []
+    assert payload["review"]["status"] == status
+    assert payload["review"]["publiclyVisible"] is (status == "ACCEPTED")
+
+
+def test_pending_is_not_a_valid_moderation_action():
+    connection, cursor = _review_cursor()
+    with patch.object(api, "connection", connection), \
+         patch.object(
+             api, "_authenticated_user", return_value=_moderator(is_staff=True)
+         ):
+        result = schema.execute(
+            MODERATE_REVIEW_MUTATION,
+            variable_values={"reviewId": "91", "action": "PENDING"},
+            context_value=SimpleNamespace(headers={}),
+        )
+
+    assert result.errors
+    assert "PENDING" in str(result.errors[0])
+    cursor.execute.assert_not_called()
+
+
+def test_concurrent_moderation_last_serialized_action_wins(review_migration_database):
+    database = review_migration_database
+    _migrate_review_status(database, REVIEW_STATUS_TARGET)
+    with database.cursor() as cursor:
+        cursor.execute("ALTER TABLE product_boardgame ADD COLUMN name varchar(200)")
+        cursor.execute("UPDATE product_boardgame SET name = 'Catan' WHERE bgg_id = 7")
+        cursor.execute(
+            "INSERT INTO product_review "
+            "(id, bgg_id, user_id, rating, body, status) "
+            "VALUES (5, 7, 1, 5, 'Concurrent review', 'PENDING')"
+        )
+
+    ready = {name: threading.Event() for name in ("accept", "reject")}
+    finished = {name: threading.Event() for name in ("accept", "reject")}
+    backend_pids = {}
+    results = {}
+
+    def moderate(name, action):
+        thread_connection = connections["default"]
+        try:
+            with thread_connection.cursor() as cursor:
+                cursor.execute("SELECT pg_backend_pid()")
+                backend_pids[name] = cursor.fetchone()[0]
+            ready[name].set()
+            results[name] = schema.execute(
+                MODERATE_REVIEW_MUTATION,
+                variable_values={"reviewId": "5", "action": action},
+                context_value=SimpleNamespace(headers={}),
+            )
+        finally:
+            thread_connection.close()
+            finished[name].set()
+
+    def wait_for_row_lock(name):
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if finished[name].is_set():
+                assert results[name].errors is None, (
+                    f"{name} moderation failed before acquiring the row lock: "
+                    f"{results[name].errors}"
+                )
+                pytest.fail(f"{name} moderation did not wait for the row lock")
+            with database.cursor() as cursor:
+                cursor.execute(
+                    "SELECT wait_event_type FROM pg_stat_activity WHERE pid = %s",
+                    [backend_pids[name]],
+                )
+                activity = cursor.fetchone()
+            if activity and activity[0] == "Lock":
+                return
+            time.sleep(0.05)
+        pytest.fail(f"{name} moderation did not acquire the queued row lock")
+
+    lock_transaction = transaction.atomic()
+    lock_transaction.__enter__()
+    threads = []
+    try:
+        with database.cursor() as cursor:
+            cursor.execute("SELECT id FROM product_review WHERE id = 5 FOR UPDATE")
+
+        with patch.object(
+            api, "_authenticated_user", return_value=_moderator(is_staff=True)
+        ):
+            for name, action in (("accept", "ACCEPT"), ("reject", "REJECT")):
+                thread = threading.Thread(target=moderate, args=(name, action))
+                threads.append(thread)
+                thread.start()
+                assert ready[name].wait(timeout=5)
+                wait_for_row_lock(name)
+    finally:
+        lock_transaction.__exit__(None, None, None)
+        for thread in threads:
+            thread.join(timeout=10)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert results["accept"].errors is None
+    assert results["reject"].errors is None
+    assert results["accept"].data["moderateReview"]["review"]["status"] == "ACCEPTED"
+    assert results["reject"].data["moderateReview"]["review"]["status"] == "REJECTED"
+    with database.cursor() as cursor:
+        cursor.execute("SELECT status FROM product_review WHERE id = 5")
+        assert cursor.fetchone() == ("REJECTED",)
 
 
 def test_public_detail_includes_only_accepted_non_deleted_reviews_and_matching_summary():
