@@ -126,6 +126,7 @@ type PublicReview {
 }
 
 type ReviewSummary {
+  """Count and average include accepted, non-deleted reviews only."""
   approvedReviewCount: Int!
   averageRating: Float
 }
@@ -145,7 +146,9 @@ type ProductDetail {
   publisher: String!
   imageUrl: String!
   quantity: Int!
+  """Count and average include accepted, non-deleted reviews only."""
   reviewSummary: ReviewSummary!
+  """Only accepted, non-deleted reviews are included."""
   approvedReviews: [PublicReview!]!
 }
 
@@ -348,6 +351,14 @@ type Query {
   myCredit: CreditBalancePayload!
   adminOpSessions(userId: ID, page: Int = 1, pageSize: Int = 50): OperationSessionPage!
   adminPaymentReviews(page: Int = 1, pageSize: Int = 50): PaymentReviewPage!
+  """
+  Requires an authenticated active staff or superuser identity. An operation
+  key without an active user identity is insufficient. Lists non-deleted
+  reviews filtered by an optional single status. page is one-based and defaults
+  to 1; pageSize defaults to 50 (maximum 100). Results are ordered by createdAt
+  DESC then id DESC. Authorization errors use UNAUTHENTICATED or FORBIDDEN.
+  """
+  adminReviews(status: ReviewModerationStatus, page: Int = 1, pageSize: Int = 50): AdminReviewPage!
   adminPaymentAttempts(page: Int = 1, pageSize: Int = 50): PaymentAttemptPage!
   adminPaymentAttemptObservations(attemptId: ID!, page: Int = 1, pageSize: Int = 50): PaymentAttemptObservationPage!
   adminPaymentAttemptRelease(attemptId: ID!): PaymentAttemptReleasePayload!
@@ -471,6 +482,52 @@ type CreateReviewPayload {
   userErrors: [ReviewUserError!]!
 }
 
+enum ReviewModerationStatus {
+  PENDING
+  ACCEPTED
+  REJECTED
+}
+
+enum ReviewModerationAction {
+  ACCEPT
+  REJECT
+  DELETE
+}
+
+type AdminReview {
+  id: ID!
+  gameBggId: Int!
+  gameName: String!
+  rating: Int!
+  body: String!
+  createdAt: String!
+  """Retained moderation status; soft-deleted records are omitted from the queue."""
+  status: ReviewModerationStatus!
+  deleted: Boolean!
+  publiclyVisible: Boolean!
+}
+
+type AdminReviewPage {
+  items: [AdminReview!]!
+  page: Int!
+  pageSize: Int!
+  total: Int!
+  totalPages: Int!
+}
+
+type ReviewModerationError {
+  """Stable code such as REVIEW_NOT_FOUND or INVALID_TRANSITION."""
+  field: [String!]
+  code: String!
+  message: String!
+}
+
+type ModerateReviewPayload {
+  success: Boolean!
+  review: AdminReview
+  userErrors: [ReviewModerationError!]!
+}
+
 type IssuedGiftCard {
   id: ID!
   code: String!
@@ -524,6 +581,17 @@ type Mutation {
   addToWishlist(bggId: Int!): Product!
   removeFromWishlist(bggId: Int!): Product!
   createReview(input: CreateReviewInput!): CreateReviewPayload!
+  """
+  Requires an authenticated active staff or superuser identity. An operation
+  key without an active user identity is insufficient. Core is authoritative
+  for state and locks the review row to serialize actions; the last serialized
+  action is final. Same-state ACCEPT/REJECT and repeated DELETE are idempotent
+  success. Unknown IDs and non-delete actions on soft-deleted reviews report
+  REVIEW_NOT_FOUND (mapped to HTTP 404 by the BFF); only a genuinely invalid
+  transition reports INVALID_TRANSITION (mapped to HTTP 409). DELETE sets a
+  separate soft-delete marker and retains the current moderation status.
+  """
+  moderateReview(reviewId: ID!, action: ReviewModerationAction!): ModerateReviewPayload!
   createGiftCard(amount: String!): CreateGiftCardPayload!
   """
   Redeems an unused gift card atomically. Successful results do not expire.
