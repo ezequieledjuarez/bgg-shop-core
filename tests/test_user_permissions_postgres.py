@@ -1,9 +1,11 @@
 """Opt-in user-permission integration tests for a disposable local PostgreSQL DB."""
 
+import json
 import os
 import re
 import sys
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
@@ -20,8 +22,9 @@ django.setup()
 from django.conf import settings
 from django.contrib.auth.models import Group, Permission, User
 from django.contrib.contenttypes.models import ContentType
-from django.db import connections
+from django.db import connections, transaction
 from django.db import close_old_connections
+from django.db.utils import OperationalError
 
 from saleor.graphql import api
 from saleor.graphql.api import schema
@@ -485,6 +488,97 @@ def test_operation_key_only_cannot_list_or_update_users(database):
     assert target.is_staff is False
 
 
+_DATABASE_ERROR_MARKER = "SYNTHETIC_T012_INTERNAL_DB_FAILURE"
+_DATABASE_ERROR_DETAIL = (
+    f"{_DATABASE_ERROR_MARKER}: Traceback (synthetic only); "
+    "https://internal.example.test/database; "
+    "password=synthetic-password secret=synthetic-secret "
+    "DSN=postgresql://synthetic:synthetic-password@internal.example.test/core"
+)
+
+
+def _assert_database_error_is_public_safe(result, *, mutation=False):
+    if result.errors:
+        # Both selected root fields are non-null: preserve GraphQL error bubbling.
+        assert result.data is None
+        errors = [
+            {"message": error.message, "extensions": error.extensions or {}}
+            for error in result.errors
+        ]
+        codes = [error["extensions"].get("code") for error in errors]
+    else:
+        assert mutation, "a failed listing must not masquerade as an empty page"
+        payload = _update_payload(result)
+        assert payload["user"] is None
+        errors = payload["userErrors"]
+        codes = [error["code"] for error in errors]
+
+    assert errors, "database failure must have an explicit public error result"
+    public_result = json.dumps({"data": result.data, "errors": errors})
+    for internal_detail in (
+        _DATABASE_ERROR_MARKER,
+        "internal.example.test",
+        "synthetic-password",
+        "synthetic-secret",
+    ):
+        assert internal_detail not in public_result, (
+            "public error exposed synthetic internal database details"
+        )
+    _assert_sanitized_public_messages([public_result])
+    assert all(error["message"] for error in errors)
+    # The approved contract does not prescribe a database-failure code, but an
+    # unclassified GraphQL exception is not an explicit, safe error result.
+    assert codes and all(isinstance(code, str) and code for code in codes)
+
+
+def test_user_list_operational_error_is_sanitized(database):
+    actor = _new_user(is_active=True, is_superuser=True)
+    context, _ = _bearer_context(actor)
+    injected = []
+
+    def fail_listing(execute, sql, params, many, execution_context):
+        assert execution_context["connection"] is database
+        # Bearer authorization uses a PK lookup; fail the ordered list SELECT,
+        # not authentication, and do not replace the list/error contract.
+        if (
+            sql.lstrip().upper().startswith("SELECT")
+            and '"auth_user"' in sql
+            and "ORDER BY" in sql.upper()
+        ):
+            injected.append(True)
+            raise OperationalError(_DATABASE_ERROR_DETAIL)
+        return execute(sql, params, many, execution_context)
+
+    with database.execute_wrapper(fail_listing):
+        result = _execute(ADMIN_USERS_DEFAULT_LIMIT, context=context)
+
+    assert injected == [True], "the user-list database path was not exercised"
+    _assert_database_error_is_public_safe(result)
+
+
+def test_privilege_update_operational_error_is_sanitized(database):
+    actor = _new_user(is_active=True, is_superuser=True)
+    target = _new_user()
+    context, _ = _bearer_context(actor)
+    injected = []
+
+    def fail_update(execute, sql, params, many, execution_context):
+        assert execution_context["connection"] is database
+        if sql.lstrip().upper().startswith('UPDATE "AUTH_USER"'):
+            injected.append(True)
+            raise OperationalError(_DATABASE_ERROR_DETAIL)
+        return execute(sql, params, many, execution_context)
+
+    with database.execute_wrapper(fail_update):
+        result = _update(target.pk, "is_staff", True, context)
+
+    assert injected == [True], "the privilege-write database path was not exercised"
+    target.refresh_from_db()
+    assert target.is_staff is False
+    assert target.is_superuser is False
+    _assert_database_error_is_public_safe(result, mutation=True)
+
+
 @pytest.mark.parametrize(
     ("privilege", "enabled", "initial_staff", "initial_superuser", "expected_staff", "expected_superuser"),
     [
@@ -637,6 +731,104 @@ def test_concurrent_superuser_revocations_preserve_one_active_superuser(database
     assert sum(
         user.is_active and user.is_superuser for user in (actor_a, actor_b)
     ) == 1
+
+
+def test_promotion_then_concurrent_actor_revocation_refreshes_qualifying_set(database):
+    actor = _new_user(is_active=True, is_superuser=True)
+    target = _new_user(is_active=True, is_superuser=False)
+    _, token = _bearer_context(actor)
+    with database.cursor() as cursor:
+        cursor.execute("SELECT pg_backend_pid(), current_schema()")
+        blocker_pid, fixture_schema = cursor.fetchone()
+
+    pids = {"blocker": blocker_pid}
+    ready = {name: threading.Event() for name in ("promotion", "revocation")}
+    poll_interval = threading.Event()
+
+    def update_on_backend(name, user_id, enabled):
+        close_old_connections()
+        db = connections["default"]
+        try:
+            with db.cursor() as cursor:
+                cursor.execute("SELECT pg_backend_pid(), current_schema()")
+                backend_pid, current_schema = cursor.fetchone()
+                assert current_schema == fixture_schema
+                assert db.settings_dict["NAME"] == database.settings_dict["NAME"]
+                # Bound both SQL execution and lock acquisition, including cleanup
+                # if a coordinating assertion fails before a blocker is released.
+                cursor.execute("SET statement_timeout = 10000")
+                cursor.execute("SET lock_timeout = 10000")
+            pids[name] = backend_pid
+            ready[name].set()
+            return _update(user_id, "is_superuser", enabled, _context(token))
+        finally:
+            db.close()
+
+    def wait_until_blocked(waiter, blocker, future):
+        assert ready[waiter].wait(timeout=3), "worker backend was not ready"
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            if future.done():
+                future.result(timeout=0)  # Surface worker setup failures directly.
+                pytest.fail(f"{waiter} finished before the required blocked phase")
+            with database.cursor() as cursor:
+                # The observer also holds the target-row transaction. Clear its
+                # cached statistics snapshot before each lock-state observation.
+                cursor.execute("SELECT pg_stat_clear_snapshot()")
+                cursor.execute(
+                    "SELECT pg_blocking_pids(pid), wait_event_type, query "
+                    "FROM pg_stat_activity WHERE pid = %s",
+                    [pids[waiter]],
+                )
+                row = cursor.fetchone()
+            if row and pids[blocker] in row[0] and row[1] == "Lock":
+                return row[2]
+            # Throttle polling, never use elapsed time as proof of the race phase.
+            poll_interval.wait(timeout=0.01)
+        pytest.fail(f"{waiter} did not block on {blocker} within the deadline")
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        # This is the only deliberately held row lock, on the fixture-schema
+        # target, not a catalog, shared table, or application-default database.
+        with transaction.atomic(using=database.alias):
+            User.objects.select_for_update().get(pk=target.pk)
+            promotion = executor.submit(
+                update_on_backend, "promotion", target.pk, True
+            )
+            blocked_query = wait_until_blocked("promotion", "blocker", promotion)
+            # In the current implementation the target SELECT follows complete
+            # materialization/locking of the old active-superuser set. Observing
+            # this statement blocked proves promotion has passed that first step.
+            assert "FOR UPDATE" in blocked_query.upper()
+            target_predicate = blocked_query.split(" WHERE ", 1)[1]
+            assert '"auth_user"."id" =' in target_predicate
+            assert "is_superuser" not in target_predicate
+
+            revocation = executor.submit(
+                update_on_backend, "revocation", actor.pk, False
+            )
+            wait_until_blocked("revocation", "promotion", revocation)
+            assert len(set(pids.values())) == 3
+        # Release only after revocation is demonstrably waiting on promotion.
+        promoted = promotion.result(timeout=15)
+        revoked = revocation.result(timeout=15)
+
+    promotion_payload = _update_payload(promoted)
+    assert promotion_payload["userErrors"] == []
+    assert promotion_payload["user"]["id"] == str(target.pk)
+    assert promotion_payload["user"]["isSuperuser"] is True
+    revocation_payload = _update_payload(revoked)
+    assert revocation_payload["userErrors"] == [], (
+        "revocation must see the newly committed active Superadmin, "
+        "not incorrectly return LAST_ACTIVE_SUPERUSER from a stale qualifying set"
+    )
+    assert revocation_payload["user"]["id"] == str(actor.pk)
+    assert revocation_payload["user"]["isSuperuser"] is False
+    actor.refresh_from_db()
+    target.refresh_from_db()
+    assert actor.is_active is True and actor.is_superuser is False
+    assert target.is_active is True and target.is_superuser is True
+    assert User.objects.filter(is_active=True, is_superuser=True).count() == 1
 
 
 def test_existing_bearer_token_uses_updated_privileges_on_next_request(database):
