@@ -136,6 +136,50 @@ class CreateReviewPayload(graphene.ObjectType):
     user_errors = graphene.List(graphene.NonNull(ReviewUserError), required=True)
 
 
+class ReviewModerationStatus(graphene.Enum):
+    PENDING = "PENDING"
+    ACCEPTED = "ACCEPTED"
+    REJECTED = "REJECTED"
+
+
+class ReviewModerationAction(graphene.Enum):
+    ACCEPT = "ACCEPT"
+    REJECT = "REJECT"
+    DELETE = "DELETE"
+
+
+class AdminReview(graphene.ObjectType):
+    id = graphene.ID(required=True)
+    game_bgg_id = graphene.Int(required=True)
+    game_name = graphene.String(required=True)
+    rating = graphene.Int(required=True)
+    body = graphene.String(required=True)
+    created_at = graphene.String(required=True)
+    status = graphene.Field(ReviewModerationStatus, required=True)
+    deleted = graphene.Boolean(required=True)
+    publicly_visible = graphene.Boolean(required=True)
+
+
+class AdminReviewPage(graphene.ObjectType):
+    items = graphene.List(graphene.NonNull(AdminReview), required=True)
+    page = graphene.Int(required=True)
+    page_size = graphene.Int(required=True)
+    total = graphene.Int(required=True)
+    total_pages = graphene.Int(required=True)
+
+
+class ReviewModerationError(graphene.ObjectType):
+    field = graphene.List(graphene.NonNull(graphene.String))
+    code = graphene.String(required=True)
+    message = graphene.String(required=True)
+
+
+class ModerateReviewPayload(graphene.ObjectType):
+    success = graphene.Boolean(required=True)
+    review = graphene.Field(AdminReview)
+    user_errors = graphene.List(graphene.NonNull(ReviewModerationError), required=True)
+
+
 class CreateReviewInput(graphene.InputObjectType):
     product_slug = graphene.String(required=True)
     rating = graphene.Int(required=True)
@@ -327,7 +371,8 @@ def _product_detail(cursor, product):
         return None
     cursor.execute(
         "SELECT rating, body, created_at FROM product_review "
-        "WHERE bgg_id = %s AND status = 'APPROVED' ORDER BY created_at DESC",
+        "WHERE bgg_id = %s AND status = 'ACCEPTED' AND is_deleted = FALSE "
+        "ORDER BY created_at DESC",
         [product["bgg_id"]],
     )
     public_reviews = [
@@ -344,6 +389,36 @@ def _product_detail(cursor, product):
 
 def _review_error(code, message, field=None):
     return ReviewUserError(field=field, code=code, message=message)
+
+
+def _moderation_error(code, message, field=None):
+    return ReviewModerationError(field=field, code=code, message=message)
+
+
+def _admin_review_from_row(row):
+    review_id, bgg_id, game_name, rating, body, created_at, status, deleted = row
+    return AdminReview(
+        id=str(review_id),
+        game_bgg_id=bgg_id,
+        game_name=game_name,
+        rating=rating,
+        body=body,
+        created_at=created_at.isoformat(),
+        status=status,
+        deleted=deleted,
+        publicly_visible=status == "ACCEPTED" and not deleted,
+    )
+
+
+def _moderation_user_error(info):
+    user = _authenticated_user(info)
+    if user is None:
+        return _moderation_error("UNAUTHENTICATED", "Authentication is required.")
+    if not getattr(user, "is_active", False) or not (
+        getattr(user, "is_staff", False) or getattr(user, "is_superuser", False)
+    ):
+        return _moderation_error("FORBIDDEN", "Administrator permission is required.")
+    return None
 
 
 def _authenticated_user(info):
@@ -763,6 +838,19 @@ class Query(graphene.ObjectType):
         PaymentReviewPage, required=True,
         page=graphene.Int(default_value=1), page_size=graphene.Int(default_value=50),
     )
+    admin_reviews = graphene.Field(
+        AdminReviewPage,
+        required=True,
+        status=ReviewModerationStatus(),
+        page=graphene.Int(default_value=1),
+        page_size=graphene.Int(default_value=50),
+        description=(
+            "Requires an authenticated active staff or superuser identity. An "
+            "operation key without an active user identity is insufficient. "
+            "Lists non-deleted reviews filtered by an optional single status. "
+            "page is one-based and pageSize defaults to 50 (maximum 100)."
+        ),
+    )
     admin_payment_attempts = graphene.Field(
         PaymentAttemptPage, required=True,
         page=graphene.Int(default_value=1), page_size=graphene.Int(default_value=50),
@@ -930,6 +1018,68 @@ class Query(graphene.ObjectType):
             return OperationSessionPage(items=[], has_next=False, user_errors=[OrderUserError(code="INVALID", message="Invalid request.")])
         except Exception:
             return OperationSessionPage(items=[], has_next=False, user_errors=[OrderUserError(code="SERVER_ERROR", message="Could not load operation sessions.")])
+
+    def resolve_admin_reviews(self, info, status=None, page=1, page_size=50):
+        user = _authenticated_user(info)
+        if user is None:
+            raise GraphQLError(
+                "Authentication is required.",
+                extensions={"code": "UNAUTHENTICATED"},
+            )
+        if not getattr(user, "is_active", False) or not (
+            getattr(user, "is_staff", False) or getattr(user, "is_superuser", False)
+        ):
+            raise GraphQLError(
+                "Administrator permission is required.",
+                extensions={"code": "FORBIDDEN"},
+            )
+        if (
+            page is None
+            or page_size is None
+            or not 1 <= page <= 10000
+            or not 1 <= page_size <= 100
+        ):
+            raise GraphQLError(
+                "Invalid pagination.",
+                extensions={"code": "INVALID"},
+            )
+
+        status_value = getattr(status, "value", status)
+        if status_value not in (None, "PENDING", "ACCEPTED", "REJECTED"):
+            raise GraphQLError(
+                "Invalid review status.",
+                extensions={"code": "INVALID"},
+            )
+        conditions = ["review.is_deleted = FALSE"]
+        params = []
+        if status_value is not None:
+            conditions.append("review.status = %s")
+            params.append(status_value)
+        where_clause = " AND ".join(conditions)
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT COUNT(*) FROM product_review review WHERE " + where_clause,
+                params,
+            )
+            total = cursor.fetchone()[0]
+            cursor.execute(
+                "SELECT review.id, review.bgg_id, game.name, review.rating, "
+                "review.body, review.created_at, review.status, review.is_deleted "
+                "FROM product_review review "
+                "JOIN product_boardgame game ON game.bgg_id = review.bgg_id "
+                "WHERE " + where_clause +
+                " ORDER BY review.created_at DESC, review.id DESC "
+                "LIMIT %s OFFSET %s",
+                params + [page_size, (page - 1) * page_size],
+            )
+            rows = cursor.fetchall()
+        return AdminReviewPage(
+            items=[_admin_review_from_row(row) for row in rows],
+            page=page,
+            page_size=page_size,
+            total=total,
+            total_pages=(total + page_size - 1) // page_size,
+        )
 
     def resolve_admin_payment_attempt_release(self, info, attempt_id):
         try:
@@ -2059,6 +2209,149 @@ class CreateReviewMutation(graphene.Mutation):
             created=True,
             status="PENDING",
             created_at=created_at.isoformat(),
+            user_errors=[],
+        )
+
+
+class ModerateReviewMutation(graphene.Mutation):
+    class Arguments:
+        review_id = graphene.ID(required=True)
+        action = graphene.Argument(ReviewModerationAction, required=True)
+
+    Output = ModerateReviewPayload
+
+    @staticmethod
+    def mutate(_root, info, review_id, action):
+        auth_error = _moderation_user_error(info)
+        if auth_error is not None:
+            return ModerateReviewPayload(
+                success=False,
+                user_errors=[auth_error],
+            )
+
+        action_value = getattr(action, "value", action)
+        if action_value not in {"ACCEPT", "REJECT", "DELETE"}:
+            return ModerateReviewPayload(
+                success=False,
+                user_errors=[_moderation_error(
+                    "INVALID_TRANSITION",
+                    "Only ACCEPT, REJECT, and DELETE actions are supported.",
+                )],
+            )
+        target_status = {"ACCEPT": "ACCEPTED", "REJECT": "REJECTED"}.get(
+            action_value
+        )
+        valid_statuses = {"PENDING", "ACCEPTED", "REJECTED"}
+        try:
+            identifier = int(review_id)
+            if identifier < 1:
+                raise ValueError
+        except (TypeError, ValueError):
+            return ModerateReviewPayload(
+                success=False,
+                user_errors=[_moderation_error(
+                    "REVIEW_NOT_FOUND", "Review not found.", ["reviewId"]
+                )],
+            )
+
+        with transaction.atomic():
+            with connection.cursor() as cursor:
+                deletion_filter = (
+                    ""
+                    if action_value == "DELETE"
+                    else " AND review.is_deleted = FALSE"
+                )
+                cursor.execute(
+                    "SELECT review.id, review.bgg_id, game.name, review.rating, "
+                    "review.body, review.created_at, review.status, review.is_deleted "
+                    "FROM product_review review "
+                    "JOIN product_boardgame game ON game.bgg_id = review.bgg_id "
+                    "WHERE review.id = %s" + deletion_filter +
+                    " FOR UPDATE OF review",
+                    [identifier],
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    return ModerateReviewPayload(
+                        success=False,
+                        user_errors=[_moderation_error(
+                            "REVIEW_NOT_FOUND", "Review not found.", ["reviewId"]
+                        )],
+                    )
+
+                if row[7] and action_value != "DELETE":
+                    return ModerateReviewPayload(
+                        success=False,
+                        user_errors=[_moderation_error(
+                            "REVIEW_NOT_FOUND", "Review not found.", ["reviewId"]
+                        )],
+                    )
+
+                if action_value == "DELETE":
+                    if not row[7]:
+                        cursor.execute(
+                            "UPDATE product_review SET is_deleted = TRUE, "
+                            "updated_at = CURRENT_TIMESTAMP "
+                            "WHERE id = %s AND is_deleted = FALSE",
+                            [identifier],
+                        )
+                        cursor.execute(
+                            "SELECT review.id, review.bgg_id, game.name, "
+                            "review.rating, review.body, review.created_at, "
+                            "review.status, review.is_deleted "
+                            "FROM product_review review "
+                            "JOIN product_boardgame game "
+                            "ON game.bgg_id = review.bgg_id "
+                            "WHERE review.id = %s",
+                            [identifier],
+                        )
+                        row = cursor.fetchone()
+                        if row is None:
+                            return ModerateReviewPayload(
+                                success=False,
+                                user_errors=[_moderation_error(
+                                    "REVIEW_NOT_FOUND",
+                                    "Review not found.",
+                                    ["reviewId"],
+                                )],
+                            )
+                elif row[6] not in valid_statuses:
+                    return ModerateReviewPayload(
+                        success=False,
+                        user_errors=[_moderation_error(
+                            "INVALID_TRANSITION",
+                            f"Cannot {action_value.lower()} a {row[6].lower()} review.",
+                        )],
+                    )
+                elif row[6] != target_status:
+                    cursor.execute(
+                        "UPDATE product_review SET status = %s, "
+                        "updated_at = CURRENT_TIMESTAMP "
+                        "WHERE id = %s AND is_deleted = FALSE",
+                        [target_status, identifier],
+                    )
+                    cursor.execute(
+                        "SELECT review.id, review.bgg_id, game.name, review.rating, "
+                        "review.body, review.created_at, review.status, "
+                        "review.is_deleted FROM product_review review "
+                        "JOIN product_boardgame game ON game.bgg_id = review.bgg_id "
+                        "WHERE review.id = %s AND review.is_deleted = FALSE",
+                        [identifier],
+                    )
+                    row = cursor.fetchone()
+                    if row is None:
+                        return ModerateReviewPayload(
+                            success=False,
+                            user_errors=[_moderation_error(
+                                "REVIEW_NOT_FOUND",
+                                "Review not found.",
+                                ["reviewId"],
+                            )],
+                        )
+
+        return ModerateReviewPayload(
+            success=True,
+            review=_admin_review_from_row(row),
             user_errors=[],
         )
 
@@ -3375,6 +3668,7 @@ class Mutation(graphene.ObjectType):
     add_to_wishlist = AddToWishlistMutation.Field(required=True)
     remove_from_wishlist = RemoveFromWishlistMutation.Field(required=True)
     create_review = CreateReviewMutation.Field(required=True)
+    moderate_review = ModerateReviewMutation.Field(required=True)
     # Admin mutations for BFF
     create_product = CreateProductMutation.Field(
         required=True,
