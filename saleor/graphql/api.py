@@ -1,6 +1,7 @@
 import datetime
 import hashlib
 import json
+import logging
 import re
 import secrets
 import unicodedata
@@ -9,8 +10,13 @@ from decimal import Decimal, InvalidOperation
 
 import graphene
 import jwt
-import logging
-from django.db import IntegrityError, connection, transaction
+from django.db import (
+    DatabaseError,
+    IntegrityError,
+    connection,
+    connections,
+    transaction,
+)
 from graphql import GraphQLError
 
 from saleor.catalog_events import record_catalog_event
@@ -146,6 +152,11 @@ class ReviewModerationAction(graphene.Enum):
     ACCEPT = "ACCEPT"
     REJECT = "REJECT"
     DELETE = "DELETE"
+
+
+class AdminUserPrivilege(graphene.Enum):
+    is_staff = "is_staff"
+    is_superuser = "is_superuser"
 
 
 class AdminReview(graphene.ObjectType):
@@ -830,6 +841,30 @@ class Query(graphene.ObjectType):
         CreditBalancePayload, required=True,
         description="Returns the authenticated buyer's ARS balance, or zero if no credit exists.",
     )
+    admin_users = graphene.Field(
+        lambda: AdminUserPage,
+        required=True,
+        search=graphene.String(),
+        cursor=graphene.String(),
+        limit=graphene.Int(default_value=50),
+        description=(
+            "Lists any existing account, including inactive users and existing superusers.\n"
+            "Requires a bearer-authenticated active isSuperuser=true user loaded from the\n"
+            "current database state on every request; isStaff is not required. Token role\n"
+            "claims do not authorize access. Staff-only, inactive and operation-key-only\n"
+            "callers are FORBIDDEN; missing/invalid authentication is UNAUTHENTICATED.\n"
+            "These GraphQL extensions.code values map to BFF HTTP 403 and 401 respectively.\n"
+            "Only User fields are selectable; credentials and authentication secrets are\n"
+            "never returned. Optional search has 1-200 characters and is a case-insensitive\n"
+            "substring match over email, firstName and lastName. cursor is an opaque signed\n"
+            "nextCursor (1-512 characters); omit it for the first page. Results are ordered\n"
+            "by user ID ascending and the cursor continues after the last user ID.\n"
+            "limit defaults to 50, range 1-100.\n"
+            "Invalid inputs/cursors use extensions.code INVALID and extensions.field,\n"
+            "mapped to HTTP 400. Error messages are sanitized and never contain\n"
+            "upstream/internal details."
+        ),
+    )
     admin_op_sessions = graphene.Field(
         OperationSessionPage, required=True, user_id=graphene.ID(),
         page=graphene.Int(default_value=1), page_size=graphene.Int(default_value=50),
@@ -967,6 +1002,72 @@ class Query(graphene.ObjectType):
             return balance_for_user(_authenticated_user(info))
         except Exception:
             return _error("SERVER_ERROR")
+
+    def resolve_admin_users(self, info, search=None, cursor=None, limit=50):
+        from django.contrib.auth.models import User
+        from django.core import signing
+        from django.db.models import Q
+
+        try:
+            _, auth_error = _admin_users_authorization(info)
+        except DatabaseError:
+            logging.getLogger(__name__).error("Admin user listing failed.")
+            raise GraphQLError(
+                "Could not retrieve users.", extensions={"code": "SERVER_ERROR"}
+            ) from None
+        if auth_error:
+            raise GraphQLError(auth_error.message, extensions={"code": auth_error.code})
+
+        if search is not None and (
+            not isinstance(search, str) or not 1 <= len(search) <= 200
+        ):
+            raise _admin_users_invalid("search")
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise _admin_users_invalid("limit")
+
+        after_id = None
+        if cursor is not None:
+            if not isinstance(cursor, str) or not 1 <= len(cursor) <= 512:
+                raise _admin_users_invalid("cursor")
+            try:
+                cursor_data = signing.loads(
+                    cursor, salt=_ADMIN_USERS_CURSOR_SALT, max_age=None
+                )
+                after_id = cursor_data["id"]
+                if type(after_id) is not int or after_id < 1:
+                    raise ValueError
+            except (signing.BadSignature, KeyError, TypeError, ValueError):
+                raise _admin_users_invalid("cursor") from None
+
+        users = User.objects.all()
+        if search is not None:
+            users = users.filter(
+                Q(email__icontains=search)
+                | Q(first_name__icontains=search)
+                | Q(last_name__icontains=search)
+            )
+        if after_id is not None:
+            users = users.filter(pk__gt=after_id)
+        try:
+            page_users = list(users.order_by("pk")[: limit + 1])
+            has_next = len(page_users) > limit
+            page_users = page_users[:limit]
+            next_cursor = None
+            if has_next:
+                next_cursor = signing.dumps(
+                    {"id": page_users[-1].pk},
+                    salt=_ADMIN_USERS_CURSOR_SALT,
+                    compress=False,
+                )
+            return AdminUserPage(
+                items=[_auth_user(item) for item in page_users],
+                next_cursor=next_cursor,
+            )
+        except DatabaseError:
+            logging.getLogger(__name__).error("Admin user listing failed.")
+            raise GraphQLError(
+                "Could not retrieve users.", extensions={"code": "SERVER_ERROR"}
+            ) from None
 
     def resolve_admin_stock_movement_status(self, info, movement_id):
         try:
@@ -1766,6 +1867,34 @@ class UserError(graphene.ObjectType):
     message = graphene.String(required=True)
 
 
+class AdminUserPage(graphene.ObjectType):
+    class Meta:
+        description = (
+            "Personnel-selection page using the existing safe User projection only.\n"
+            "nextCursor is opaque and signed; null means there is no next page.\n"
+            "Search is a case-insensitive substring match over email, firstName and lastName.\n"
+            "Items are ordered by user ID ascending; nextCursor continues after the last user ID.\n"
+            "The limit defaults to 50 and ranges from 1 through 100."
+        )
+
+    items = graphene.List(graphene.NonNull(AuthUser), required=True)
+    next_cursor = graphene.String()
+
+
+class AdminUpdateUserPrivilegePayload(graphene.ObjectType):
+    class Meta:
+        description = (
+            "Successful single-privilege update returns the saved user and empty userErrors.\n"
+            "Failure returns user null and nonempty sanitized userErrors, without any writes.\n"
+            "Uses existing UserError codes UNAUTHENTICATED, FORBIDDEN, INVALID and NOT_FOUND;\n"
+            "last-active-superuser denial uses LAST_ACTIVE_SUPERUSER.\n"
+            "Never includes credentials, authentication secrets or internal error details."
+        )
+
+    user = graphene.Field(AuthUser)
+    user_errors = graphene.List(graphene.NonNull(UserError), required=True)
+
+
 class AdminCouponPayload(graphene.ObjectType):
     coupon = graphene.Field(AdminCoupon)
     user_errors = graphene.List(graphene.NonNull(UserError), required=True)
@@ -1837,6 +1966,67 @@ class LoginPayload(RegisterPayload):
 
 def _auth_error(message, code, field=None):
     return UserError(field=field, code=code, message=message)
+
+
+_ADMIN_USERS_CURSOR_SALT = "admin-users-cursor"
+
+
+def _admin_users_invalid(field):
+    return GraphQLError(
+        f"{field} is invalid",
+        extensions={"code": "INVALID", "field": field},
+    )
+
+
+def _admin_users_authorization(info):
+    from django.conf import settings
+    from django.contrib.auth.models import User
+
+    context = info.context
+    headers = getattr(context, "headers", {}) or {}
+    authorization = headers.get("Authorization", "")
+    if not isinstance(authorization, str) or not authorization.startswith("Bearer "):
+        if getattr(context, "opkey_delegated", False):
+            return None, _auth_error(
+                "Superuser permission is required.", "FORBIDDEN"
+            )
+        return None, _auth_error("Authentication is required.", "UNAUTHENTICATED")
+
+    user = _authenticated_user(info)
+    if user is None:
+        # The common authentication helper deliberately filters inactive users.
+        # Distinguish their valid bearer identity from missing/invalid credentials.
+        try:
+            claims = jwt.decode(
+                authorization[7:].strip(),
+                settings.SECRET_KEY,
+                algorithms=["HS256"],
+            )
+            if claims.get("token_type") != "access":
+                raise ValueError
+            inactive_user = User.objects.get(pk=int(claims["sub"]))
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+            OverflowError,
+            jwt.PyJWTError,
+            User.DoesNotExist,
+        ):
+            return None, _auth_error(
+                "Authentication is required.", "UNAUTHENTICATED"
+            )
+        if not inactive_user.is_active:
+            return None, _auth_error(
+                "Superuser permission is required.", "FORBIDDEN"
+            )
+        return None, _auth_error("Authentication is required.", "UNAUTHENTICATED")
+
+    if not getattr(user, "is_active", False) or not getattr(
+        user, "is_superuser", False
+    ):
+        return None, _auth_error("Superuser permission is required.", "FORBIDDEN")
+    return user, None
 
 
 def _coupon_admin_user(info):
@@ -3658,9 +3848,159 @@ class ManageOperationSessionMutation(graphene.Mutation):
             return ManageOperationSessionPayload(success=False, user_errors=[OrderUserError(code="SERVER_ERROR", message="Could not update operation session.")])
 
 
+class AdminUpdateUserPrivilegeMutation(graphene.Mutation):
+    class Arguments:
+        user_id = graphene.ID(required=True)
+        privilege = AdminUserPrivilege(required=True)
+        enabled = graphene.Boolean(required=True)
+
+    Output = AdminUpdateUserPrivilegePayload
+
+    @staticmethod
+    def mutate(_root, info, user_id, privilege, enabled):
+        from django.contrib.auth.models import User
+
+        try:
+            _, auth_error = _admin_users_authorization(info)
+        except DatabaseError:
+            logging.getLogger(__name__).error("User privilege update failed.")
+            return AdminUpdateUserPrivilegePayload(
+                user=None,
+                user_errors=[
+                    _auth_error(
+                        "Could not update user privilege.",
+                        "SERVER_ERROR",
+                    )
+                ],
+            )
+        if auth_error:
+            return AdminUpdateUserPrivilegePayload(user=None, user_errors=[auth_error])
+
+        privilege_name = getattr(privilege, "value", privilege)
+        if privilege_name not in ("is_staff", "is_superuser"):
+            return AdminUpdateUserPrivilegePayload(
+                user=None,
+                user_errors=[
+                    _auth_error(
+                        "Privilege is invalid.", "INVALID", ["privilege"]
+                    )
+                ],
+            )
+        if (
+            not isinstance(user_id, str)
+            or len(user_id) > 19
+            or not re.fullmatch(r"[0-9]+", user_id)
+        ):
+            return AdminUpdateUserPrivilegePayload(
+                user=None,
+                user_errors=[
+                    _auth_error("User identifier is invalid.", "INVALID", ["userId"])
+                ],
+            )
+        target_id = int(user_id)
+        if not 1 <= target_id <= 2**63 - 1:
+            return AdminUpdateUserPrivilegePayload(
+                user=None,
+                user_errors=[
+                    _auth_error("User identifier is invalid.", "INVALID", ["userId"])
+                ],
+            )
+
+        database = User.objects.db
+        try:
+            with transaction.atomic(using=database):
+                locked_superusers = []
+                if privilege_name == "is_superuser":
+                    with connections[database].cursor() as cursor:
+                        cursor.execute(
+                            "SELECT pg_advisory_xact_lock(%s, %s)",
+                            [0x42474753, 1],
+                        )
+                    locked_superusers = list(
+                        User.objects.using(database)
+                        .select_for_update()
+                        .filter(is_active=True, is_superuser=True)
+                        .order_by("pk")
+                    )
+
+                target = (
+                    User.objects.using(database)
+                    .select_for_update()
+                    .get(pk=target_id)
+                )
+                if (
+                    privilege_name == "is_superuser"
+                    and not enabled
+                    and target.is_active
+                    and target.is_superuser
+                    and len(locked_superusers) <= 1
+                ):
+                    return AdminUpdateUserPrivilegePayload(
+                        user=None,
+                        user_errors=[
+                            _auth_error(
+                                "At least one active superuser must remain.",
+                                "LAST_ACTIVE_SUPERUSER",
+                                ["isSuperuser"],
+                            )
+                        ],
+                    )
+
+                setattr(target, privilege_name, enabled)
+                target.save(using=database, update_fields=[privilege_name])
+        except User.DoesNotExist:
+            return AdminUpdateUserPrivilegePayload(
+                user=None,
+                user_errors=[
+                    _auth_error("User not found.", "NOT_FOUND", ["userId"])
+                ],
+            )
+        except DatabaseError:
+            logging.getLogger(__name__).error("User privilege update failed.")
+            return AdminUpdateUserPrivilegePayload(
+            user=None,
+            user_errors=[
+                _auth_error(
+                    "Could not update user privilege.",
+                    "SERVER_ERROR",
+                )
+            ],
+            )
+
+        return AdminUpdateUserPrivilegePayload(user=_auth_user(target), user_errors=[])
+
+
 class Mutation(graphene.ObjectType):
     register = RegisterMutation.Field(required=True)
     login = LoginMutation.Field(required=True)
+    admin_update_user_privilege = graphene.Field(
+        AdminUpdateUserPrivilegePayload,
+        user_id=graphene.ID(required=True),
+        privilege=AdminUserPrivilege(required=True),
+        enabled=graphene.Boolean(required=True),
+        required=True,
+        description=(
+            "Requires the same current bearer-authenticated active Superadmin authority as\n"
+            "adminUsers; isStaff is not required and operation-key-only access is forbidden.\n"
+            "userId is the existing User.id, not an employee or operation-session ID.\n"
+            "Changes exactly one selected staff or superuser flag to enabled, preserving\n"
+            "the other privilege and all other account fields. Granting superuser never\n"
+            "grants staff. privilege must be exactly is_staff or is_superuser. May target\n"
+            "any existing account, including the actor or an inactive user. Returns saved\n"
+            "state only after commit; subsequent authorization checks, including\n"
+            "already-active sessions, use current saved flags.\n"
+            "Revoking an active user's superuser flag, including self-demotion, is denied\n"
+            "atomically if no other active superuser would remain. Concurrent revocations\n"
+            "must preserve this invariant; any failed/denied change makes no partial writes.\n"
+            "userErrors map UNAUTHENTICATED to HTTP 401, FORBIDDEN (including inactive,\n"
+            "staff-only and operation-key-only callers) to 403, NOT_FOUND to 404 and INVALID\n"
+            "to 400. Last-active-superuser denial uses LAST_ACTIVE_SUPERUSER and maps to\n"
+            "HTTP 409. Errors expose no upstream exceptions, traces, internal URLs,\n"
+            "credentials or authentication secrets. Existing staff operational\n"
+            "authorization is unchanged."
+        ),
+        resolver=AdminUpdateUserPrivilegeMutation.mutate,
+    )
     manage_op_session = ManageOperationSessionMutation.Field(required=True)
     add_to_cart = AddToCartMutation.Field(required=True)
     update_cart_quantity = UpdateCartQuantityMutation.Field(required=True)

@@ -229,6 +229,35 @@ type AdminAuditPage {
   nextCursor: String
 }
 
+"""
+Personnel-selection page using the existing safe User projection only.
+nextCursor is opaque and signed; null means there is no next page.
+Search is a case-insensitive substring match over email, firstName and lastName.
+Items are ordered by user ID ascending; nextCursor continues after the last user ID.
+The limit defaults to 50 and ranges from 1 through 100.
+"""
+type AdminUserPage {
+  items: [User!]!
+  nextCursor: String
+}
+
+enum AdminUserPrivilege {
+  is_staff
+  is_superuser
+}
+
+"""
+Successful single-privilege update returns the saved user and empty userErrors.
+Failure returns user null and nonempty sanitized userErrors, without any writes.
+Uses existing UserError codes UNAUTHENTICATED, FORBIDDEN, INVALID and NOT_FOUND;
+last-active-superuser denial uses LAST_ACTIVE_SUPERUSER.
+Never includes credentials, authentication secrets or internal error details.
+"""
+type AdminUpdateUserPrivilegePayload {
+  user: User
+  userErrors: [UserError!]!
+}
+
 type TopProduct {
   bggId: Int!
   name: String!
@@ -349,6 +378,24 @@ type Query {
   myOrder(id: ID!): PurchaseOrder
   """Returns the authenticated buyer's ARS balance, or zero if no credit exists."""
   myCredit: CreditBalancePayload!
+  """
+  Lists any existing account, including inactive users and existing superusers.
+  Requires a bearer-authenticated active isSuperuser=true user loaded from the
+  current database state on every request; isStaff is not required. Token role
+  claims do not authorize access. Staff-only, inactive and operation-key-only
+  callers are FORBIDDEN; missing/invalid authentication is UNAUTHENTICATED.
+  These GraphQL extensions.code values map to BFF HTTP 403 and 401 respectively.
+  Only User fields are selectable; credentials and authentication secrets are
+  never returned. Optional search has 1-200 characters and is a case-insensitive
+  substring match over email, firstName and lastName. cursor is an opaque signed
+  nextCursor (1-512 characters); omit it for the first page. Results are ordered
+  by user ID ascending and the cursor continues after the last user ID.
+  limit defaults to 50, range 1-100.
+  Invalid inputs/cursors use extensions.code INVALID and extensions.field,
+  mapped to HTTP 400. Error messages are sanitized and never contain
+  upstream/internal details.
+  """
+  adminUsers(search: String, cursor: String, limit: Int = 50): AdminUserPage!
   adminOpSessions(userId: ID, page: Int = 1, pageSize: Int = 50): OperationSessionPage!
   adminPaymentReviews(page: Int = 1, pageSize: Int = 50): PaymentReviewPage!
   """
@@ -574,6 +621,27 @@ type CreditCheckoutPayload {
 type Mutation {
   register(input: RegisterInput!): RegisterPayload!
   login(input: LoginInput!): LoginPayload!
+  """
+  Requires the same current bearer-authenticated active Superadmin authority as
+  adminUsers; isStaff is not required and operation-key-only access is forbidden.
+  userId is the existing User.id, not an employee or operation-session ID.
+  Changes exactly one selected staff or superuser flag to enabled, preserving
+  the other privilege and all other account fields. Granting superuser never
+  grants staff. privilege must be exactly is_staff or is_superuser. May target
+  any existing account, including the actor or an inactive user. Returns saved
+  state only after commit; subsequent authorization checks, including
+  already-active sessions, use current saved flags.
+  Revoking an active user's superuser flag, including self-demotion, is denied
+  atomically if no other active superuser would remain. Concurrent revocations
+  must preserve this invariant; any failed/denied change makes no partial writes.
+  userErrors map UNAUTHENTICATED to HTTP 401, FORBIDDEN (including inactive,
+  staff-only and operation-key-only callers) to 403, NOT_FOUND to 404 and INVALID
+  to 400. Last-active-superuser denial uses LAST_ACTIVE_SUPERUSER and maps to
+  HTTP 409. Errors expose no upstream exceptions, traces, internal URLs,
+  credentials or authentication secrets. Existing staff operational
+  authorization is unchanged.
+  """
+  adminUpdateUserPrivilege(userId: ID!, privilege: AdminUserPrivilege!, enabled: Boolean!): AdminUpdateUserPrivilegePayload!
   manageOpSession(sessionId: ID!, action: String!): ManageOperationSessionPayload!
   addToCart(bggId: Int!, cartId: ID, quantity: Int!): CartPayload!
   updateCartQuantity(bggId: Int!, cartId: ID, quantity: Int!): CartPayload!
