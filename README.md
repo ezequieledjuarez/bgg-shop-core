@@ -7,26 +7,34 @@
 
 ## 📌 Descripción General
 
-**`bgg-shop-core`** es el backend de dominio transaccional (OLTP) y fuente central de verdad para la plataforma e-commerce de juegos de mesa **BGG Shop**. 
+**`bgg-shop-core`** es el backend de dominio transaccional (OLTP) y fuente central de verdad para la plataforma e-commerce de juegos de mesa **BGG Shop**.
 
-Construido sobre **Django** y la arquitectura base de **Saleor Core**, este servicio abstrae la persitencia de datos en PostgreSQL, orquesta tareas asíncronas con Celery/Redis y expone las reglas de negocio a través de una API GraphQL unificada mediante **Graphene**.
+Construido con **Django** y **Graphene**, este servicio aplica reglas de
+dominio, persiste datos en PostgreSQL y proporciona tareas asíncronas mediante
+Celery con Redis como broker/cache. El BFF Flask es su consumidor REST-a-
+GraphQL para el Frontend React/Vite; el navegador no llama directamente al
+Core.
 
 ---
 
 ## 🏗️ Arquitectura y Rol en el Sistema
 
-Este repositorio opera de forma desacoplada dentro de la infraestructura
-general. El flujo implementado es:
-[ bgg-shop-front ]  ──(REST)──>  [ bgg-shop-bff ]  ──(GraphQL)──>  [ bgg-shop-core ]
-(React / Vite)                  (Flask / Gateway)                 (Django / Saleor)
-│
-┌─────────┴─────────┐
-▼                   ▼
-[PostgreSQL]      [Redis / Celery]
+El flujo de solicitudes implementado es:
+
+```text
+Frontend React/Vite ── REST/JSON ──> BFF Flask ── GraphQL ──> Core Django/Graphene
+                                                               │
+                                        PostgreSQL ◄────────────┤
+                                        Redis / Celery ◄────────┘
+```
 
 * **OLTP Transaccional:** Administra usuarios, catálogo de productos, variantes y stock con integridad ACID.
-* **Capa de Transporte Stricta:** Proporciona un esquema de GraphQL fuertemente tipado, previniendo problemas de *over-fetching* y *under-fetching*.
-* **Asincronismo:** Procesa eventos en diferido (notificaciones, reportes masivos) mediante Celery Workers.
+* **API de dominio:** Expone operaciones GraphQL fuertemente tipadas mediante Graphene.
+* **Asincronismo:** Ejecuta tareas mediante Celery Worker/Beat con Redis.
+
+El esquema GraphQL de referencia está en
+[`specs/schema.graphql`](specs/schema.graphql). La referencia REST consumida por
+el Frontend es [`../bgg-shop-bff/specs/openapi.yaml`](../bgg-shop-bff/specs/openapi.yaml).
 
 ## Servicio GraphQL expuesto
 
@@ -58,10 +66,11 @@ curl http://localhost:8000/graphql/ \
 se rechazan. Los errores GraphQL se devuelven en el formato de GraphQL
 (`errors`); la consulta de productos filtra `product_boardgame` antes de
 contar y paginar. `categoryId` usa el mapa local `1` estrategia, `2` temática,
-`3` familiar. El Core no expone aquí endpoints REST de productos. Expone el stock (`quantity`)
-y, por GraphQL, `cart`, `addToCart`, `updateCartQuantity` y `removeFromCart`
-(el carrito no reserva ni descuenta stock). No expone checkout ni pedidos. La documentación completa de
-autenticación está en
+`3` familiar. El Core no expone REST para el catálogo: entrega el stock
+(`quantity`) y las operaciones de catálogo/carrito, Wishlist, checkout y
+pedidos mediante GraphQL. El carrito no reserva ni descuenta stock. La ruta
+HTTP para descargar facturas se describe en la sección de compras. La
+documentación completa de autenticación está en
 [`docs/CU-C01-AUTHENTICATION-CHANGES.md`](../docs/CU-C01-AUTHENTICATION-CHANGES.md).
 
 ### Métricas de ventas (Admin)
@@ -113,6 +122,30 @@ El Frontend consume el catálogo a través del BFF; no llama GraphQL
 directamente. Para el detalle de CU-C02, ver
 [`docs/CU-C02-FILTERING-CHANGES.md`](../docs/CU-C02-FILTERING-CHANGES.md).
 
+### Persistencia de conversaciones del chatbot (CU-C07, en progreso)
+
+El Core implementa las operaciones GraphQL `createChatConversation`,
+`chatConversation` y `recordChatExchange`. Las conversaciones y mensajes se
+guardan en PostgreSQL con propietario autenticado o anónimo validado; el
+identificador de propietario no se acepta como argumento de cliente. La
+migración es [`saleor/graphql/migrations/0020_chat_conversations.py`](saleor/graphql/migrations/0020_chat_conversations.py).
+
+Esto cubre solo la base de persistencia, no el chatbot completo. No está
+implementada la mutación `deleteChatConversation` declarada en el SDL, ni la
+retención automática de 30 días. No hay recuperación por ChromaDB, conexión
+con un modelo ni respuestas fundamentadas: el BFF todavía devuelve un
+fallback determinista. ChromaDB sigue siendo un requisito aprobado para una
+fase futura, no un componente instalado o ejecutado. El OpenAPI del BFF y el
+SDL incluyen partes planificadas que aún no son funcionalidad disponible.
+
+Trazabilidad: [`../specs/013-add-chatbot/spec.md`](../specs/013-add-chatbot/spec.md),
+[`../specs/013-add-chatbot/plan.md`](../specs/013-add-chatbot/plan.md),
+[`../odd/tasks/013-add-chatbot.md`](../odd/tasks/013-add-chatbot.md);
+implementación en [`saleor/graphql/api.py`](saleor/graphql/api.py); pruebas
+en [`tests/test_graphql_chat.py`](tests/test_graphql_chat.py). Las pruebas de
+persistencia se verificaron de forma aislada según el plan, pero eso no
+equivale a validar el servicio completo o su integración con el Frontend.
+
 ---
 
 ## 🛠️ Tech Stack
@@ -128,14 +161,23 @@ directamente. Para el detalle de CU-C02, ver
 
 ## 🚀 Inicio Rápido (Entorno Local con Podman)
 
-### Prerrequisitos
-* Podman y Podman Compose instalados.
-* Contenedores `db` y `redis` activos en la red compartida.
+Se requiere Podman con proveedor Compose. Para levantar Core, PostgreSQL,
+Redis, Celery y el resto de dependencias del proyecto, ejecuta desde la raíz
+del repositorio:
 
-### 1. Clonar e Inicializar
 ```bash
-git clone [https://github.com/tu-usuario/bgg-shop-core.git](https://github.com/tu-usuario/bgg-shop-core.git)
-cd bgg-shop-core
+podman compose -f podman-compose.yaml up -d --build
+podman compose -f podman-compose.yaml exec api python manage.py migrate
+```
+
+GraphQL/GraphiQL queda publicado en `http://localhost:8000/graphql/`. El BFF
+accede al Core por `http://api:8000/graphql/` dentro de la red Compose. Los
+valores predeterminados del Compose son solo para desarrollo local. Para
+detener los contenedores sin borrar volúmenes:
+
+```bash
+podman compose -f podman-compose.yaml down
+```
 
 ## Purchase checkout
 

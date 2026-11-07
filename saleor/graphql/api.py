@@ -1,5 +1,6 @@
 import datetime
 import hashlib
+import hmac
 import json
 import logging
 import re
@@ -17,6 +18,7 @@ from django.db import (
     connections,
     transaction,
 )
+from django.utils import timezone
 from graphql import GraphQLError
 
 from saleor.catalog_events import record_catalog_event
@@ -792,6 +794,456 @@ class SalesMetrics(graphene.ObjectType):
     revenue_by_day = graphene.List(graphene.NonNull(RevenueByDay), required=True)
 
 
+class ChatMessageRole(graphene.Enum):
+    USER = "USER"
+    ASSISTANT = "ASSISTANT"
+
+
+class ChatConversationErrorCode(graphene.Enum):
+    INVALID = "INVALID"
+    UNAUTHENTICATED = "UNAUTHENTICATED"
+    NOT_FOUND = "NOT_FOUND"
+    SERVER_ERROR = "SERVER_ERROR"
+
+
+class ChatSource(graphene.ObjectType):
+    title = graphene.String(required=True)
+    url = graphene.String()
+
+
+class ChatSourceInput(graphene.InputObjectType):
+    title = graphene.String(required=True)
+    url = graphene.String()
+
+
+class ChatMessage(graphene.ObjectType):
+    id = graphene.ID(required=True)
+    role = graphene.Field(ChatMessageRole, required=True)
+    content = graphene.String(required=True)
+    created_at = graphene.String(required=True)
+    sources = graphene.List(graphene.NonNull(ChatSource), required=True)
+
+
+class ChatConversation(graphene.ObjectType):
+    id = graphene.ID(required=True)
+    messages = graphene.List(graphene.NonNull(ChatMessage), required=True)
+    created_at = graphene.String(required=True)
+    updated_at = graphene.String(required=True)
+    expires_at = graphene.String(required=True)
+
+    class Meta:
+        description = (
+            "A Core-owned conversation. Ownership is derived from the validated "
+            "execution\nprincipal and is never supplied as a caller-controlled "
+            "owner ID. Registered\nbuyers use the current bearer-authenticated "
+            "user, which remains authoritative\nwhen present. For anonymous "
+            "calls, the Core transport adapter validates the\nBFF-signed "
+            "HMAC-SHA256 assertion supplied only through the internal\n"
+            "X-Chat-Assertion header, then derives ownership exclusively from "
+            "its validated\nsub claim. The assertion has alg=HS256, "
+            "typ=chat-assertion, iss=bgg-shop-bff,\naud=bgg-shop-core, "
+            "scope=chat:conversations, iat, and exp=iat+60s; sub is the\n"
+            "SHA-256 digest of the browser chat_session cookie, never its raw "
+            "value. A\ndedicated CHAT_ASSERTION_SECRET environment setting is "
+            "shared by BFF and Core\nand is distinct from JWT SECRET_KEY and "
+            "OPKEY_INTERNAL_SECRET. The header is\nnot a GraphQL argument or "
+            "browser-supplied payload. Assertions are short-lived\nand scoped, "
+            "but are not one-time credentials and do not promise replay\n"
+            "prevention. Rotate the key by coordinated BFF/Core environment "
+            "replacement.\nOperation-key delegation does not identify an "
+            "anonymous buyer."
+        )
+
+
+class ChatConversationError(graphene.ObjectType):
+    code = graphene.Field(ChatConversationErrorCode, required=True)
+    message = graphene.String(required=True)
+    field = graphene.List(graphene.NonNull(graphene.String))
+
+
+class ChatConversationPayload(graphene.ObjectType):
+    conversation = graphene.Field(ChatConversation)
+    user_errors = graphene.List(
+        graphene.NonNull(ChatConversationError), required=True
+    )
+
+
+class DeleteChatConversationPayload(graphene.ObjectType):
+    success = graphene.Boolean(required=True)
+    user_errors = graphene.List(
+        graphene.NonNull(ChatConversationError), required=True
+    )
+
+
+def _chat_error(code, message, field=None):
+    return ChatConversationError(code=code, message=message, field=field)
+
+
+def _chat_payload_error(code, message, field=None):
+    return ChatConversationPayload(
+        conversation=None,
+        user_errors=[_chat_error(code, message, field)],
+    )
+
+
+def _chat_inactivity_cutoff():
+    current_time = timezone.now()
+    if timezone.is_naive(current_time):
+        current_time = timezone.make_aware(
+            current_time, timezone.get_default_timezone()
+        )
+    return current_time - datetime.timedelta(days=30)
+
+
+def _chat_delete_payload_error(code, message):
+    return DeleteChatConversationPayload(
+        success=False,
+        user_errors=[_chat_error(code, message)],
+    )
+
+
+def _chat_assertion_secret():
+    from django.conf import settings
+
+    secret = getattr(settings, "CHAT_ASSERTION_SECRET", "")
+    if (
+        not isinstance(secret, str)
+        or not secret.isascii()
+        or len(secret) < 32
+        or len(set(secret)) < 16
+    ):
+        return None
+
+    other_secrets = [
+        getattr(settings, "SECRET_KEY", ""),
+        getattr(settings, "OPKEY_INTERNAL_SECRET", ""),
+        getattr(settings, "CATALOG_EVENTS_HMAC_SECRET", ""),
+        *getattr(settings, "SECRET_KEY_FALLBACKS", []),
+    ]
+    if any(
+        isinstance(other, str)
+        and other.isascii()
+        and other
+        and hmac.compare_digest(secret, other)
+        for other in other_secrets
+    ):
+        return None
+    return secret
+
+
+def _chat_execution_owner(info):
+    """Return a validated owner tuple; caller-provided identity is never used."""
+    request = info.context
+    authorization = request.headers.get("Authorization", "")
+    if authorization:
+        if not isinstance(authorization, str) or not authorization.startswith(
+            "Bearer "
+        ):
+            return None
+        user = _authenticated_user(info)
+        if user is None:
+            return None
+        return "USER", str(user.pk), user.pk
+
+    assertion = request.headers.get("X-Chat-Assertion", "")
+    secret = _chat_assertion_secret()
+    if not assertion or secret is None:
+        return None
+    try:
+        header = jwt.get_unverified_header(assertion)
+        if header.get("alg") != "HS256" or header.get("typ") != "chat-assertion":
+            return None
+        claims = jwt.decode(
+            assertion,
+            secret,
+            algorithms=["HS256"],
+            issuer="bgg-shop-bff",
+            audience="bgg-shop-core",
+            options={
+                "require": ["sub", "scope", "iat", "exp"],
+                "verify_iat": True,
+            },
+        )
+    except (jwt.PyJWTError, TypeError, ValueError):
+        return None
+
+    subject = claims.get("sub")
+    if (
+        claims.get("scope") != "chat:conversations"
+        or claims.get("iss") != "bgg-shop-bff"
+        or claims.get("aud") != "bgg-shop-core"
+        or not isinstance(subject, str)
+        or re.fullmatch(r"[0-9a-f]{64}", subject) is None
+    ):
+        return None
+    return "ANONYMOUS", subject, None
+
+
+def _chat_sources(sources):
+    normalized = []
+    for source in sources or []:
+        if isinstance(source, dict):
+            title = source.get("title")
+            url = source.get("url")
+        else:
+            title = getattr(source, "title", None)
+            url = getattr(source, "url", None)
+        normalized.append({"title": title, "url": url})
+    return normalized
+
+
+def _chat_conversation_object(conversation_id, created_at, updated_at, messages):
+    return ChatConversation(
+        id=str(conversation_id),
+        messages=messages,
+        created_at=created_at.isoformat(),
+        updated_at=updated_at.isoformat(),
+        # The SDL exposes the planned retention boundary; this task does not
+        # enforce expiry or remove records.
+        expires_at=(updated_at + datetime.timedelta(days=30)).isoformat(),
+    )
+
+
+def _chat_load_conversation(cursor, row):
+    conversation_id, created_at, updated_at = row
+    cursor.execute(
+        """
+        SELECT id, role, content, created_at, sources
+        FROM chat_message
+        WHERE conversation_id = %s
+        ORDER BY created_at,
+                 CASE role WHEN 'USER' THEN 0 ELSE 1 END,
+                 id
+        """,
+        [conversation_id],
+    )
+    messages = []
+    for message_id, role, content, created_at, sources in cursor.fetchall():
+        if isinstance(sources, str):
+            sources = json.loads(sources)
+        messages.append(
+            ChatMessage(
+                id=str(message_id),
+                role=role,
+                content=content,
+                created_at=created_at.isoformat(),
+                sources=[
+                    ChatSource(title=source["title"], url=source.get("url"))
+                    for source in sources
+                ],
+            )
+        )
+    return _chat_conversation_object(
+        conversation_id, created_at, updated_at, messages
+    )
+
+
+def _chat_read_conversation(info, conversation_id):
+    owner = _chat_execution_owner(info)
+    if owner is None:
+        return _chat_payload_error(
+            "UNAUTHENTICATED", "Authentication is required."
+        )
+    try:
+        parsed_id = uuid.UUID(str(conversation_id))
+    except (TypeError, ValueError, AttributeError):
+        return _chat_payload_error("NOT_FOUND", "Conversation was not found.")
+
+    cutoff = _chat_inactivity_cutoff()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, created_at, updated_at
+                FROM chat_conversation
+                WHERE id = %s AND owner_type = %s AND owner_id = %s
+                    AND updated_at > %s
+                """,
+                [parsed_id, owner[0], owner[1], cutoff],
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return _chat_payload_error(
+                    "NOT_FOUND", "Conversation was not found."
+                )
+            conversation = _chat_load_conversation(cursor, row)
+    except DatabaseError:
+        return _chat_payload_error(
+            "SERVER_ERROR", "Conversation could not be loaded."
+        )
+    return ChatConversationPayload(conversation=conversation, user_errors=[])
+
+
+def _chat_create_conversation(info):
+    owner = _chat_execution_owner(info)
+    if owner is None:
+        return _chat_payload_error(
+            "UNAUTHENTICATED", "Authentication is required."
+        )
+    conversation_id = uuid.uuid4()
+    try:
+        with transaction.atomic():
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO chat_conversation
+                        (id, owner_type, owner_id, owner_user_id)
+                    VALUES (%s, %s, %s, %s)
+                    RETURNING id, created_at, updated_at
+                    """,
+                    [
+                        conversation_id,
+                        owner[0],
+                        owner[1],
+                        owner[2],
+                    ],
+                )
+                conversation = _chat_load_conversation(cursor, cursor.fetchone())
+    except DatabaseError:
+        return _chat_payload_error(
+            "SERVER_ERROR", "Conversation could not be created."
+        )
+    return ChatConversationPayload(conversation=conversation, user_errors=[])
+
+
+def _chat_record_exchange(
+    info, conversation_id, user_message, assistant_message, sources=None
+):
+    owner = _chat_execution_owner(info)
+    if owner is None:
+        return _chat_payload_error(
+            "UNAUTHENTICATED", "Authentication is required."
+        )
+    if len(user_message) > 2000:
+        return _chat_payload_error(
+            "INVALID",
+            "User message must not exceed 2,000 characters.",
+            ["userMessage"],
+        )
+    try:
+        parsed_id = uuid.UUID(str(conversation_id))
+    except (TypeError, ValueError, AttributeError):
+        return _chat_payload_error("NOT_FOUND", "Conversation was not found.")
+    if not user_message.strip() or not assistant_message.strip():
+        return _chat_payload_error(
+            "INVALID", "Messages must not be blank.", ["userMessage"]
+        )
+
+    conversation = None
+    cutoff = _chat_inactivity_cutoff()
+    try:
+        with transaction.atomic():
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT id, created_at, updated_at
+                    FROM chat_conversation
+                    WHERE id = %s AND owner_type = %s AND owner_id = %s
+                        AND updated_at > %s
+                    FOR UPDATE
+                    """,
+                    [parsed_id, owner[0], owner[1], cutoff],
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    return _chat_payload_error(
+                        "NOT_FOUND", "Conversation was not found."
+                    )
+
+                normalized_sources = _chat_sources(sources)
+                cursor.execute(
+                    """
+                    INSERT INTO chat_message
+                        (id, conversation_id, role, content, sources)
+                    VALUES (%s, %s, 'USER', %s, '[]'::jsonb),
+                           (%s, %s, 'ASSISTANT', %s, %s::jsonb)
+                    """,
+                    [
+                        uuid.uuid4(),
+                        parsed_id,
+                        user_message,
+                        uuid.uuid4(),
+                        parsed_id,
+                        assistant_message,
+                        json.dumps(normalized_sources),
+                    ],
+                )
+                cursor.execute(
+                    """
+                    UPDATE chat_conversation
+                    SET updated_at = clock_timestamp()
+                    WHERE id = %s
+                    RETURNING id, created_at, updated_at
+                    """,
+                    [parsed_id],
+                )
+                conversation = _chat_load_conversation(
+                    cursor, cursor.fetchone()
+                )
+    except DatabaseError:
+        return _chat_payload_error(
+            "SERVER_ERROR", "Exchange could not be recorded."
+        )
+    return ChatConversationPayload(conversation=conversation, user_errors=[])
+
+
+def _chat_delete_conversation(info, conversation_id):
+    owner = _chat_execution_owner(info)
+    if owner is None:
+        return _chat_delete_payload_error(
+            "UNAUTHENTICATED", "Authentication is required."
+        )
+    try:
+        parsed_id = uuid.UUID(str(conversation_id))
+    except (TypeError, ValueError, AttributeError):
+        return _chat_delete_payload_error(
+            "NOT_FOUND", "Conversation was not found."
+        )
+
+    cutoff = _chat_inactivity_cutoff()
+    try:
+        with transaction.atomic():
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    DELETE FROM chat_conversation
+                    WHERE id = %s AND owner_type = %s AND owner_id = %s
+                        AND updated_at > %s
+                    RETURNING id
+                    """,
+                    [parsed_id, owner[0], owner[1], cutoff],
+                )
+                if cursor.fetchone() is None:
+                    return _chat_delete_payload_error(
+                        "NOT_FOUND", "Conversation was not found."
+                    )
+    except DatabaseError:
+        return _chat_delete_payload_error(
+            "SERVER_ERROR", "Conversation could not be deleted."
+        )
+    return DeleteChatConversationPayload(success=True, user_errors=[])
+
+
+def _resolve_chat_create_conversation(root, info):
+    return _chat_create_conversation(info)
+
+
+def _resolve_chat_record_exchange(
+    root, info, conversation_id, user_message, assistant_message, sources=None
+):
+    return _chat_record_exchange(
+        info,
+        conversation_id,
+        user_message,
+        assistant_message,
+        sources=sources,
+    )
+
+
+def _resolve_chat_delete_conversation(root, info, conversation_id):
+    return _chat_delete_conversation(info, conversation_id)
+
+
 def _sales_metrics_invalid(field):
     return GraphQLError(
         f"{field} is invalid", extensions={"code": "INVALID", "field": field}
@@ -814,6 +1266,20 @@ def _sales_metrics_date(value, field):
 class Query(graphene.ObjectType):
     hello = graphene.String(default_value="Saleor API activa y respondiendo OK")
     me = graphene.Field(lambda: AuthUser)
+    chat_conversation = graphene.Field(
+        ChatConversationPayload,
+        id=graphene.ID(required=True),
+        required=True,
+        description=(
+            "Returns a conversation only when it belongs to the validated "
+            "execution\nprincipal. For anonymous requests, the transport "
+            "adapter validates\nX-Chat-Assertion before exposing its subject "
+            "as the principal. A bearer token\nremains authoritative when "
+            "present. Missing, expired, and other-scope IDs\nall return "
+            "NOT_FOUND without exposing conversation metadata. No owner ID or\n"
+            "assertion is accepted as a GraphQL argument."
+        ),
+    )
     product_by_slug = graphene.Field(
         ProductDetail,
         slug=graphene.String(required=True),
@@ -996,6 +1462,9 @@ class Query(graphene.ObjectType):
         if user is None:
             return None
         return _auth_user(user)
+
+    def resolve_chat_conversation(self, info, id):
+        return _chat_read_conversation(info, id)
 
     def resolve_my_credit(self, info):
         try:
@@ -3973,6 +4442,51 @@ class AdminUpdateUserPrivilegeMutation(graphene.Mutation):
 class Mutation(graphene.ObjectType):
     register = RegisterMutation.Field(required=True)
     login = LoginMutation.Field(required=True)
+    create_chat_conversation = graphene.Field(
+        ChatConversationPayload,
+        required=True,
+        resolver=_resolve_chat_create_conversation,
+        description=(
+            "Creates a PostgreSQL-backed conversation for the validated "
+            "execution\nprincipal, with no owner identifier or assertion in "
+            "the GraphQL input.\nAnonymous ownership is derived only after "
+            "the Core transport adapter\nvalidates the BFF-signed assertion "
+            "in X-Chat-Assertion; a registered-user\nbearer token remains "
+            "authoritative when present. Conversation content and\nmetadata "
+            "expire after 30 days of inactivity."
+        ),
+    )
+    record_chat_exchange = graphene.Field(
+        ChatConversationPayload,
+        conversation_id=graphene.ID(required=True),
+        user_message=graphene.String(required=True),
+        assistant_message=graphene.String(required=True),
+        sources=graphene.List(graphene.NonNull(ChatSourceInput)),
+        required=True,
+        resolver=_resolve_chat_record_exchange,
+        description=(
+            "Atomically records one in-scope user/assistant exchange in the "
+            "caller-owned\nconversation and refreshes its 30-day inactivity "
+            "expiry. The BFF must apply\nthe shop-scope and sensitive-content "
+            "guard before invoking this mutation.\nThe user message must be "
+            "nonblank and no longer than 2,000 characters; the\nBFF supplies "
+            "only the last 10 prior turns to the model. This mutation does\n"
+            "not write to or otherwise affect ChromaDB. No owner ID is "
+            "accepted."
+        ),
+    )
+    delete_chat_conversation = graphene.Field(
+        DeleteChatConversationPayload,
+        conversation_id=graphene.ID(required=True),
+        required=True,
+        resolver=_resolve_chat_delete_conversation,
+        description=(
+            "Deletes only the caller-owned conversation and its messages "
+            "from PostgreSQL.\nUnknown, expired, and other-scope IDs return "
+            "NOT_FOUND. ChromaDB knowledge is\nindependent and is never "
+            "modified by conversation deletion."
+        ),
+    )
     admin_update_user_privilege = graphene.Field(
         AdminUpdateUserPrivilegePayload,
         user_id=graphene.ID(required=True),
