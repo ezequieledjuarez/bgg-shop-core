@@ -76,6 +76,20 @@ class ProductPage(graphene.ObjectType):
     total_pages = graphene.Int(required=True)
 
 
+class ProductPublisherCount(graphene.ObjectType):
+    class Meta:
+        description = "A publisher name and its count of distinct eligible public catalog games."
+
+    publisher = graphene.String(
+        required=True,
+        description="Trimmed publisher name; also the exact, case-sensitive selection identity.",
+    )
+    product_count = graphene.Int(
+        required=True,
+        description="Nonnegative count of distinct eligible catalog bggId values.",
+    )
+
+
 class PublicReview(graphene.ObjectType):
     rating = graphene.Int(required=True)
     body = graphene.String(required=True)
@@ -83,7 +97,10 @@ class PublicReview(graphene.ObjectType):
 
 
 class ReviewSummary(graphene.ObjectType):
-    approved_review_count = graphene.Int(required=True)
+    approved_review_count = graphene.Int(
+        required=True,
+        description="Count and average include accepted, non-deleted reviews only.",
+    )
     average_rating = graphene.Float()
 
 
@@ -101,8 +118,16 @@ class ProductDetail(graphene.ObjectType):
     publisher = graphene.String(required=True)
     image_url = graphene.String(required=True)
     quantity = graphene.Int(required=True)
-    review_summary = graphene.Field(ReviewSummary, required=True)
-    approved_reviews = graphene.List(graphene.NonNull(PublicReview), required=True)
+    review_summary = graphene.Field(
+        ReviewSummary,
+        required=True,
+        description="Count and average include accepted, non-deleted reviews only.",
+    )
+    approved_reviews = graphene.List(
+        graphene.NonNull(PublicReview),
+        required=True,
+        description="Only accepted, non-deleted reviews are included.",
+    )
 
 
 class CartLine(graphene.ObjectType):
@@ -168,7 +193,11 @@ class AdminReview(graphene.ObjectType):
     rating = graphene.Int(required=True)
     body = graphene.String(required=True)
     created_at = graphene.String(required=True)
-    status = graphene.Field(ReviewModerationStatus, required=True)
+    status = graphene.Field(
+        ReviewModerationStatus,
+        required=True,
+        description="Retained moderation status; soft-deleted records are omitted from the queue.",
+    )
     deleted = graphene.Boolean(required=True)
     publicly_visible = graphene.Boolean(required=True)
 
@@ -182,7 +211,10 @@ class AdminReviewPage(graphene.ObjectType):
 
 
 class ReviewModerationError(graphene.ObjectType):
-    field = graphene.List(graphene.NonNull(graphene.String))
+    field = graphene.List(
+        graphene.NonNull(graphene.String),
+        description="Stable code such as REVIEW_NOT_FOUND or INVALID_TRANSITION.",
+    )
     code = graphene.String(required=True)
     message = graphene.String(required=True)
 
@@ -1286,11 +1318,22 @@ class Query(graphene.ObjectType):
     )
     product_by_bgg_id = graphene.Field(ProductDetail, bgg_id=graphene.Int(required=True))
     product_categories = graphene.List(graphene.NonNull(graphene.String), required=True)
+    product_publishers = graphene.List(
+        graphene.NonNull(ProductPublisherCount),
+        required=True,
+        description=(
+            "Complete global publisher facets for the public catalog. Counts are distinct\n"
+            "games and independent of search, category, other filters, and pagination.\n"
+            "Blank publisher values are excluded; trimmed spelling is preserved and\n"
+            "case-sensitive variants remain distinct."
+        ),
+    )
     products = graphene.Field(
         ProductPage,
         page=graphene.Int(default_value=1),
         page_size=graphene.Int(default_value=50),
         search=graphene.String(),
+        publisher=graphene.String(),
         year_published=graphene.Int(),
         min_players=graphene.Int(),
         max_players=graphene.Int(),
@@ -1346,10 +1389,11 @@ class Query(graphene.ObjectType):
         page=graphene.Int(default_value=1),
         page_size=graphene.Int(default_value=50),
         description=(
-            "Requires an authenticated active staff or superuser identity. An "
-            "operation key without an active user identity is insufficient. "
-            "Lists non-deleted reviews filtered by an optional single status. "
-            "page is one-based and pageSize defaults to 50 (maximum 100)."
+            "Requires an authenticated active staff or superuser identity. An operation\n"
+            "key without an active user identity is insufficient. Lists non-deleted\n"
+            "reviews filtered by an optional single status. page is one-based and defaults\n"
+            "to 1; pageSize defaults to 50 (maximum 100). Results are ordered by createdAt\n"
+            "DESC then id DESC. Authorization errors use UNAUTHENTICATED or FORBIDDEN."
         ),
     )
     admin_payment_attempts = graphene.Field(
@@ -1836,8 +1880,22 @@ class Query(graphene.ObjectType):
             cursor.execute("SELECT DISTINCT category FROM product_boardgame WHERE category IS NOT NULL")
             return sorted({name.strip() for (value,) in cursor.fetchall() for name in (value or "").split(",") if name.strip()})
 
+    def resolve_product_publishers(self, info):
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT BTRIM(publisher) AS publisher, COUNT(DISTINCT bgg_id) AS product_count "
+                "FROM product_boardgame "
+                "WHERE NULLIF(BTRIM(publisher), '') IS NOT NULL "
+                "GROUP BY BTRIM(publisher) "
+                "ORDER BY LOWER(BTRIM(publisher)), BTRIM(publisher)"
+            )
+            return [
+                ProductPublisherCount(publisher=publisher, product_count=product_count)
+                for publisher, product_count in cursor.fetchall()
+            ]
+
     def resolve_products(self, info, page=1, page_size=50, search=None,
-                         year_published=None, min_players=None, max_players=None,
+                         publisher=None, year_published=None, min_players=None, max_players=None,
                          category_id=None, category_name=None, price_min=None, price_max=None):
         if page < 1 or page_size < 1:
             raise ValueError("page and pageSize must be positive integers")
@@ -1845,11 +1903,18 @@ class Query(graphene.ObjectType):
             raise ValueError("minPlayers must be less than or equal to maxPlayers")
         if price_min is not None and price_max is not None and price_min > price_max:
             raise ValueError("priceMin must be less than or equal to priceMax")
+        if publisher is not None:
+            publisher = publisher.strip()
+            if not publisher or len(publisher) > 250:
+                raise ValueError("publisher must contain 1 to 250 non-whitespace characters")
         with connection.cursor() as cursor:
             conditions, parameters = [], []
             if search:
                 conditions.append("(LOWER(name) LIKE LOWER(%s) OR LOWER(publisher) LIKE LOWER(%s))")
                 parameters.extend([f"%{search}%", f"%{search}%"])
+            if publisher is not None:
+                conditions.append("BTRIM(publisher) = %s")
+                parameters.append(publisher)
             for value, column, minimum, maximum in (
                 (year_published, "release_year", 0, 9999),
                 (min_players, "max_players", 1, 999),
@@ -4522,7 +4587,19 @@ class Mutation(graphene.ObjectType):
     add_to_wishlist = AddToWishlistMutation.Field(required=True)
     remove_from_wishlist = RemoveFromWishlistMutation.Field(required=True)
     create_review = CreateReviewMutation.Field(required=True)
-    moderate_review = ModerateReviewMutation.Field(required=True)
+    moderate_review = ModerateReviewMutation.Field(
+        required=True,
+        description=(
+            "Requires an authenticated active staff or superuser identity. An operation\n"
+            "key without an active user identity is insufficient. Core is authoritative\n"
+            "for state and locks the review row to serialize actions; the last serialized\n"
+            "action is final. Same-state ACCEPT/REJECT and repeated DELETE are idempotent\n"
+            "success. Unknown IDs and non-delete actions on soft-deleted reviews report\n"
+            "REVIEW_NOT_FOUND (mapped to HTTP 404 by the BFF); only a genuinely invalid\n"
+            "transition reports INVALID_TRANSITION (mapped to HTTP 409). DELETE sets a\n"
+            "separate soft-delete marker and retains the current moderation status."
+        ),
+    )
     # Admin mutations for BFF
     create_product = CreateProductMutation.Field(
         required=True,

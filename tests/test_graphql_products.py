@@ -717,7 +717,7 @@ def test_product_by_bgg_id_queries_exact_product_and_approved_reviews(found):
     assert "WHERE bgg_id = %s" in query
     assert parameters == [13]
     if found:
-        assert "status = 'APPROVED'" in cursor.execute.call_args_list[1].args[0]
+        assert "status = 'ACCEPTED'" in cursor.execute.call_args_list[1].args[0]
 
 
 def test_product_detail_aggregates_only_approved_reviews():
@@ -752,5 +752,5 @@ def test_product_detail_aggregates_only_approved_reviews():
         {"rating": 5, "body": "Excellent"}, {"rating": 4, "body": "Good"}
     ]
     sql, parameters = cursor.execute.call_args.args
-    assert "status = 'APPROVED'" in sql
+    assert "status = 'ACCEPTED'" in sql
     assert parameters == [13]

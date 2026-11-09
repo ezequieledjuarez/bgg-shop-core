@@ -45,7 +45,8 @@ ruta para exploración manual. En Compose está disponible en
 | Operación | Argumentos | Resultado o error |
 | --- | --- | --- |
 | `hello` | Ninguno | Texto `Saleor API activa y respondiendo OK`. |
-| `products` | `page`, `pageSize`, `search`, `yearPublished`, `minPlayers`, `maxPlayers`, `categoryId`, `priceMin`, `priceMax` | `ProductPage` filtrado con productos y metadatos de paginación. |
+| `products` | `page`, `pageSize`, `search`, `publisher`, `yearPublished`, `minPlayers`, `maxPlayers`, `categoryId`, `categoryName`, `priceMin`, `priceMax` | `ProductPage` filtrado con productos y metadatos de paginación. `publisher` aplica coincidencia exacta y sensible a mayúsculas luego de recortar espacios. |
+| `productPublishers` | Ninguno | Lista completa y global de editoriales con conteos de juegos distintos del catálogo público. |
 | `myWishlist` | None; requires an access token | Lists products saved by the authenticated buyer. |
 | `addToWishlist` | `bggId`; requires an access token | Idempotently saves a product and returns its data. |
 | `removeFromWishlist` | `bggId`; requires an access token | Removes a product from the buyer's Wishlist and returns its data. |
@@ -118,8 +119,13 @@ type ProductPage {
 El BFF adapta estos nombres a `snake_case` (`bgg_id`, `page_size`,
 `total_pages`, etc.) antes de responder por REST.
 
-El Frontend consume el catálogo a través del BFF; no llama GraphQL
-directamente. Para el detalle de CU-C02, ver
+`productPublishers` cuenta `bggId` distintos entre los mismos productos
+elegibles para el catálogo público, sin depender de búsqueda, categoría ni
+paginación. Agrupa nombres luego de recortar espacios, conserva variantes de
+mayúsculas/minúsculas y excluye nombres vacíos. `publisher` usa ese nombre
+recortado como identidad exacta y se combina con los demás filtros. El
+Frontend consume el catálogo a través del BFF; no llama GraphQL directamente.
+Para el detalle de CU-C02, ver
 [`docs/CU-C02-FILTERING-CHANGES.md`](../docs/CU-C02-FILTERING-CHANGES.md).
 
 ### Persistencia de conversaciones del chatbot (CU-C07, en progreso)

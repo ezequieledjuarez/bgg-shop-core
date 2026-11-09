@@ -119,6 +119,14 @@ type ProductPage {
   totalPages: Int!
 }
 
+"""A publisher name and its count of distinct eligible public catalog games."""
+type ProductPublisherCount {
+  """Trimmed publisher name; also the exact, case-sensitive selection identity."""
+  publisher: String!
+  """Nonnegative count of distinct eligible catalog bggId values."""
+  productCount: Int!
+}
+
 type PublicReview {
   rating: Int!
   body: String!
@@ -439,11 +447,19 @@ type Query {
   productBySlug(slug: String!): ProductDetail
   productByBggId(bggId: Int!): ProductDetail
   productCategories: [String!]!
+  """
+  Complete global publisher facets for the public catalog. Counts are distinct
+  games and independent of search, category, other filters, and pagination.
+  Blank publisher values are excluded; trimmed spelling is preserved and
+  case-sensitive variants remain distinct.
+  """
+  productPublishers: [ProductPublisherCount!]!
   products(
     page: Int = 1
     # Default pageSize changed from 20 to 50 to align BFF defaults and admin UX requirements
     pageSize: Int = 50
     search: String
+    publisher: String
     yearPublished: Int
     minPlayers: Int
     maxPlayers: Int
