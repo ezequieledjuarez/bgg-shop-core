@@ -153,6 +153,7 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 OPKEYS_ISSUE_ON_LOGIN = env.bool("OPKEYS_ISSUE_ON_LOGIN", default=False)
 # Secret header value required by internal endpoints (BFF -> Core)
 OPKEY_INTERNAL_SECRET = env("OPKEY_INTERNAL_SECRET", default="")
+CHAT_ASSERTION_SECRET = env("CHAT_ASSERTION_SECRET", default="")
 CATALOG_EVENTS_HMAC_SECRET = env(
     "CATALOG_EVENTS_HMAC_SECRET",
     default=OPKEY_INTERNAL_SECRET,

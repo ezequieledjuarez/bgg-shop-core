@@ -353,9 +353,89 @@ type ManageOperationSessionPayload {
   userErrors: [OrderUserError!]!
 }
 
+enum ChatMessageRole {
+  USER
+  ASSISTANT
+}
+
+enum ChatConversationErrorCode {
+  INVALID
+  UNAUTHENTICATED
+  NOT_FOUND
+  SERVER_ERROR
+}
+
+type ChatSource {
+  title: String!
+  url: String
+}
+
+input ChatSourceInput {
+  title: String!
+  url: String
+}
+
+type ChatMessage {
+  id: ID!
+  role: ChatMessageRole!
+  content: String!
+  createdAt: String!
+  sources: [ChatSource!]!
+}
+
+"""
+A Core-owned conversation. Ownership is derived from the validated execution
+principal and is never supplied as a caller-controlled owner ID. Registered
+buyers use the current bearer-authenticated user, which remains authoritative
+when present. For anonymous calls, the Core transport adapter validates the
+BFF-signed HMAC-SHA256 assertion supplied only through the internal
+X-Chat-Assertion header, then derives ownership exclusively from its validated
+sub claim. The assertion has alg=HS256, typ=chat-assertion, iss=bgg-shop-bff,
+aud=bgg-shop-core, scope=chat:conversations, iat, and exp=iat+60s; sub is the
+SHA-256 digest of the browser chat_session cookie, never its raw value. A
+dedicated CHAT_ASSERTION_SECRET environment setting is shared by BFF and Core
+and is distinct from JWT SECRET_KEY and OPKEY_INTERNAL_SECRET. The header is
+not a GraphQL argument or browser-supplied payload. Assertions are short-lived
+and scoped, but are not one-time credentials and do not promise replay
+prevention. Rotate the key by coordinated BFF/Core environment replacement.
+Operation-key delegation does not identify an anonymous buyer.
+"""
+type ChatConversation {
+  id: ID!
+  messages: [ChatMessage!]!
+  createdAt: String!
+  updatedAt: String!
+  expiresAt: String!
+}
+
+type ChatConversationError {
+  code: ChatConversationErrorCode!
+  message: String!
+  field: [String!]
+}
+
+type ChatConversationPayload {
+  conversation: ChatConversation
+  userErrors: [ChatConversationError!]!
+}
+
+type DeleteChatConversationPayload {
+  success: Boolean!
+  userErrors: [ChatConversationError!]!
+}
+
 type Query {
   hello: String
   me: User
+  """
+  Returns a conversation only when it belongs to the validated execution
+  principal. For anonymous requests, the transport adapter validates
+  X-Chat-Assertion before exposing its subject as the principal. A bearer token
+  remains authoritative when present. Missing, expired, and other-scope IDs
+  all return NOT_FOUND without exposing conversation metadata. No owner ID or
+  assertion is accepted as a GraphQL argument.
+  """
+  chatConversation(id: ID!): ChatConversationPayload!
   productBySlug(slug: String!): ProductDetail
   productByBggId(bggId: Int!): ProductDetail
   productCategories: [String!]!
@@ -621,6 +701,35 @@ type CreditCheckoutPayload {
 type Mutation {
   register(input: RegisterInput!): RegisterPayload!
   login(input: LoginInput!): LoginPayload!
+  """
+  Creates a PostgreSQL-backed conversation for the validated execution
+  principal, with no owner identifier or assertion in the GraphQL input.
+  Anonymous ownership is derived only after the Core transport adapter
+  validates the BFF-signed assertion in X-Chat-Assertion; a registered-user
+  bearer token remains authoritative when present. Conversation content and
+  metadata expire after 30 days of inactivity.
+  """
+  createChatConversation: ChatConversationPayload!
+  """
+  Atomically records one in-scope user/assistant exchange in the caller-owned
+  conversation and refreshes its 30-day inactivity expiry. The BFF must apply
+  the shop-scope and sensitive-content guard before invoking this mutation.
+  The user message must be nonblank and no longer than 2,000 characters; the
+  BFF supplies only the last 10 prior turns to the model. This mutation does
+  not write to or otherwise affect ChromaDB. No owner ID is accepted.
+  """
+  recordChatExchange(
+    conversationId: ID!
+    userMessage: String!
+    assistantMessage: String!
+    sources: [ChatSourceInput!]
+  ): ChatConversationPayload!
+  """
+  Deletes only the caller-owned conversation and its messages from PostgreSQL.
+  Unknown, expired, and other-scope IDs return NOT_FOUND. ChromaDB knowledge is
+  independent and is never modified by conversation deletion.
+  """
+  deleteChatConversation(conversationId: ID!): DeleteChatConversationPayload!
   """
   Requires the same current bearer-authenticated active Superadmin authority as
   adminUsers; isStaff is not required and operation-key-only access is forbidden.
