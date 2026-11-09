@@ -1,0 +1,46 @@
+# Environment variables and credentials
+.env
+.env.*
+!.env.example
+!.env.template
+**/.env
+**/.env.*
+!**/.env.example
+!**/.env.template
+
+# Source control and local private data
+.git
+**/.git
+.local/
+**/.local/
+
+# Python environments, bytecode, and test artifacts
+.venv/
+**/.venv/
+venv/
+env/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+**/.pytest_cache/
+.pytest-tmp/
+**/.pytest-tmp/
+.mypy_cache/
+.ruff_cache/
+.coverage*
+htmlcov/
+logs/
+**/logs/
+*.log
+
+# Local databases and backup/archive artifacts
+*.sqlite3
+*.db
+*.dump
+*.bak
+*.backup
+*.sql.gz
+*.tar
+*.tar.gz
+*.zip
