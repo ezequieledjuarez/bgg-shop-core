@@ -19,6 +19,7 @@ django.setup()
 from saleor.graphql.api import schema
 from saleor.graphql import credit
 from django.db import connections, transaction
+from django.db.migrations.executor import MigrationExecutor
 from django.db.migrations.loader import MigrationLoader
 from django.test import override_settings
 
@@ -51,6 +52,7 @@ def database(monkeypatch):
         "OPTIONS": {},
     }
     database = connections[alias]
+    MigrationExecutor(database).migrate([("catalog_events", "0001_initial")])
     definitions = (
         "CREATE TABLE credit_account (user_id integer PRIMARY KEY, balance numeric, currency text)",
         "CREATE TABLE credit_transaction (id integer PRIMARY KEY, user_id integer, gift_card_id text, "
@@ -270,8 +272,13 @@ def test_success_and_retry_return_original_snapshot(database, balance, remaining
     assert scalar(database, "SELECT quantity FROM shopping_cart_line WHERE cart_id = %s", [CART]) == 1
     for table in ("purchase_order", "invoice", "credit_transaction", "credit_payment"):
         assert scalar(database, f"SELECT count(*) FROM {table}") == 1
+    assert scalar(database, "SELECT count(*) FROM catalog_event_outbox") == 1
+    assert scalar(database, "SELECT event_type FROM catalog_event_outbox") == "stock.changed"
+    assert scalar(database, "SELECT aggregate_type FROM catalog_event_outbox") == "stock"
+    assert scalar(database, "SELECT aggregate_id FROM catalog_event_outbox") == "7"
     assert scalar(database, "SELECT count(*) FROM wishlist_entry WHERE user_id = 1 AND bgg_id = 7") == 0
     assert scalar(database, "SELECT count(*) FROM wishlist_entry WHERE user_id = 2 AND bgg_id = 7") == 1
+    assert scalar(database, "SELECT count(*) FROM catalog_event_outbox") == 1
 
 
 @pytest.mark.parametrize("change,code", [
@@ -359,7 +366,13 @@ def test_added_cart_quantity_is_not_removed(database):
 
 
 def test_cart_update_failure_rolls_back_everything(database):
+    failure_reached = []
     with database.cursor() as cursor:
+        database.connection.create_function(
+            "mark_cart_update_failure",
+            0,
+            lambda: failure_reached.append(True) or 1,
+        )
         cursor.execute(
             "CREATE TRIGGER add_quantity AFTER INSERT ON invoice "
             "BEGIN UPDATE shopping_cart_line SET quantity = quantity + 3; END"
@@ -367,27 +380,54 @@ def test_cart_update_failure_rolls_back_everything(database):
         cursor.execute(
             "CREATE TRIGGER fail_cart_update BEFORE UPDATE ON shopping_cart_line "
             "WHEN NEW.quantity < OLD.quantity "
-            "BEGIN SELECT RAISE(ABORT, 'private detail'); END"
+            "BEGIN SELECT mark_cart_update_failure(); "
+            "SELECT RAISE(ABORT, 'private detail'); END"
         )
     assert checkout()["userErrors"][0]["code"] == "SERVER_ERROR"
+    assert failure_reached == [True]
     assert scalar(database, "SELECT balance FROM credit_account WHERE user_id = 1") == 30
     assert scalar(database, "SELECT quantity FROM product_boardgame WHERE bgg_id = 7") == 5
     assert scalar(database, "SELECT quantity FROM shopping_cart_line WHERE cart_id = %s", [CART]) == 2
     for target in ("purchase_order", "invoice", "credit_transaction", "credit_payment", "credit_idempotency"):
         assert scalar(database, f"SELECT count(*) FROM {target}") == 0
+    assert scalar(database, "SELECT count(*) FROM catalog_event_outbox") == 0
 
 
 def test_retry_after_rolled_back_database_error(database):
     key = uuid.uuid4()
+    failure_reached = []
     with database.cursor() as cursor:
+        database.connection.create_function(
+            "mark_invoice_failure",
+            0,
+            lambda: failure_reached.append(True) or 1,
+        )
         cursor.execute("CREATE TRIGGER fail_invoice BEFORE INSERT ON invoice "
-                       "BEGIN SELECT RAISE(ABORT, 'private detail'); END")
-    assert checkout(key=key)["userErrors"][0]["code"] == "SERVER_ERROR"
+                       "BEGIN SELECT mark_invoice_failure(); "
+                       "SELECT RAISE(ABORT, 'private detail'); END")
+    failed = checkout(key=key)
+    assert failed["userErrors"][0]["code"] == "SERVER_ERROR"
+    assert failure_reached == [True]
+    assert scalar(database, "SELECT balance FROM credit_account WHERE user_id = 1") == 30
+    assert scalar(database, "SELECT quantity FROM product_boardgame WHERE bgg_id = 7") == 5
+    assert scalar(database, "SELECT quantity FROM shopping_cart_line WHERE cart_id = %s", [CART]) == 2
+    for table in ("purchase_order", "invoice", "credit_transaction", "credit_payment", "credit_idempotency"):
+        assert scalar(database, f"SELECT count(*) FROM {table}") == 0
+    assert scalar(database, "SELECT count(*) FROM catalog_event_outbox") == 0
     with database.cursor() as cursor:
         cursor.execute("DROP TRIGGER fail_invoice")
     assert checkout(key=key)["userErrors"] == []
     assert scalar(database, "SELECT balance FROM credit_account WHERE user_id = 1") == 5
     assert scalar(database, "SELECT count(*) FROM purchase_order") == 1
+    assert scalar(database, "SELECT count(*) FROM invoice") == 1
+    assert scalar(database, "SELECT count(*) FROM credit_transaction") == 1
+    assert scalar(database, "SELECT count(*) FROM credit_payment") == 1
+    assert scalar(database, "SELECT count(*) FROM credit_idempotency") == 1
+    assert scalar(database, "SELECT quantity FROM product_boardgame WHERE bgg_id = 7") == 3
+    assert scalar(database, "SELECT count(*) FROM catalog_event_outbox") == 1
+    assert scalar(database, "SELECT event_type FROM catalog_event_outbox") == "stock.changed"
+    assert scalar(database, "SELECT aggregate_type FROM catalog_event_outbox") == "stock"
+    assert scalar(database, "SELECT aggregate_id FROM catalog_event_outbox") == "7"
 
 
 def test_zero_total_is_supported(database):
@@ -452,11 +492,19 @@ def test_checkout_fails_closed_without_postgresql_row_locks(database, monkeypatc
     "purchase_order", "purchase_order_line", "credit_transaction", "credit_payment", "invoice", "credit_idempotency",
 ])
 def test_database_failure_rolls_back_every_stage(database, table):
+    failure_reached = []
     with database.cursor() as cursor:
+        database.connection.create_function(
+            "mark_database_failure",
+            0,
+            lambda: failure_reached.append(table) or 1,
+        )
         cursor.execute(f"CREATE TRIGGER fail_checkout BEFORE INSERT ON {table} "
-                       "BEGIN SELECT RAISE(ABORT, 'private detail'); END")
+                       "BEGIN SELECT mark_database_failure(); "
+                       "SELECT RAISE(ABORT, 'private detail'); END")
     result = checkout()
     assert result["userErrors"][0]["code"] == "SERVER_ERROR"
+    assert failure_reached == [table]
     assert "private detail" not in str(result)
     assert Decimal(str(scalar(database, "SELECT balance FROM credit_account WHERE user_id = 1"))) == Decimal("30")
     assert scalar(database, "SELECT quantity FROM product_boardgame WHERE bgg_id = 7") == 5
@@ -465,6 +513,7 @@ def test_database_failure_rolls_back_every_stage(database, table):
         assert scalar(database, f"SELECT count(*) FROM {target}") == 0
     assert scalar(database, "SELECT count(*) FROM credit_idempotency") == 0
     assert scalar(database, "SELECT count(*) FROM wishlist_entry WHERE user_id = 1 AND bgg_id = 7") == 1
+    assert scalar(database, "SELECT count(*) FROM catalog_event_outbox") == 0
 
 
 @pytest.mark.parametrize("action,table", [
@@ -474,11 +523,19 @@ def test_database_failure_rolls_back_every_stage(database, table):
     ("DELETE", "shopping_cart_line"),
 ])
 def test_update_and_delete_failures_roll_back_everything(database, action, table):
+    failure_reached = []
     with database.cursor() as cursor:
+        database.connection.create_function(
+            "mark_update_delete_failure",
+            0,
+            lambda: failure_reached.append(table) or 1,
+        )
         cursor.execute(f"CREATE TRIGGER fail_checkout BEFORE {action} ON {table} "
-                       "BEGIN SELECT RAISE(ABORT, 'private detail'); END")
+                       "BEGIN SELECT mark_update_delete_failure(); "
+                       "SELECT RAISE(ABORT, 'private detail'); END")
     result = checkout()
     assert result["userErrors"][0]["code"] == "SERVER_ERROR"
+    assert failure_reached == [table]
     assert "private detail" not in str(result)
     assert scalar(database, "SELECT balance FROM credit_account WHERE user_id = 1") == 30
     assert scalar(database, "SELECT quantity FROM product_boardgame WHERE bgg_id = 7") == 5
@@ -486,3 +543,4 @@ def test_update_and_delete_failures_roll_back_everything(database, action, table
     assert scalar(database, "SELECT count(*) FROM wishlist_entry WHERE user_id = 1 AND bgg_id = 7") == 1
     for target in ("purchase_order", "invoice", "credit_transaction", "credit_payment", "credit_idempotency"):
         assert scalar(database, f"SELECT count(*) FROM {target}") == 0
+    assert scalar(database, "SELECT count(*) FROM catalog_event_outbox") == 0
