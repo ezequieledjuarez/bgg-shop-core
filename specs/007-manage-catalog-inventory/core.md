@@ -1,6 +1,6 @@
 # CU-A01 — Core Responsibilities (Saleor)
 
-Reference: ../007-manage-catalog-inventory/spec.md
+Reference: ../../../specs/006-manage-catalog-inventory/spec.md
 
 ## Purpose
 Definir y exponer la fuente de verdad del catálogo: productos, stock por producto, promociones y auditoría. Cada edición o variante de un juego es un producto independiente.
@@ -33,7 +33,7 @@ define the storage. They have not been applied to the active database. A
 provisional record may remain `IN_PROGRESS` after an interruption; automatic
 recovery of that situation is not implemented. A missing record does not prove
 that a movement was rejected or rolled back. The BFF contract is in
-`../bgg-shop-bff/specs/openapi.yaml`.
+`../../../bgg-shop-bff/specs/openapi.yaml`.
 
 Local tests use mocks, SQLite and a disposable PostgreSQL 15 instance. Django's
 migration executor applied 0012 and 0013 in an isolated schema; the preceding

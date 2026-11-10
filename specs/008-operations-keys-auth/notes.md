@@ -1,6 +1,6 @@
 # 008 — Operations & Keys (Auth por Ops) — Especificación
 
-La estructura retrospectiva para Spec Kit está en [008-operations-keys-auth/](008-operations-keys-auth/spec.md), con especificación, plan y tareas; este documento conserva las notas y decisiones originales.
+La estructura retrospectiva para Spec Kit está en [spec.md](./spec.md), con especificación, plan y tareas; este documento conserva las notas y decisiones originales.
 
 Estado: cerrada y validada con salvedades el 2026-10-30, con aprobación del responsable. La cobertura histórica de Playwright no ejecutada fue aceptada como excepción y no se considera aprobada.
 
@@ -303,4 +303,3 @@ Consideraciones operativas
 ---------------------------
 - TTL corto reduce impacto en caso de key leak, pero aumenta la frecuencia de re-login; 30 minutos es el valor inicial acordado.
 - Si se decide permitir renovación automática, implementarla explícitamente con un flag `sliding=True` y límites de extensión (max 24h).
-

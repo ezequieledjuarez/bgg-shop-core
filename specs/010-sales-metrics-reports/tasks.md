@@ -1,6 +1,6 @@
 # Tasks (Core): CU-A02 — Sales Metrics & Reports
 
-Plan and rules: `../../specs/010-sales-metrics-reports/plan.md`. Global ledger: `../../specs/010-sales-metrics-reports/tasks.md`.
+Plan and rules: `../../../specs/010-sales-metrics-reports/plan.md`. Global ledger: `../../../specs/010-sales-metrics-reports/tasks.md`.
 Branch: `010-sales-metrics-reports`. Local validation only; disposable PostgreSQL for integration tests; do not migrate an active database.
 
 ## Contract (blocking)
