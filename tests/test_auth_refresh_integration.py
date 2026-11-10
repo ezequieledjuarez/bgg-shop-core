@@ -2,6 +2,15 @@ import json
 
 from saleor import auth_refresh
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def eligible_subjects(monkeypatch):
+    # Refresh storage tests use synthetic subjects; eligibility has dedicated tests.
+    from saleor import auth_refresh as module
+    monkeypatch.setattr(module, "_user_eligible", lambda _user_id: True)
+
 # If Django is installed in the environment, ensure minimal settings so JsonResponse works
 try:
     from django.conf import settings

@@ -9,6 +9,7 @@ from django.contrib.auth import get_user_model
 from graphql import GraphQLError, get_operation_ast, get_variable_values, parse, validate
 from graphql.execution.values import get_argument_values
 from graphql.language import FieldNode, FragmentDefinitionNode, FragmentSpreadNode, InlineFragmentNode, OperationType
+from saleor import email_verification
 from .models import OpSession
 from .utils import has_internal_secret, key_hash
 
@@ -173,7 +174,7 @@ class OpKeyAuthMiddleware(MiddlewareMixin):
             try:
                 User = get_user_model()
                 user = User.objects.filter(pk=sess.user_id).first()
-                if user:
+                if user and email_verification.is_eligible(user.pk):
                     request.user = user
                     # mark source for debugging
                     setattr(request, "op_session", sess)

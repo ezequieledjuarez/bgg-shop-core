@@ -21,6 +21,8 @@ from django.db import (
 from django.utils import timezone
 from graphql import GraphQLError
 
+from saleor import email_verification
+from saleor.password_validation import has_required_registration_password_composition
 from saleor.catalog_events import record_catalog_event
 from . import wishlist
 from .credit import (
@@ -476,7 +478,7 @@ def _authenticated_user(info):
         user = getattr(request, "user", None)
         if getattr(user, "is_active", False) and (
             getattr(user, "is_staff", False) or getattr(user, "is_superuser", False)
-        ):
+        ) and email_verification.is_eligible(user.pk):
             return user
     if not header.startswith("Bearer "):
         return None
@@ -485,9 +487,10 @@ def _authenticated_user(info):
         claims = jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
         if claims.get("token_type") != "access":
             return None
-        return User.objects.get(pk=int(claims["sub"]), is_active=True)
+        user = User.objects.get(pk=int(claims["sub"]), is_active=True)
     except (KeyError, TypeError, ValueError, OverflowError, jwt.PyJWTError, User.DoesNotExist):
         return None
+    return user if email_verification.is_eligible(user.pk) else None
 
 
 def _cart_error(code, message, field=None):
@@ -2488,14 +2491,58 @@ class AdjustProductStockPayload(graphene.ObjectType):
     errors = graphene.List(graphene.NonNull(UserError), required=True)
 
 
+class RegistrationVerificationState(graphene.Enum):
+    PENDING = "PENDING"
+
+
+class VerificationDeliveryStatus(graphene.Enum):
+    SUBMITTED = "SUBMITTED"
+    UNCONFIRMED = "UNCONFIRMED"
+
+
+class RegistrationVerification(graphene.ObjectType):
+    state = graphene.Field(RegistrationVerificationState, required=True)
+    delivery_status = graphene.Field(VerificationDeliveryStatus, required=True)
+    message = graphene.String(required=True)
+
+
 class RegisterPayload(graphene.ObjectType):
+    user = graphene.Field(AuthUser)
+    tokens = graphene.Field(AuthToken)
+    verification = graphene.Field(RegistrationVerification)
+    errors = graphene.List(graphene.NonNull(UserError), required=True)
+
+
+class LoginPayload(graphene.ObjectType):
     user = graphene.Field(AuthUser)
     tokens = graphene.Field(AuthToken)
     errors = graphene.List(graphene.NonNull(UserError), required=True)
 
 
-class LoginPayload(RegisterPayload):
-    pass
+class ConfirmEmailVerificationInput(graphene.InputObjectType):
+    token = graphene.String(required=True)
+
+
+class ResendEmailVerificationInput(graphene.InputObjectType):
+    email = graphene.String(required=True)
+
+
+class EmailVerificationError(graphene.ObjectType):
+    field = graphene.List(graphene.NonNull(graphene.String))
+    code = graphene.String(required=True)
+    message = graphene.String(required=True)
+    retry_after_seconds = graphene.Int()
+
+
+class ConfirmEmailVerificationPayload(graphene.ObjectType):
+    verified = graphene.Boolean(required=True)
+    message = graphene.String()
+    errors = graphene.List(graphene.NonNull(EmailVerificationError), required=True)
+
+
+class ResendEmailVerificationPayload(graphene.ObjectType):
+    message = graphene.String()
+    errors = graphene.List(graphene.NonNull(EmailVerificationError), required=True)
 
 
 def _auth_error(message, code, field=None):
@@ -2739,18 +2786,117 @@ class RegisterMutation(graphene.Mutation):
 
     @staticmethod
     def mutate(_root, _info, input):
-        from django.contrib.auth.models import User
-
-        email = input.email.strip().casefold()
-        if User.objects.filter(email__iexact=email).exists():
+        if not has_required_registration_password_composition(input.password):
+            return RegisterPayload(errors=[_auth_error(
+                "Password must include an ASCII uppercase letter, lowercase letter, digit, and printable punctuation symbol.",
+                "INVALID",
+                ["password"],
+            )])
+        email = email_verification.normalize_email(input.email)
+        try:
+            registration = email_verification.register_pending(
+                email, input.password, input.first_name, input.last_name
+            )
+        except email_verification.DuplicateEmail:
             return RegisterPayload(errors=[_auth_error(
                 "An account with this email already exists.", "DUPLICATE_EMAIL", ["email"]
             )])
-        user = User.objects.create_user(
-            username=email, email=email, password=input.password,
-            first_name=input.first_name.strip(), last_name=input.last_name.strip(),
+        user = registration.user
+        delivery = email_verification.deliver(user.pk, email, registration.token)
+        return RegisterPayload(
+            user=_auth_user(user),
+            verification=RegistrationVerification(
+                state="PENDING",
+                delivery_status=delivery,
+                message="Check your email for a verification link before signing in.",
+            ),
+            errors=[],
         )
-        return RegisterPayload(user=_auth_user(user), errors=[])
+
+
+def _verification_error(code, message, field=None, retry_after=None):
+    return EmailVerificationError(
+        field=field, code=code, message=message, retry_after_seconds=retry_after
+    )
+
+
+def _verification_caller(info):
+    """Trusted BFF context: internal secret plus a server-derived caller digest."""
+    from opkeys.utils import has_internal_secret
+
+    request = info.context
+    caller = request.headers.get("X-Verification-Caller", "")
+    if has_internal_secret(request) and email_verification.is_valid_caller(caller):
+        return caller
+    return None
+
+
+_FORBIDDEN_ERROR = ("FORBIDDEN", "Trusted service context is required.")
+_UNAVAILABLE_ERROR = ("VERIFICATION_UNAVAILABLE", "Verification is temporarily unavailable.")
+
+
+class ConfirmEmailVerificationMutation(graphene.Mutation):
+    class Arguments:
+        input = ConfirmEmailVerificationInput(required=True)
+
+    Output = ConfirmEmailVerificationPayload
+
+    @staticmethod
+    def mutate(_root, info, input):
+        caller = _verification_caller(info)
+        if caller is None:
+            return ConfirmEmailVerificationPayload(
+                verified=False, errors=[_verification_error(*_FORBIDDEN_ERROR)])
+        try:
+            result = email_verification.confirm(input.token, caller)
+        except DatabaseError:
+            logging.getLogger(__name__).error("email verification confirmation storage failure")
+            return ConfirmEmailVerificationPayload(
+                verified=False, errors=[_verification_error(*_UNAVAILABLE_ERROR)])
+        if result.verified:
+            return ConfirmEmailVerificationPayload(
+                verified=True, message=email_verification.CONFIRM_MESSAGE, errors=[])
+        if result.rate_limited:
+            error = _verification_error(
+                "RATE_LIMITED", "Too many attempts. Try again later.",
+                retry_after=result.retry_after)
+        else:
+            error = _verification_error(
+                "INVALID_VERIFICATION_TOKEN",
+                "This verification link is invalid or has expired.")
+        return ConfirmEmailVerificationPayload(verified=False, errors=[error])
+
+
+class ResendEmailVerificationMutation(graphene.Mutation):
+    class Arguments:
+        input = ResendEmailVerificationInput(required=True)
+
+    Output = ResendEmailVerificationPayload
+
+    @staticmethod
+    def mutate(_root, info, input):
+        caller = _verification_caller(info)
+        if caller is None:
+            return ResendEmailVerificationPayload(
+                errors=[_verification_error(*_FORBIDDEN_ERROR)])
+        email = email_verification.normalize_email(input.email)
+        try:
+            result = email_verification.resend(email, caller)
+        except DatabaseError:
+            logging.getLogger(__name__).error("email verification resend storage failure")
+            return ResendEmailVerificationPayload(
+                errors=[_verification_error(*_UNAVAILABLE_ERROR)])
+        if result.invalid:
+            return ResendEmailVerificationPayload(errors=[_verification_error(
+                "INVALID", "Enter a valid email address.", ["email"])])
+        if result.rate_limited:
+            return ResendEmailVerificationPayload(errors=[_verification_error(
+                "RATE_LIMITED", "Too many requests. Try again later.",
+                retry_after=result.retry_after)])
+        if result.issued is not None:
+            email_verification.deliver(result.issued.user, email, result.issued.token)
+        return ResendEmailVerificationPayload(
+            message=email_verification.RESEND_MESSAGE, errors=[])
 
 
 class LoginMutation(graphene.Mutation):
@@ -2770,6 +2916,14 @@ class LoginMutation(graphene.Mutation):
             request=info.context, username=input.email.strip().casefold(), password=input.password
         )
         if user is None or not user.is_active:
+            return LoginPayload(errors=[_auth_error(
+                "Invalid email or password.", "INVALID_CREDENTIALS"
+            )])
+        if not email_verification.is_eligible(user.pk):
+            if email_verification.is_pending(user.pk):
+                return LoginPayload(errors=[_auth_error(
+                    "Verify your email address before signing in.", "EMAIL_NOT_VERIFIED"
+                )])
             return LoginPayload(errors=[_auth_error(
                 "Invalid email or password.", "INVALID_CREDENTIALS"
             )])
@@ -4507,6 +4661,8 @@ class AdminUpdateUserPrivilegeMutation(graphene.Mutation):
 class Mutation(graphene.ObjectType):
     register = RegisterMutation.Field(required=True)
     login = LoginMutation.Field(required=True)
+    confirm_email_verification = ConfirmEmailVerificationMutation.Field(required=True)
+    resend_email_verification = ResendEmailVerificationMutation.Field(required=True)
     create_chat_conversation = graphene.Field(
         ChatConversationPayload,
         required=True,

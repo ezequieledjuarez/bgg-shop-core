@@ -556,6 +556,7 @@ type StockMovementStatusPayload {
 
 input RegisterInput {
   email: String!
+  """Must include at least one ASCII uppercase letter, ASCII lowercase letter, ASCII digit, and printable ASCII punctuation character (not whitespace)."""
   password: String!
   firstName: String!
   lastName: String!
@@ -594,10 +595,60 @@ type UserError {
   message: String!
 }
 
+enum RegistrationVerificationState {
+  PENDING
+}
+
+enum VerificationDeliveryStatus {
+  SUBMITTED
+  UNCONFIRMED
+}
+
+type RegistrationVerification {
+  state: RegistrationVerificationState!
+  deliveryStatus: VerificationDeliveryStatus!
+  message: String!
+}
+
 type RegisterPayload {
   user: User
+  # Kept for compatibility; always null. Registration never authenticates.
   tokens: AuthToken
+  verification: RegistrationVerification
   errors: [UserError!]!
+}
+
+input ConfirmEmailVerificationInput {
+  # 43 base64url characters; never persisted or logged as plaintext.
+  token: String!
+}
+
+input ResendEmailVerificationInput {
+  # Trimmed and casefolded; at most 254 characters.
+  email: String!
+}
+
+type EmailVerificationError {
+  field: [String!]
+  # INVALID_VERIFICATION_TOKEN, INVALID, RATE_LIMITED, VERIFICATION_UNAVAILABLE
+  # or FORBIDDEN (untrusted service context). No owner or provider diagnostics.
+  code: String!
+  message: String!
+  # Only for RATE_LIMITED: ceiling of the remaining caller wait, minimum one.
+  retryAfterSeconds: Int
+}
+
+type ConfirmEmailVerificationPayload {
+  # True only for the single winning transition. No credentials or user.
+  verified: Boolean!
+  message: String
+  errors: [EmailVerificationError!]!
+}
+
+type ResendEmailVerificationPayload {
+  # Same neutral message for every valid, non-throttled email.
+  message: String
+  errors: [EmailVerificationError!]!
 }
 
 type LoginPayload {
@@ -715,8 +766,31 @@ type CreditCheckoutPayload {
 }
 
 type Mutation {
+  """
+  Creates a PENDING account and its verification challenge atomically, then
+  submits one message after commit. Never returns tokens. Duplicate emails
+  return DUPLICATE_EMAIL and never resend.
+  """
   register(input: RegisterInput!): RegisterPayload!
+  """
+  Checks the password and activation, then email verification, BEFORE any guest
+  cart merge, JWT or operation session. A pending account receives
+  EMAIL_NOT_VERIFIED; an inactive account receives INVALID_CREDENTIALS.
+  """
   login(input: LoginInput!): LoginPayload!
+  """
+  Atomic single-use confirmation, valid only strictly before expiry (3600 seconds
+  after issuance). Requires trusted BFF service context (X-Internal-Secret and
+  X-Verification-Caller). Unusable tokens share INVALID_VERIFICATION_TOKEN. Ten
+  invalid attempts per caller in a rolling 900 seconds.
+  """
+  confirmEmailVerification(input: ConfirmEmailVerificationInput!): ConfirmEmailVerificationPayload!
+  """
+  Neutral acknowledgment for every valid email. Requires trusted BFF service
+  context. Ten requests per caller and two replacements per recipient per rolling
+  3600 seconds, with a 120 second recipient cooldown.
+  """
+  resendEmailVerification(input: ResendEmailVerificationInput!): ResendEmailVerificationPayload!
   """
   Creates a PostgreSQL-backed conversation for the validated execution
   principal, with no owner identifier or assertion in the GraphQL input.

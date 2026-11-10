@@ -185,6 +185,40 @@ detener los contenedores sin borrar volúmenes:
 podman compose -f podman-compose.yaml down
 ```
 
+## Verificación de correo del registro
+
+`register` crea la cuenta pendiente (`account_email_verification`) y un único
+desafío vigente por usuario (`email_verification_challenge`); solo se guarda el
+SHA-256 del token (3600 s, un solo uso, consumo atómico). `login`, refresh,
+bearer y OpKeys de usuario rechazan cuentas pendientes; las cuentas existentes
+se migran como `LEGACY_EXEMPT` sin fecha de verificación inventada. Las
+mutaciones `confirmEmailVerification` y `resendEmailVerification` exigen
+`X-Internal-Secret` y `X-Verification-Caller`. Contrato: `specs/schema.graphql`.
+
+Configuración SMTP (solo variables de entorno; sin valores en el repositorio):
+
+| Variable | Uso |
+| --- | --- |
+| `EMAIL_URL` / `EMAIL_HOST` / `EMAIL_PORT` | Por defecto Mailpit (`mailpit:1025`) |
+| `EMAIL_HOST_USER`, `MEEPLE_APP_SMTP_PASSWORD` | Credenciales (el segundo es solo el nombre de la variable) |
+| `EMAIL_USE_TLS` / `EMAIL_USE_SSL` | Obligatorio para hosts externos (mutuamente excluyentes) |
+| `DEFAULT_FROM_EMAIL` | Remitente; obligatorio y distinto del valor local para hosts externos |
+| `EMAIL_EXTERNAL_SMTP_ENABLED` | `true` para permitir un host distinto de Mailpit/localhost |
+| `EMAIL_VERIFICATION_FRONTEND_ORIGIN` | Origen del enlace `/verify-email#token=…` (por defecto `FRONTEND_URL`) |
+| `SALEOR_SKIP_DOTENV` | `1` evita leer `.env` (usado por las pruebas) |
+
+Para Gmail hay que fijar explícitamente host, puerto (587 con TLS o 465 con SSL),
+remitente y la opción externa; no hay valores por defecto adivinados. Las
+fallas SMTP se registran sin detalle de excepción, token ni correo.
+
+Pruebas herméticas (no importan `saleor.settings` ni `.env`; las de PostgreSQL
+exigen `EMAIL_VERIFICATION_TEST_POSTGRES_DSN` hacia una base desechable local
+`email_verification_test_<hex>` y se omiten si falta):
+
+```bash
+cd bgg-shop-core && PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=tests:. DJANGO_SETTINGS_MODULE=email_verification_settings SALEOR_SKIP_DOTENV=1 python -m pytest -q -p no:cacheprovider tests/test_email_verification.py tests/test_email_verification_postgres.py
+```
+
 ## Purchase checkout
 
 Authenticated GraphQL buyers can use `checkout`, `retryPayment`, and `confirmPayment`, then query `myOrders` or `myOrder`. Paid orders expose an invoice number and the PDF route `GET /invoices/<order_id>/`. Mercado Pago Checkout Pro is sandbox-only; inventory is reduced only after the verified payment is approved.
