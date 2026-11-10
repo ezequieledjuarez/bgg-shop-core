@@ -8,6 +8,7 @@ from django.views.decorators.http import require_POST
 from django.utils import timezone
 from django.shortcuts import get_object_or_404
 
+from saleor import email_verification
 from .models import OpKeyAudit, OpSession
 from .utils import has_internal_secret, key_hash
 from .utils import generate_raw_key, default_expiry, utc_isoformat
@@ -77,6 +78,9 @@ def op_validate(request):
         reference = hashlib.sha256(h.encode("utf-8")).hexdigest()[:16]
         logger.info("OpKey validation denied reason=%s reference=%s", reason, reference)
         return JsonResponse({"valid": False, "reason": "expired_or_revoked"})
+
+    if session.user_id and not email_verification.is_eligible(session.user_id):
+        return JsonResponse({"valid": False, "reason": "op_not_allowed"})
 
     if path.split("?")[0].startswith("/api/v1/admin/"):
         user = session.user if session.user_id else None
@@ -179,6 +183,9 @@ def op_create(request):
     ops = payload.get("ops") or []
     user_id = payload.get("user_id")
     expires_at = payload.get("expires_at")
+
+    if user_id is not None and not email_verification.is_eligible(user_id):
+        return JsonResponse({"error": "Subject is not eligible for an operation key"}, status=403)
 
     raw = generate_raw_key()
     h = key_hash(raw)

@@ -15,8 +15,10 @@ env = environ.Env(
     ALLOWED_HOSTS=(list, ["*"]),
 )
 
-# Carga de archivo .env opcional si existe en la raíz
-environ.Env.read_env(os.path.join(BASE_DIR, ".env"))
+# Carga de archivo .env opcional si existe en la raíz.
+# SALEOR_SKIP_DOTENV=1 lo omite (tests herméticos que importan estos settings).
+if os.environ.get("SALEOR_SKIP_DOTENV") != "1":
+    environ.Env.read_env(os.path.join(BASE_DIR, ".env"))
 
 # ==============================================================================
 # 2. SEGURIDAD Y CONFIGURACIÓN DE RED
@@ -38,6 +40,43 @@ MP_SANDBOX = env.bool("MP_SANDBOX", default=False)
 MP_CURRENCY_ID = env("MP_CURRENCY_ID", default="")
 COUNTRY_MONEY_CODE = env("COUNTRY_MONEY_CODE", default="AR")
 FRONTEND_URL = env("FRONTEND_URL", default="http://localhost:3000")
+
+# ------------------------------------------------------------------------------
+# Correo saliente (verificación de email). Por defecto: captura local (Mailpit).
+# Un host SMTP externo exige EMAIL_EXTERNAL_SMTP_ENABLED=true, TLS/SSL y un
+# DEFAULT_FROM_EMAIL explícito. La contraseña solo se lee desde el entorno.
+# ------------------------------------------------------------------------------
+_email_url = env.email_url("EMAIL_URL", default="smtp://mailpit:1025")
+EMAIL_BACKEND = _email_url["EMAIL_BACKEND"]
+EMAIL_HOST = env("EMAIL_HOST", default=_email_url.get("EMAIL_HOST") or "mailpit")
+EMAIL_PORT = env.int("EMAIL_PORT", default=_email_url.get("EMAIL_PORT") or 1025)
+EMAIL_HOST_USER = env("EMAIL_HOST_USER", default=_email_url.get("EMAIL_HOST_USER") or "")
+EMAIL_HOST_PASSWORD = env(
+    "MEEPLE_APP_SMTP_PASSWORD",
+    default=env("EMAIL_HOST_PASSWORD", default=_email_url.get("EMAIL_HOST_PASSWORD") or ""),
+)
+EMAIL_USE_TLS = env.bool("EMAIL_USE_TLS", default=bool(_email_url.get("EMAIL_USE_TLS")))
+EMAIL_USE_SSL = env.bool("EMAIL_USE_SSL", default=bool(_email_url.get("EMAIL_USE_SSL")))
+EMAIL_TIMEOUT = 3
+DEFAULT_FROM_EMAIL = env("DEFAULT_FROM_EMAIL", default="noreply@saleor.local")
+EMAIL_EXTERNAL_SMTP_ENABLED = env.bool("EMAIL_EXTERNAL_SMTP_ENABLED", default=False)
+EMAIL_VERIFICATION_FRONTEND_ORIGIN = env(
+    "EMAIL_VERIFICATION_FRONTEND_ORIGIN", default=FRONTEND_URL
+)
+if EMAIL_USE_TLS and EMAIL_USE_SSL:
+    raise ImproperlyConfigured("EMAIL_USE_TLS and EMAIL_USE_SSL are mutually exclusive.")
+if EMAIL_BACKEND.endswith("smtp.EmailBackend") and EMAIL_HOST not in (
+    "mailpit", "localhost", "127.0.0.1", "::1"
+):
+    if not EMAIL_EXTERNAL_SMTP_ENABLED:
+        raise ImproperlyConfigured(
+            "An external SMTP host requires EMAIL_EXTERNAL_SMTP_ENABLED=true."
+        )
+    if not (EMAIL_USE_TLS or EMAIL_USE_SSL) or DEFAULT_FROM_EMAIL == "noreply@saleor.local":
+        raise ImproperlyConfigured(
+            "An external SMTP host requires EMAIL_USE_TLS or EMAIL_USE_SSL and an explicit "
+            "DEFAULT_FROM_EMAIL."
+        )
 
 # Permite cualquier Host en desarrollo para evitar el HTTP 400 Bad Request
 ALLOWED_HOSTS = env.list("ALLOWED_HOSTS", default=["*"])

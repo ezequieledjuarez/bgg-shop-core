@@ -1,5 +1,6 @@
 """Opt-in user-permission integration tests for a disposable local PostgreSQL DB."""
 
+import importlib
 import json
 import os
 import re
@@ -15,7 +16,7 @@ from unittest.mock import patch
 import django
 import pytest
 
-os.environ.setdefault("DJANGO_SETTINGS_MODULE", "saleor.settings")
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "email_verification_settings")
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 django.setup()
 
@@ -157,6 +158,12 @@ def database():
             editor.create_model(Permission)
             editor.create_model(Group)
             editor.create_model(User)
+        migration = importlib.import_module(
+            "saleor.graphql.migrations.0021_email_verification"
+        ).Migration
+        with db.schema_editor() as editor:
+            for operation in migration.operations:
+                editor.execute(operation.sql)
         with db.cursor() as cursor:
             cursor.execute("SELECT current_schema()")
             assert cursor.fetchone()[0] == schema_name
@@ -177,7 +184,7 @@ def database():
 def _new_user(*, is_active=True, is_staff=False, is_superuser=False):
     unique = uuid.uuid4().hex
     email = f"user-{unique}@example.test"
-    return User.objects.create(
+    user = User.objects.create(
         username=email,
         email=email,
         password="not-a-valid-login-hash",
@@ -187,6 +194,18 @@ def _new_user(*, is_active=True, is_staff=False, is_superuser=False):
         is_staff=is_staff,
         is_superuser=is_superuser,
     )
+    # Fixture identities represent pre-feature accounts, not verified or newly registered users.
+    with connections["default"].cursor() as cursor:
+        cursor.execute(
+            "INSERT INTO account_email_verification (user_id, state) VALUES (%s, 'LEGACY_EXEMPT')",
+            [user.pk],
+        )
+        cursor.execute(
+            "SELECT state, verified_at FROM account_email_verification WHERE user_id = %s",
+            [user.pk],
+        )
+        assert cursor.fetchone() == ("LEGACY_EXEMPT", None)
+    return user
 
 
 def _bearer_context(user):
@@ -870,3 +889,10 @@ def test_registration_does_not_assign_staff_or_superuser(database):
     user = User.objects.get(email=email)
     assert user.is_staff is False
     assert user.is_superuser is False
+    with database.cursor() as cursor:
+        cursor.execute(
+            "SELECT state, verified_at FROM account_email_verification WHERE user_id = %s",
+            [user.pk],
+        )
+        assert cursor.fetchone() == ("PENDING", None)
+    assert not api.email_verification.is_eligible(user.pk)

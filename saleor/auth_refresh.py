@@ -38,7 +38,18 @@ def _hash_token(token: str) -> str:
     return hashlib.sha256(token.encode('utf-8')).hexdigest()
 
 
+def _user_eligible(user_id) -> bool:
+    """Active and email-verified (or legacy-exempt); fails closed."""
+    try:
+        from saleor.email_verification import is_eligible
+    except ImportError:
+        return False
+    return is_eligible(user_id)
+
+
 def _issue_tokens(user_id: str) -> Dict[str, str]:
+    if not _user_eligible(user_id):
+        raise PermissionError("subject is not eligible for refresh tokens")
     access = f"access-{uuid.uuid4().hex}"
     refresh = f"refresh-{uuid.uuid4().hex}"
     expires = datetime.utcnow() + _REFRESH_TTL
@@ -52,14 +63,16 @@ def _consume_refresh(refresh_token: str) -> Optional[str]:
     key = _hash_token(refresh_token)
     with _store_lock:
         rec = _refresh_store.pop(key, None)
-        if not rec:
-            return None
-        if rec["expires_at"] < datetime.utcnow():
-            return None
-        # rotation: issue new refresh and persist
-        new_refresh = f"refresh-{uuid.uuid4().hex}"
+    if not rec or rec["expires_at"] < datetime.utcnow():
+        return None
+    # The consumed token stays dead when the subject is no longer eligible.
+    if not _user_eligible(rec["user_id"]):
+        return None
+    # rotation: issue new refresh and persist
+    new_refresh = f"refresh-{uuid.uuid4().hex}"
+    with _store_lock:
         _refresh_store[_hash_token(new_refresh)] = {"user_id": rec["user_id"], "expires_at": datetime.utcnow() + _REFRESH_TTL}
-        return new_refresh
+    return new_refresh
 
 
 @csrf_exempt

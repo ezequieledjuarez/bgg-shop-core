@@ -31,6 +31,56 @@ from saleor.graphql.api import AuthToken, LoginMutation, _authenticated_user, sc
 INTERNAL_SECRET = "synthetic-internal-secret-0123456789-abcdef"
 
 
+@pytest.fixture(autouse=True)
+def verified_subjects():
+    # These tests mock identities; verification eligibility has dedicated tests below.
+    with patch("saleor.email_verification.is_eligible", return_value=True) as eligible:
+        yield eligible
+
+
+def test_create_rejects_subject_without_verified_eligibility(verified_subjects):
+    verified_subjects.return_value = False
+    request = RequestFactory().post(
+        "/internal/op-create", data=json.dumps({"ops": ["GET:/api/test"], "user_id": 1}),
+        content_type="application/json", HTTP_X_INTERNAL_SECRET=INTERNAL_SECRET,
+    )
+    with override_settings(OPKEY_INTERNAL_SECRET=INTERNAL_SECRET), \
+            patch.object(views.OpSession.objects, "create") as create:
+        response = views.op_create(request)
+    assert response.status_code == 403
+    create.assert_not_called()
+    assert "raw_key" not in response.content.decode()
+
+
+def test_validate_and_middleware_reject_pending_subject(verified_subjects):
+    verified_subjects.return_value = False
+    session = SimpleNamespace(
+        id="synthetic-session", pk="synthetic-session", user_id=1, ops=["GET:/api/test"],
+        expires_at=timezone.now() + timedelta(minutes=5), revoked=False,
+        is_valid=lambda: True, touch=Mock(),
+    )
+    request = RequestFactory().post(
+        "/internal/op-validate", data=json.dumps({"op_key": "synthetic", "method": "GET",
+                                                  "path": "/api/test"}),
+        content_type="application/json", HTTP_X_INTERNAL_SECRET=INTERNAL_SECRET,
+    )
+    with override_settings(OPKEY_INTERNAL_SECRET=INTERNAL_SECRET), \
+            patch.object(views.OpSession.objects, "get", return_value=session):
+        response = views.op_validate(request)
+    assert json.loads(response.content)["valid"] is False
+
+    mw_request = RequestFactory().post("/graphql/", HTTP_X_OP_KEY="synthetic")
+    user = SimpleNamespace(pk=1, is_active=True, is_staff=True, is_superuser=False)
+    with override_settings(OPKEY_INTERNAL_SECRET=INTERNAL_SECRET), \
+            patch("opkeys.middleware.OpSession.objects") as sessions, \
+            patch("opkeys.middleware.get_user_model") as users:
+        sessions.filter.return_value.first.return_value = session
+        users.return_value.objects.filter.return_value.first.return_value = user
+        OpKeyAuthMiddleware(lambda r: None).process_request(mw_request)
+    assert not getattr(mw_request, "opkey_delegated", False)
+    assert getattr(mw_request, "user", None) is not user
+
+
 @pytest.mark.parametrize("method,path,query,allowed", [
     ("GET", "/api/v1/admin/audit",
      "query { adminAuditLogs { records { id } nextCursor } }", True),

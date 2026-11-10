@@ -7,6 +7,15 @@ import pytest
 
 from saleor.auth_refresh import issue_for_user, clear_store, _hash_token, _consume_refresh
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def eligible_subjects(monkeypatch):
+    # Refresh storage tests use synthetic subjects; eligibility has dedicated tests.
+    from saleor import auth_refresh as module
+    monkeypatch.setattr(module, "_user_eligible", lambda _user_id: True)
+
 
 def test_issue_and_rotate_refresh_token():
     clear_store()
