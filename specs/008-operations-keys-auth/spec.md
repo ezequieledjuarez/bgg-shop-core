@@ -1,7 +1,7 @@
 # Feature Specification: Operations and Keys (008)
 
 **Status**: Closed and validated with exceptions on 2026-10-30, with owner approval.
-**Source**: [Original specification and operational notes](../008-operations-keys-auth.md)
+**Source**: [Original specification and operational notes](./notes.md)
 
 ## Objective and scope
 

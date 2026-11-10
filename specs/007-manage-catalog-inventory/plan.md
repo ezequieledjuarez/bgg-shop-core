@@ -1,7 +1,7 @@
 # Plan: CU-A01 — Core Implementation
 
 Owner: bgg-shop-core
-Reference spec: ../../specs/007-manage-catalog-inventory/spec.md
+Reference spec: ../../../specs/006-manage-catalog-inventory/spec.md
 
 ## Objective
 Implement data model, business rules and safe operations that make Core the authoritative source for products, stock, promotions and coupons.

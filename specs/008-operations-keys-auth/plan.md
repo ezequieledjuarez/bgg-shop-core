@@ -2,7 +2,7 @@
 
 **Status**: Retrospective/as-built; closed and validated with exceptions on 2026-10-30. See [tasks.md](tasks.md).
 **Specification**: [spec.md](spec.md)
-**Original notes**: [008-operations-keys-auth.md](../008-operations-keys-auth.md)
+**Original notes**: [notes.md](./notes.md)
 
 ## Summary
 
